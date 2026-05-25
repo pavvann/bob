@@ -1,0 +1,26 @@
+# SPM build artefacts
+.build/
+.swiftpm/
+Package.resolved
+DerivedData/
+
+# Built app bundle (output of `make app`)
+Bob.app/
+
+# Xcode (if anyone opens this in Xcode)
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
+
+# Local-only config
+.env
+.env.local

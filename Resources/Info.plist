@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Bob</string>
+    <key>CFBundleDisplayName</key>
+    <string>bob</string>
+    <key>CFBundleIdentifier</key>
+    <string>xyz.beyondclub.bob</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>Bob</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>bob listens when you press the mic.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>bob transcribes what you say so it can pass it to claude.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>bob shows your next meeting and the join link for in-progress calls.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>bob shows your next meeting and the join link for in-progress calls.</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>xyz.beyondclub.bob.url</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>bob</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
