@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>bob</string>
     <key>CFBundleIdentifier</key>
-    <string>xyz.beyondclub.bob</string>
+    <string>app.bob.mac</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
@@ -36,7 +36,7 @@
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>xyz.beyondclub.bob.url</string>
+            <string>app.bob.mac.url</string>
             <key>CFBundleURLSchemes</key>
             <array>
                 <string>bob</string>
