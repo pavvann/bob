@@ -37,6 +37,14 @@ final class MusicService: ObservableObject {
 
     @Published private(set) var current: Playback? = nil
 
+    /// Publish a track from outside (e.g. when MusicCatalogService plays via
+    /// ApplicationMusicPlayer — Music.app's playerInfo notification doesn't
+    /// fire for that, so we push directly to the tile).
+    func publish(track: Track, state: String = "playing", source: String = "apple_music_catalog") {
+        self.current = Playback(source: source, state: state, track: track, updatedAt: Date())
+        writeState()
+    }
+
     private let stateFile: URL
     private var artworkCache: [String: URL] = [:]
 
