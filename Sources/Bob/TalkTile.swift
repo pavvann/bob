@@ -95,7 +95,13 @@ struct TalkTileContent: View {
                 .fill(.ultraThinMaterial)
         }
         .overlay {
-            AnimatedBorder(cornerRadius: 22)
+            // Border canvas extends 14px beyond the input bar in every
+            // direction so blur can radiate outward without being clipped at
+            // the canvas's rectangular bounds (the source of the "squared
+            // corners" artefact). The glow layer inside AnimatedBorder is
+            // clipped to outside-the-path so it never bleeds into the bar.
+            AnimatedBorder(cornerRadius: 22, bleed: 14)
+                .padding(-14)
         }
     }
 
