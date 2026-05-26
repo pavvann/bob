@@ -76,8 +76,32 @@ enum BobURLHandler {
         switch url.host {
         case "play-key":
             pressPlayInMusic()
+        case "music":
+            handleMusicCommand(url)
         default:
             log("unknown bob:// host: \(url.host ?? "<nil>")")
+        }
+    }
+
+    /// `bob://music/play?id=<catalog-id>` — play an Apple Music catalog track
+    /// via MusicKit (SystemMusicPlayer). The skill curls iTunes Search to get
+    /// the trackId, then opens this URL so bob's Swift code does the play.
+    private static func handleMusicCommand(_ url: URL) {
+        let action = url.pathComponents.dropFirst().first ?? ""
+        switch action {
+        case "play":
+            guard let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "id" })?.value, !id.isEmpty else {
+                log("bob://music/play missing id query parameter")
+                return
+            }
+            log("bob://music/play id=\(id)")
+            Task { @MainActor in
+                await MusicCatalogService.shared.play(catalogId: id)
+            }
+        default:
+            log("unknown bob://music action: '\(action)'")
         }
     }
 

@@ -530,19 +530,17 @@ final class BobHome: ObservableObject {
     - "pause music", "stop music", "next track", "previous track"
     - "start music" (no song — resume queue)
 
-    ## what this can and can't do today
+    bob can play **library tracks** (via AppleScript) and **catalog tracks** (via MusicKit through `bob://music/play`).
 
-    bob can drive Music.app for **library tracks** and **transport controls**. it cannot play arbitrary catalog tracks (songs not in your library) — that needs MusicKit + an Apple Developer Program identifier. when the user asks for a catalog track, say so honestly; don't pretend.
-
-    ## library playback
+    ## play a specific song
 
     1. canonicalise via iTunes Search:
        ```
        curl -s "https://itunes.apple.com/search?term=<urlencoded>&entity=song&limit=1"
        ```
-       use `results[0].trackName` + `results[0].artistName`.
+       parse `results[0].trackId`, `trackName`, `artistName`. empty → tell user, stop.
 
-    2. try playing from library:
+    2. try library first:
        ```
        osascript -e 'tell application "Music"
          try
@@ -553,10 +551,15 @@ final class BobHome: ObservableObject {
          end try
        end tell'
        ```
+       output `played` → confirm and stop.
 
-    3. output `played` → "playing <trackName> by <artistName>." done.
+    3. catalog fallback — hand off to bob:
+       ```
+       open -g "bob://music/play?id=<trackId>"
+       ```
+       bob plays via MusicKit's `SystemMusicPlayer`. first time will prompt for Apple Music access.
 
-    4. output `not in library` → tell the user: "isn't in your library yet. bob can't play arbitrary catalog tracks until we wire MusicKit. add it in Music.app and i can play it next time."
+    4. confirm: "playing <trackName> by <artistName>."
 
     ## transport controls
 
@@ -567,11 +570,11 @@ final class BobHome: ObservableObject {
 
     ## permissions
 
-    TCC Automation for Music on first call. no Accessibility needed.
+    TCC Automation for Music on first AppleScript call. Apple Music access on first catalog playback.
 
     ## notes
 
-    music tile updates via `com.apple.Music.playerInfo` distributed notification. current state mirrored to `~/bob/state/music.json`.
+    music tile updates via `com.apple.Music.playerInfo` distributed notification. catalog debug info at `~/bob/state/music-debug.log`.
     """
     }
 }
