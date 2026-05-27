@@ -6,6 +6,8 @@ struct ContentView: View {
     @StateObject private var voiceOut = VoiceOutput()
     @ObservedObject private var home = BobHome.shared
 
+    @ObservedObject private var minions = MinionService.shared
+    @ObservedObject private var music = MusicService.shared
     @State private var showMemory = false
 
     var body: some View {
@@ -13,29 +15,34 @@ struct ContentView: View {
             VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
                 .ignoresSafeArea()
 
+            // album-art vibe — washes the window with the current track's colors
+            AmbientBackground(palette: music.palette, active: music.isPlaying)
+
             HStack(spacing: 14) {
-                VStack(spacing: 14) {
-                    HStack(spacing: 14) {
+                VStack(spacing: 18) {
+                    // ambient context — glanceable strip across the top
+                    HStack(spacing: 12) {
                         Tile(title: "work") { WorkTileContent() }
-                            .frame(maxWidth: .infinity, minHeight: 150)
                         Tile(title: "music") { MusicTileContent() }
-                            .frame(maxWidth: .infinity, minHeight: 150)
-                    }
-                    HStack(spacing: 14) {
                         Tile(title: "calendar") { CalendarTileContent() }
-                            .frame(maxWidth: .infinity, minHeight: 150)
                         Tile(title: "weather") { WeatherTileContent() }
-                            .frame(maxWidth: .infinity, minHeight: 150)
                     }
-                    Tile(title: "talk") {
-                        TalkTileContent(
-                            bridge: bridge,
-                            voiceIn: voiceIn,
-                            voiceOut: voiceOut,
-                            home: home
-                        )
+                    .frame(height: 110)
+
+                    Spacer(minLength: 0)
+
+                    // bob — the conductor, centered
+                    CenterStage(bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home)
+                        .frame(maxWidth: 640)
+
+                    // minions bob has delegated tasks to
+                    if !minions.active.isEmpty {
+                        MinionStrip(minions: minions.active)
+                            .frame(maxWidth: 640)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
-                    .frame(maxWidth: .infinity, minHeight: 200)
+
+                    Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity)
 
@@ -45,25 +52,102 @@ struct ContentView: View {
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
-            .padding(16)
+            .padding(20)
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: minions.active)
 
-            // Memory sidebar toggle — collapsed by default, floats top-right.
-            Button {
-                withAnimation(.easeInOut(duration: 0.22)) { showMemory.toggle() }
-            } label: {
-                Image(systemName: "sidebar.right")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(showMemory ? Color.accentColor.opacity(0.85) : .secondary.opacity(0.55))
-                    .padding(7)
-                    .background { Circle().fill(.ultraThinMaterial) }
-            }
-            .buttonStyle(.plain)
-            .help(showMemory ? "hide memory" : "show memory")
-            .padding(.top, 12)
-            .padding(.trailing, 14)
+            memoryToggle
         }
         .task {
             await home.bootstrapIfNeeded()
+        }
+    }
+
+    private var memoryToggle: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.22)) { showMemory.toggle() }
+        } label: {
+            Image(systemName: "sidebar.right")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(showMemory ? Color.accentColor.opacity(0.85) : .secondary.opacity(0.55))
+                .padding(7)
+                .background { Circle().fill(.ultraThinMaterial) }
+        }
+        .buttonStyle(.plain)
+        .help(showMemory ? "hide memory" : "show memory")
+        .padding(.top, 12)
+        .padding(.trailing, 14)
+    }
+}
+
+// MARK: minions
+
+/// A row of the little agent cards bob has delegated tasks to.
+private struct MinionStrip: View {
+    let minions: [MinionService.Minion]
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ForEach(minions) { minion in
+                MinionCard(minion: minion)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+private struct MinionCard: View {
+    let minion: MinionService.Minion
+    @State private var pulse = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            statusDot
+            VStack(alignment: .leading, spacing: 1) {
+                Text(minion.task)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.primary.opacity(0.85))
+                    .lineLimit(1)
+                if let detail = minion.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.6))
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background {
+            Capsule(style: .continuous).fill(.ultraThinMaterial)
+        }
+        .overlay {
+            Capsule(style: .continuous)
+                .strokeBorder(.white.opacity(0.06), lineWidth: 0.5)
+        }
+    }
+
+    @ViewBuilder
+    private var statusDot: some View {
+        switch minion.status {
+        case "done":
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(.green.opacity(0.85))
+        case "failed":
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(.red.opacity(0.8))
+        default: // working
+            Circle()
+                .fill(Color.accentColor.opacity(0.9))
+                .frame(width: 7, height: 7)
+                .scaleEffect(pulse ? 1.0 : 0.5)
+                .opacity(pulse ? 1.0 : 0.4)
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                        pulse = true
+                    }
+                }
         }
     }
 }
