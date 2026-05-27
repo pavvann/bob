@@ -107,12 +107,7 @@ private struct MinionCard: View {
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(.primary.opacity(0.85))
                     .lineLimit(1)
-                if let detail = minion.detail, !detail.isEmpty {
-                    Text(detail)
-                        .font(.system(size: 9, weight: .regular, design: .rounded))
-                        .foregroundStyle(.secondary.opacity(0.6))
-                        .lineLimit(1)
-                }
+                subtitle
             }
         }
         .padding(.horizontal, 12)
@@ -127,6 +122,30 @@ private struct MinionCard: View {
     }
 
     @ViewBuilder
+    private var subtitle: some View {
+        if minion.status == "working", let start = minion.startedAt {
+            // live elapsed timer while the minion grinds in the background
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                Text("working · \(elapsed(from: start, to: ctx.date))")
+                    .font(.system(size: 9, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.6))
+                    .lineLimit(1)
+            }
+        } else if let detail = minion.detail, !detail.isEmpty {
+            Text(detail)
+                .font(.system(size: 9, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.6))
+                .lineLimit(1)
+        }
+    }
+
+    private func elapsed(from start: Date, to now: Date) -> String {
+        let s = max(0, Int(now.timeIntervalSince(start)))
+        if s < 60 { return "\(s)s" }
+        return "\(s / 60)m \(s % 60)s"
+    }
+
+    @ViewBuilder
     private var statusDot: some View {
         switch minion.status {
         case "done":
@@ -137,6 +156,10 @@ private struct MinionCard: View {
             Image(systemName: "xmark.circle.fill")
                 .font(.system(size: 12))
                 .foregroundStyle(.red.opacity(0.8))
+        case "queued":
+            Circle()
+                .strokeBorder(.secondary.opacity(0.5), lineWidth: 1.4)
+                .frame(width: 7, height: 7)
         default: // working
             Circle()
                 .fill(Color.accentColor.opacity(0.9))

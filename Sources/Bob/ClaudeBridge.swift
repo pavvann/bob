@@ -115,7 +115,8 @@ final class ClaudeBridge: ObservableObject {
     /// Resolve the claude binary at startup. Prefer `~/.local/bin/claude` (where
     /// recent Claude Code installs land) over older copies that may sit on PATH.
     /// Falls back to PATH lookup via `/usr/bin/env` if no known path is executable.
-    private static let claudePath: String = {
+    /// Internal so MinionService can reuse it when spawning minions.
+    static let claudePath: String = {
         let fm = FileManager.default
         let candidates = [
             "\(NSHomeDirectory())/.local/bin/claude",
