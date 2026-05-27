@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import SwiftUI
 
 /// Listens for now-playing changes from Music.app and Spotify via
 /// `DistributedNotificationCenter`. Fetches album artwork from the
@@ -35,7 +36,21 @@ final class MusicService: ObservableObject {
         }
     }
 
-    @Published private(set) var current: Playback? = nil
+    @Published private(set) var current: Playback? = nil {
+        didSet {
+            let newURL = current?.track?.artworkURL
+            if newURL != oldValue?.track?.artworkURL {
+                Task { await updatePalette(for: newURL) }
+            }
+        }
+    }
+
+    /// Dominant colors pulled from the current track's artwork — drives the
+    /// ambient album-art background.
+    @Published private(set) var palette: [Color] = []
+
+    /// True when something is actively playing (not paused/stopped).
+    var isPlaying: Bool { current?.state == "playing" }
 
     /// Publish a track from outside (e.g. when MusicCatalogService plays via
     /// ApplicationMusicPlayer — Music.app's playerInfo notification doesn't
@@ -43,6 +58,65 @@ final class MusicService: ObservableObject {
     func publish(track: Track, state: String = "playing", source: String = "apple_music_catalog") {
         self.current = Playback(source: source, state: state, track: track, updatedAt: Date())
         writeState()
+    }
+
+    // MARK: album-art palette
+
+    private func updatePalette(for url: URL?) async {
+        guard let url else {
+            if !palette.isEmpty { palette = [] }
+            return
+        }
+        guard let (data, _) = try? await URLSession.shared.data(from: url),
+              let image = NSImage(data: data),
+              let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return
+        }
+        let colors = Self.extractPalette(from: cg)
+        if !colors.isEmpty { palette = colors }
+    }
+
+    /// Quantizes the artwork into 3-bit-per-channel buckets and returns the
+    /// most prominent colors, weighted toward vibrant ones.
+    private static func extractPalette(from cgImage: CGImage, maxColors: Int = 4) -> [Color] {
+        let dim = 32
+        var pixels = [UInt8](repeating: 0, count: dim * dim * 4)
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: &pixels, width: dim, height: dim, bitsPerComponent: 8,
+            bytesPerRow: dim * 4, space: cs,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return [] }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: dim, height: dim))
+
+        struct Bucket { var count = 0; var r = 0; var g = 0; var b = 0 }
+        var buckets: [Int: Bucket] = [:]
+        var i = 0
+        while i < pixels.count {
+            let r = Int(pixels[i]); let g = Int(pixels[i + 1]); let b = Int(pixels[i + 2]); let a = Int(pixels[i + 3])
+            i += 4
+            if a < 100 { continue }
+            let key = (r >> 5) << 6 | (g >> 5) << 3 | (b >> 5)
+            var bk = buckets[key] ?? Bucket()
+            bk.count += 1; bk.r += r; bk.g += g; bk.b += b
+            buckets[key] = bk
+        }
+        guard !buckets.isEmpty else { return [] }
+
+        func saturation(_ r: Double, _ g: Double, _ b: Double) -> Double {
+            let mx = max(r, g, b), mn = min(r, g, b)
+            return mx <= 0 ? 0 : (mx - mn) / mx
+        }
+
+        let scored: [(Color, Double)] = buckets.values.map { bk in
+            let r = Double(bk.r) / Double(bk.count)
+            let g = Double(bk.g) / Double(bk.count)
+            let b = Double(bk.b) / Double(bk.count)
+            let sat = saturation(r / 255, g / 255, b / 255)
+            let score = Double(bk.count) * (0.35 + sat)
+            return (Color(red: r / 255, green: g / 255, blue: b / 255), score)
+        }
+        return scored.sorted { $0.1 > $1.1 }.prefix(maxColors).map { $0.0 }
     }
 
     private let stateFile: URL
