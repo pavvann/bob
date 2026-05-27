@@ -67,6 +67,90 @@ final class MusicService: ObservableObject {
             name: NSNotification.Name("com.spotify.client.PlaybackStateChanged"),
             object: nil
         )
+
+        // playerInfo notifications only fire on track *changes*. If a player is
+        // already playing when bob launches, seed the tile by asking the apps
+        // directly via AppleScript.
+        Task { await seedFromRunningPlayer() }
+    }
+
+    /// One-shot query of Music.app then Spotify at launch, so the tile reflects
+    /// whatever's already playing. Skipped if a notification already populated
+    /// `current`. Triggers a one-time Automation (TCC) prompt the first time.
+    func seedFromRunningPlayer() async {
+        guard current == nil else { return }
+
+        if let (raw, source) = await Self.queryRunningPlayer() {
+            let parts = raw.components(separatedBy: "\t")
+            guard parts.count >= 4 else { return }
+            let name = parts[0], artist = parts[1], album = parts[2]
+            let state = parts[3].lowercased()
+            guard current == nil, state != "stopped", !name.isEmpty else { return }
+
+            let art = await lookupArtwork(artist: artist, album: album, track: name)
+            let track = Track(name: name, artist: artist, album: album, durationMs: nil, artworkURL: art)
+            current = Playback(source: source, state: state, track: track, updatedAt: Date())
+            writeState()
+        }
+    }
+
+    /// Returns (tab-joined "name\tartist\talbum\tstate", source) for whichever
+    /// of Music.app / Spotify is running and not stopped. Uses `is running` so
+    /// it never launches the apps.
+    private static func queryRunningPlayer() async -> (String, String)? {
+        let music = """
+        if application "Music" is running then
+            tell application "Music"
+                if player state is not stopped then
+                    set t to current track
+                    return (get name of t) & "\t" & (get artist of t) & "\t" & (get album of t) & "\t" & (player state as text)
+                end if
+            end tell
+        end if
+        return ""
+        """
+        if let out = await runOsascript(music), !out.isEmpty {
+            return (out, "apple_music")
+        }
+
+        let spotify = """
+        if application "Spotify" is running then
+            tell application "Spotify"
+                if player state is not stopped then
+                    set t to current track
+                    return (get name of t) & "\t" & (get artist of t) & "\t" & (get album of t) & "\t" & (player state as text)
+                end if
+            end tell
+        end if
+        return ""
+        """
+        if let out = await runOsascript(spotify), !out.isEmpty {
+            return (out, "spotify")
+        }
+        return nil
+    }
+
+    private static func runOsascript(_ script: String) async -> String? {
+        await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", script]
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = Pipe()
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let out = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    cont.resume(returning: out)
+                } catch {
+                    cont.resume(returning: nil)
+                }
+            }
+        }
     }
 
     deinit {
