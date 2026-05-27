@@ -6,35 +6,61 @@ struct ContentView: View {
     @StateObject private var voiceOut = VoiceOutput()
     @ObservedObject private var home = BobHome.shared
 
+    @State private var showMemory = false
+
     var body: some View {
-        ZStack {
+        ZStack(alignment: .topTrailing) {
             VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
                 .ignoresSafeArea()
 
-            VStack(spacing: 14) {
-                HStack(spacing: 14) {
-                    Tile(title: "work") { WorkTileContent() }
-                        .frame(maxWidth: .infinity, minHeight: 150)
-                    Tile(title: "music") { MusicTileContent() }
-                        .frame(maxWidth: .infinity, minHeight: 150)
+            HStack(spacing: 14) {
+                VStack(spacing: 14) {
+                    HStack(spacing: 14) {
+                        Tile(title: "work") { WorkTileContent() }
+                            .frame(maxWidth: .infinity, minHeight: 150)
+                        Tile(title: "music") { MusicTileContent() }
+                            .frame(maxWidth: .infinity, minHeight: 150)
+                    }
+                    HStack(spacing: 14) {
+                        Tile(title: "calendar") { CalendarTileContent() }
+                            .frame(maxWidth: .infinity, minHeight: 150)
+                        Tile(title: "weather") { WeatherTileContent() }
+                            .frame(maxWidth: .infinity, minHeight: 150)
+                    }
+                    Tile(title: "talk") {
+                        TalkTileContent(
+                            bridge: bridge,
+                            voiceIn: voiceIn,
+                            voiceOut: voiceOut,
+                            home: home
+                        )
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 200)
                 }
-                HStack(spacing: 14) {
-                    Tile(title: "calendar") { CalendarTileContent() }
-                        .frame(maxWidth: .infinity, minHeight: 150)
+                .frame(maxWidth: .infinity)
+
+                if showMemory {
                     Tile(title: "memory") { MemoryTileContent() }
-                        .frame(maxWidth: .infinity, minHeight: 150)
+                        .frame(width: 280)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
-                Tile(title: "talk") {
-                    TalkTileContent(
-                        bridge: bridge,
-                        voiceIn: voiceIn,
-                        voiceOut: voiceOut,
-                        home: home
-                    )
-                }
-                .frame(maxWidth: .infinity, minHeight: 200)
             }
             .padding(16)
+
+            // Memory sidebar toggle — collapsed by default, floats top-right.
+            Button {
+                withAnimation(.easeInOut(duration: 0.22)) { showMemory.toggle() }
+            } label: {
+                Image(systemName: "sidebar.right")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(showMemory ? Color.accentColor.opacity(0.85) : .secondary.opacity(0.55))
+                    .padding(7)
+                    .background { Circle().fill(.ultraThinMaterial) }
+            }
+            .buttonStyle(.plain)
+            .help(showMemory ? "hide memory" : "show memory")
+            .padding(.top, 12)
+            .padding(.trailing, 14)
         }
         .task {
             await home.bootstrapIfNeeded()
@@ -234,6 +260,106 @@ private struct WorkTileContent: View {
                 .foregroundStyle(.secondary.opacity(0.5))
         }
         .contentShape(Rectangle())
+    }
+}
+
+private struct WeatherTileContent: View {
+    @ObservedObject private var service = WeatherService.shared
+
+    var body: some View {
+        switch service.locationStatus {
+        case .notDetermined:
+            connectView
+        case .denied, .restricted:
+            deniedView
+        default:
+            // .authorized / .authorizedAlways on macOS
+            authorizedView
+        }
+    }
+
+    private var connectView: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                service.requestAccess()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "location.circle")
+                        .font(.system(size: 11))
+                    Text("connect location")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                }
+                .foregroundStyle(.blue.opacity(0.9))
+            }
+            .buttonStyle(.plain)
+            Text("local weather, updated through the day.")
+                .font(.system(size: 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.5))
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var deniedView: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("location access denied")
+                .font(.system(size: 13, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.7))
+            Button {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices") {
+                    NSWorkspace.shared.open(url)
+                }
+            } label: {
+                Text("enable in system settings →")
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.blue.opacity(0.85))
+            }
+            .buttonStyle(.plain)
+            Spacer(minLength: 0)
+        }
+    }
+
+    @ViewBuilder
+    private var authorizedView: some View {
+        if let s = service.state {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: s.symbolName)
+                    .font(.system(size: 30, weight: .light))
+                    .symbolRenderingMode(.multicolor)
+                    .frame(width: 38)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(Int(s.temperatureC.rounded()))°")
+                        .font(.system(size: 26, weight: .light, design: .rounded))
+                        .foregroundStyle(.primary.opacity(0.92))
+                    Text(s.condition)
+                        .font(.system(size: 12, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.8))
+                        .lineLimit(1)
+                    if let high = s.highC, let low = s.lowC {
+                        Text("H:\(Int(high.rounded()))°  L:\(Int(low.rounded()))°")
+                            .font(.system(size: 10, weight: .regular, design: .rounded))
+                            .foregroundStyle(.secondary.opacity(0.6))
+                    }
+                    Text(s.locationName)
+                        .font(.system(size: 10, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.5))
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+        } else if let err = service.lastError {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(err)
+                    .font(.system(size: 13, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.7))
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+            }
+        } else {
+            Text("loading weather...")
+                .font(.system(size: 13, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.5))
+        }
     }
 }
 
