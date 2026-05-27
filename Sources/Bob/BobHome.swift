@@ -98,7 +98,9 @@ final class BobHome: ObservableObject {
 
     private func createDirectoryStructure() throws {
         let fm = FileManager.default
-        for dir in [root, wikiDir, skillsDir, rawDir, stateDir, wikiBobDir, wikiTemplatesDir] {
+        let minionsActive = root.appendingPathComponent("minions/active", isDirectory: true)
+        let minionsDone = root.appendingPathComponent("minions/done", isDirectory: true)
+        for dir in [root, wikiDir, skillsDir, rawDir, stateDir, wikiBobDir, wikiTemplatesDir, minionsActive, minionsDone] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
     }
