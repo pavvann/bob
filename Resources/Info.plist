@@ -32,6 +32,8 @@
     <string>bob shows your next meeting and the join link for in-progress calls.</string>
     <key>NSAppleMusicUsageDescription</key>
     <string>bob plays apple music catalog tracks you ask for.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>bob uses your location to show local weather.</string>
     <key>LSUIElement</key>
     <false/>
     <key>CFBundleURLTypes</key>
