@@ -16,7 +16,7 @@ struct CenterStage: View {
     @FocusState private var inputFocused: Bool
     @State private var breathe = false
 
-    private var isIdle: Bool { bridge.response.isEmpty && !bridge.isStreaming }
+    private var isIdle: Bool { bridge.turns.isEmpty && !bridge.isStreaming }
 
     var body: some View {
         VStack(spacing: 24) {
@@ -31,7 +31,7 @@ struct CenterStage: View {
         }
         .onChange(of: voiceIn.transcript) { _, newValue in input = newValue }
         .onChange(of: bridge.isStreaming) { wasStreaming, nowStreaming in
-            if wasStreaming && !nowStreaming { voiceOut.speak(bridge.response) }
+            if wasStreaming && !nowStreaming { voiceOut.speak(bridge.lastResponse) }
         }
         .animation(.easeInOut(duration: 0.35), value: isIdle)
     }
@@ -63,23 +63,48 @@ struct CenterStage: View {
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    Text(bridge.response.isEmpty ? "…" : bridge.response)
-                        .font(.system(size: 16, weight: .regular, design: .rounded))
-                        .foregroundStyle(.primary.opacity(0.92))
-                        .lineSpacing(4)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .id("end")
+                    VStack(alignment: .leading, spacing: 18) {
+                        ForEach(bridge.turns) { turn in
+                            turnRow(turn)
+                        }
+                        Color.clear.frame(height: 1).id("end")
+                    }
+                    .padding(.vertical, 4)
                 }
-                .frame(maxHeight: 340)
+                .frame(maxHeight: 380)
                 .scrollIndicators(.never)
-                .onChange(of: bridge.response) { _, _ in
+                .onChange(of: bridge.turns) { _, _ in
                     withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo("end", anchor: .bottom)
                     }
                 }
             }
             .transition(.opacity)
+        }
+    }
+
+    /// One turn in the running conversation. Your turns sit right-aligned and
+    /// muted (an echo of what you said); bob's replies are left, full reading
+    /// weight. Minimal — a thread, not chat bubbles.
+    @ViewBuilder
+    private func turnRow(_ turn: ClaudeBridge.Turn) -> some View {
+        switch turn.role {
+        case .you:
+            HStack {
+                Spacer(minLength: 48)
+                Text(turn.text)
+                    .font(.system(size: 14, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.7))
+                    .multilineTextAlignment(.trailing)
+                    .textSelection(.enabled)
+            }
+        case .bob:
+            Text(turn.text.isEmpty ? "…" : turn.text)
+                .font(.system(size: 16, weight: .regular, design: .rounded))
+                .foregroundStyle(.primary.opacity(0.92))
+                .lineSpacing(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
         }
     }
 
