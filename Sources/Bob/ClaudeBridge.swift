@@ -2,9 +2,22 @@ import Foundation
 
 @MainActor
 final class ClaudeBridge: ObservableObject {
-    @Published var response: String = ""
+    enum Role: String { case you, bob }
+    struct Turn: Identifiable, Equatable {
+        let id = UUID()
+        let role: Role
+        var text: String
+    }
+
+    /// The running conversation for this session — your turns and bob's
+    /// streamed replies, in order. Replaces the old single `response` so the
+    /// chat history stays visible instead of getting wiped each message.
+    @Published private(set) var turns: [Turn] = []
     @Published var isStreaming: Bool = false
     @Published var lastError: String? = nil
+
+    /// bob's most recent reply text (used for text-to-speech).
+    var lastResponse: String { turns.last(where: { $0.role == .bob })?.text ?? "" }
 
     /// Session UUID for this bob launch. First turn uses `--session-id` (creates).
     /// Subsequent turns use `--resume <id>` (continues). Reset by quit+relaunch
@@ -19,7 +32,7 @@ final class ClaudeBridge: ObservableObject {
         currentProcess?.terminate()
         sessionId = UUID().uuidString
         sessionStarted = false
-        response = ""
+        turns = []
         lastError = nil
         isStreaming = false
     }
@@ -29,9 +42,11 @@ final class ClaudeBridge: ObservableObject {
         guard !prompt.isEmpty else { return }
 
         currentProcess?.terminate()
-        response = ""
         lastError = nil
         isStreaming = true
+        // Append the user's turn and an empty bob turn to stream into.
+        turns.append(Turn(role: .you, text: prompt))
+        turns.append(Turn(role: .bob, text: ""))
 
         let process = Process()
         let pipe = Pipe()
@@ -80,7 +95,7 @@ final class ClaudeBridge: ObservableObject {
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             Task { @MainActor in
-                self?.response.append(text)
+                self?.appendToReply(text)
             }
         }
 
@@ -100,8 +115,20 @@ final class ClaudeBridge: ObservableObject {
         } catch {
             isStreaming = false
             lastError = "couldn't start claude: \(error.localizedDescription)"
-            response = lastError ?? ""
+            setReply(lastError ?? "")
         }
+    }
+
+    /// Append streamed text to the in-flight bob turn.
+    private func appendToReply(_ text: String) {
+        guard let idx = turns.lastIndex(where: { $0.role == .bob }) else { return }
+        turns[idx].text += text
+    }
+
+    /// Replace the in-flight bob turn's text (used for error messages).
+    private func setReply(_ text: String) {
+        guard let idx = turns.lastIndex(where: { $0.role == .bob }) else { return }
+        turns[idx].text = text
     }
 
     func cancel() {
