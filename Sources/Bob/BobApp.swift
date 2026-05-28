@@ -12,8 +12,8 @@ struct BobApp: App {
         // a new one. Kills the "two bob windows" bug.
         Window("bob", id: "main") {
             ContentView()
-                .frame(minWidth: 720, idealWidth: 980, maxWidth: 1320,
-                       minHeight: 540, idealHeight: 660, maxHeight: 1000)
+                .frame(minWidth: 820, idealWidth: 1120, maxWidth: 1440,
+                       minHeight: 540, idealHeight: 680, maxHeight: 1000)
                 .background(WindowAccessor { window in
                     Self.style(window)
                 })
@@ -22,7 +22,7 @@ struct BobApp: App {
                 }
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 980, height: 660)
+        .defaultSize(width: 1120, height: 680)
     }
 
     static func style(_ window: NSWindow) {

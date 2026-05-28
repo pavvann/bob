@@ -20,14 +20,19 @@ struct ContentView: View {
 
             HStack(spacing: 14) {
                 VStack(spacing: 18) {
-                    // ambient context — glanceable strip across the top
-                    HStack(spacing: 12) {
-                        Tile(title: "work") { WorkTileContent() }
-                        Tile(title: "music") { MusicTileContent() }
-                        Tile(title: "calendar") { CalendarTileContent() }
-                        Tile(title: "weather") { WeatherTileContent() }
+                    // ambient context — glanceable strip across the top.
+                    // hover any tile to grow it (dock-style) into the richer
+                    // expanded variant. HStack alignment top so smaller tiles
+                    // sit at the top while the hovered one expands downward.
+                    HStack(alignment: .top, spacing: 12) {
+                        HoverTile(title: "work") { exp in WorkTileContent(expanded: exp) }
+                        HoverTile(title: "music") { exp in MusicTileContent(expanded: exp) }
+                        HoverTile(title: "todos") { exp in TodoTileContent(expanded: exp) }
+                        HoverTile(title: "calendar") { exp in CalendarTileContent(expanded: exp) }
+                        HoverTile(title: "weather") { exp in WeatherTileContent(expanded: exp) }
                     }
-                    .frame(height: 110)
+                    .frame(height: 110, alignment: .top)
+                    .zIndex(2)
 
                     Spacer(minLength: 0)
 
@@ -195,6 +200,7 @@ private struct PlaceholderTileContent: View {
 }
 
 private struct WorkTileContent: View {
+    var expanded: Bool = false
     @ObservedObject private var service = GitHubService.shared
 
     private enum Section: Hashable {
@@ -202,7 +208,7 @@ private struct WorkTileContent: View {
         case openPRs
     }
 
-    @State private var expanded: Section?
+    @State private var expandedSection: Section?
 
     var body: some View {
         if let state = service.state {
@@ -229,6 +235,8 @@ private struct WorkTileContent: View {
                         .foregroundStyle(.secondary.opacity(0.45))
                     Spacer(minLength: 0)
                 }
+            } else if expanded {
+                expandedView(state: state)
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 6) {
@@ -286,6 +294,87 @@ private struct WorkTileContent: View {
         s.reviewRequests.isEmpty && s.openPRs.isEmpty && s.unreadNotifications == 0
     }
 
+    /// Hover-expanded view: flat list of every open PR with title + repo,
+    /// plus the unread-notifications link. No dropdowns — everything visible.
+    private func expandedView(state: GitHubService.State) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                if !state.reviewRequests.isEmpty {
+                    sectionHeader("awaiting your review", icon: "eye", tint: .blue, count: state.reviewRequests.count)
+                    ForEach(state.reviewRequests) { pr in prRow(pr) }
+                }
+                if !state.openPRs.isEmpty {
+                    sectionHeader("your open PRs", icon: "arrow.triangle.pull", tint: .green, count: state.openPRs.count)
+                        .padding(.top, state.reviewRequests.isEmpty ? 0 : 4)
+                    ForEach(state.openPRs) { pr in prRow(pr) }
+                }
+                if state.unreadNotifications > 0 {
+                    Button {
+                        if let url = URL(string: "https://github.com/notifications") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "bell")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.orange.opacity(0.85))
+                            Text("\(state.unreadNotifications) unread")
+                                .font(.system(size: 11, weight: .regular, design: .rounded))
+                                .foregroundStyle(.secondary.opacity(0.85))
+                            Image(systemName: "arrow.up.right")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary.opacity(0.55))
+                        }
+                        .padding(.top, 4)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .scrollIndicators(.never)
+    }
+
+    private func sectionHeader(_ text: String, icon: String, tint: Color, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(tint.opacity(0.85))
+            Text("\(count) \(text)")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .tracking(0.3)
+        }
+    }
+
+    private func prRow(_ pr: GitHubService.PR) -> some View {
+        Button {
+            if let url = URL(string: pr.url) {
+                NSWorkspace.shared.open(url)
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary.opacity(0.55))
+                Text(pr.title)
+                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                    .foregroundStyle(.primary.opacity(0.88))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                Text(pr.repo)
+                    .font(.system(size: 9, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.55))
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            .padding(.leading, 12)
+        }
+        .buttonStyle(.plain)
+    }
+
     private func expandableRow(
         section: Section,
         icon: String,
@@ -295,11 +384,11 @@ private struct WorkTileContent: View {
         plural: String,
         prs: [GitHubService.PR]
     ) -> some View {
-        let isOpen = expanded == section
+        let isOpen = expandedSection == section
         return VStack(alignment: .leading, spacing: 3) {
             Button {
                 withAnimation(.easeInOut(duration: 0.14)) {
-                    expanded = isOpen ? nil : section
+                    expandedSection = isOpen ? nil : section
                 }
             } label: {
                 rowLabel(
@@ -370,7 +459,60 @@ private struct WorkTileContent: View {
     }
 }
 
+private struct TodoTileContent: View {
+    var expanded: Bool = false
+    @ObservedObject private var service = TodoService.shared
+
+    var body: some View {
+        let open = service.open
+        let visible = expanded ? Array(open) : Array(open.prefix(4))
+        VStack(alignment: .leading, spacing: 5) {
+            if open.isEmpty {
+                Text(service.todos.isEmpty ? "no todos." : "all done.")
+                    .font(.system(size: 13, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.65))
+                Text("ask bob to add one.")
+                    .font(.system(size: 10, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.45))
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(visible) { todo in
+                            HStack(spacing: 7) {
+                                Button {
+                                    withAnimation(.easeOut(duration: 0.18)) {
+                                        service.toggle(todo.id)
+                                    }
+                                } label: {
+                                    Image(systemName: "circle")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(.secondary.opacity(0.65))
+                                }
+                                .buttonStyle(.plain)
+                                Text(todo.text)
+                                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                                    .foregroundStyle(.primary.opacity(0.85))
+                                    .lineLimit(expanded ? 2 : 1)
+                                    .truncationMode(.tail)
+                            }
+                        }
+                        if !expanded && open.count > 4 {
+                            Text("+\(open.count - 4) more")
+                                .font(.system(size: 9, weight: .regular, design: .rounded))
+                                .foregroundStyle(.secondary.opacity(0.5))
+                                .padding(.leading, 18)
+                        }
+                    }
+                }
+                .scrollIndicators(.never)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
 private struct WeatherTileContent: View {
+    var expanded: Bool = false
     @ObservedObject private var service = WeatherService.shared
 
     var body: some View {
@@ -471,6 +613,7 @@ private struct WeatherTileContent: View {
 }
 
 private struct CalendarTileContent: View {
+    var expanded: Bool = false
     @ObservedObject private var service = CalendarService.shared
 
     var body: some View {
@@ -528,7 +671,9 @@ private struct CalendarTileContent: View {
     @ViewBuilder
     private var authorizedView: some View {
         if let state = service.state {
-            if let now = state.now {
+            if expanded {
+                expandedEventsView(state: state)
+            } else if let now = state.now {
                 eventCard(event: now, isInProgress: true)
             } else if let next = state.next {
                 eventCard(event: next, isInProgress: false)
@@ -547,6 +692,32 @@ private struct CalendarTileContent: View {
             Text("loading...")
                 .font(.system(size: 13, weight: .regular, design: .rounded))
                 .foregroundStyle(.secondary.opacity(0.5))
+        }
+    }
+
+    /// Hover-expanded calendar: show current + next event when both exist.
+    @ViewBuilder
+    private func expandedEventsView(state: CalendarService.State) -> some View {
+        if state.now == nil && state.next == nil {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("nothing scheduled")
+                    .font(.system(size: 13, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.7))
+                Text("you're clear for the next 7 days.")
+                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.5))
+                Spacer(minLength: 0)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                if let now = state.now {
+                    eventCard(event: now, isInProgress: true)
+                }
+                if let next = state.next {
+                    eventCard(event: next, isInProgress: false)
+                }
+                Spacer(minLength: 0)
+            }
         }
     }
 
@@ -639,6 +810,7 @@ private struct CalendarTileContent: View {
 }
 
 private struct MusicTileContent: View {
+    var expanded: Bool = false
     @ObservedObject private var service = MusicService.shared
 
     var body: some View {
@@ -648,13 +820,20 @@ private struct MusicTileContent: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(track.name)
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .font(.system(size: expanded ? 14 : 12, weight: .medium, design: .rounded))
                         .foregroundStyle(.primary.opacity(0.9))
-                        .lineLimit(2)
+                        .lineLimit(expanded ? 3 : 2)
                     Text(track.artist)
-                        .font(.system(size: 11, weight: .regular, design: .rounded))
-                        .foregroundStyle(.secondary.opacity(0.8))
-                        .lineLimit(1)
+                        .font(.system(size: expanded ? 12 : 11, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.85))
+                        .lineLimit(expanded ? 2 : 1)
+                    if expanded, !track.album.isEmpty {
+                        Text(track.album)
+                            .font(.system(size: 11, weight: .regular, design: .rounded))
+                            .foregroundStyle(.secondary.opacity(0.6))
+                            .lineLimit(2)
+                            .padding(.top, 1)
+                    }
                     if playback.state != "playing" {
                         Text(playback.state)
                             .font(.system(size: 9, weight: .medium, design: .rounded))
@@ -679,6 +858,8 @@ private struct MusicTileContent: View {
         }
     }
 
+    private var artworkSize: CGFloat { expanded ? 110 : 56 }
+
     @ViewBuilder
     private func artwork(url: URL?) -> some View {
         if let url {
@@ -690,11 +871,11 @@ private struct MusicTileContent: View {
                     placeholderArt
                 }
             }
-            .frame(width: 56, height: 56)
+            .frame(width: artworkSize, height: artworkSize)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         } else {
             placeholderArt
-                .frame(width: 56, height: 56)
+                .frame(width: artworkSize, height: artworkSize)
         }
     }
 
