@@ -4,6 +4,13 @@
 Package.resolved
 DerivedData/
 
+# stray swift compile outputs (in case they leak out of .build/)
+*.o
+*.d
+*.swiftdeps
+*.swiftmodule
+*.swiftsourceinfo
+
 # Built app bundle (output of `make app`)
 Bob.app/
 
