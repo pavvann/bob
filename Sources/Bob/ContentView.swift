@@ -65,6 +65,14 @@ struct ContentView: View {
         .task {
             await home.bootstrapIfNeeded()
         }
+        .onReceive(NotificationCenter.default.publisher(for: MinionService.minionFinished)) { note in
+            // a hand reported back — let bob relay it in his own voice
+            guard let info = note.userInfo,
+                  let task = info["task"] as? String else { return }
+            let detail = info["detail"] as? String ?? ""
+            let ok = info["ok"] as? Bool ?? true
+            bridge.debrief(task: task, detail: detail, ok: ok)
+        }
     }
 
     private var memoryToggle: some View {
