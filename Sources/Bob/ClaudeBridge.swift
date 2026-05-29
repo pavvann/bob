@@ -19,6 +19,12 @@ final class ClaudeBridge: ObservableObject {
     /// bob's most recent reply text (used for text-to-speech).
     var lastResponse: String { turns.last(where: { $0.role == .bob })?.text ?? "" }
 
+    /// Called with each completed sentence as bob streams, so bob can speak as
+    /// he thinks rather than reading a finished wall of text. Wired by the view
+    /// to VoiceOutput. No-op until set.
+    var onSentence: ((String) -> Void)?
+    private var spokenUpTo: Int = 0
+
     /// Session UUID for this bob launch. First turn uses `--session-id` (creates).
     /// Subsequent turns use `--resume <id>` (continues). Reset by quit+relaunch
     /// or by calling `resetSession()`.
@@ -35,6 +41,7 @@ final class ClaudeBridge: ObservableObject {
         turns = []
         lastError = nil
         isStreaming = false
+        spokenUpTo = 0
     }
 
     func send(_ rawPrompt: String) {
@@ -44,6 +51,7 @@ final class ClaudeBridge: ObservableObject {
         currentProcess?.terminate()
         lastError = nil
         isStreaming = true
+        spokenUpTo = 0
         // Append the user's turn and an empty bob turn to stream into.
         turns.append(Turn(role: .you, text: prompt))
         turns.append(Turn(role: .bob, text: ""))
@@ -102,8 +110,13 @@ final class ClaudeBridge: ObservableObject {
         process.terminationHandler = { [weak self] _ in
             pipe.fileHandleForReading.readabilityHandler = nil
             Task { @MainActor in
-                self?.isStreaming = false
-                self?.currentProcess = nil
+                guard let self else { return }
+                // speak any trailing fragment that never got a terminator
+                if let idx = self.turns.lastIndex(where: { $0.role == .bob }) {
+                    self.flushSpeakable(self.turns[idx].text, final: true)
+                }
+                self.isStreaming = false
+                self.currentProcess = nil
             }
         }
 
@@ -119,10 +132,39 @@ final class ClaudeBridge: ObservableObject {
         }
     }
 
-    /// Append streamed text to the in-flight bob turn.
+    /// Append streamed text to the in-flight bob turn, and speak any sentences
+    /// that just completed.
     private func appendToReply(_ text: String) {
         guard let idx = turns.lastIndex(where: { $0.role == .bob }) else { return }
         turns[idx].text += text
+        flushSpeakable(turns[idx].text)
+    }
+
+    /// Emit any newly-completed sentences (since `spokenUpTo`) to `onSentence`.
+    /// A sentence ends at . ? ! or newline followed by whitespace or end.
+    private func flushSpeakable(_ full: String, final: Bool = false) {
+        guard onSentence != nil else { return }
+        let chars = Array(full)
+        guard spokenUpTo < chars.count else { return }
+
+        var lastBoundary = spokenUpTo
+        var i = spokenUpTo
+        while i < chars.count {
+            let ch = chars[i]
+            if ch == "." || ch == "!" || ch == "?" || ch == "\n" {
+                let nextIsBreak = (i + 1 >= chars.count) || chars[i + 1].isWhitespace
+                if nextIsBreak { lastBoundary = i + 1 }
+            }
+            i += 1
+        }
+        // On the final flush, speak whatever's left even without a terminator.
+        if final { lastBoundary = chars.count }
+
+        guard lastBoundary > spokenUpTo else { return }
+        let chunk = String(chars[spokenUpTo..<lastBoundary])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        spokenUpTo = lastBoundary
+        if !chunk.isEmpty { onSentence?(chunk) }
     }
 
     /// Replace the in-flight bob turn's text (used for error messages).
