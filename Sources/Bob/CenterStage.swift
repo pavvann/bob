@@ -12,9 +12,11 @@ struct CenterStage: View {
     /// First-name initial used in the greeting. Single letter, not identifying.
     var initialName: String = "p"
 
+    @ObservedObject private var pulse = BobPulse.shared
+    @ObservedObject private var minions = MinionService.shared
+
     @State private var input: String = ""
     @FocusState private var inputFocused: Bool
-    @State private var breathe = false
 
     private var isIdle: Bool { bridge.turns.isEmpty && !bridge.isStreaming }
 
@@ -25,15 +27,32 @@ struct CenterStage: View {
         }
         .onAppear {
             inputFocused = true
-            withAnimation(.easeInOut(duration: 4).repeatForever(autoreverses: true)) {
-                breathe = true
+            refreshPulse()
+            // bob speaks each sentence as it streams (no-op unless voice is on).
+            bridge.onSentence = { [weak voiceOut] sentence in
+                voiceOut?.speakSentence(sentence)
             }
         }
         .onChange(of: voiceIn.transcript) { _, newValue in input = newValue }
-        .onChange(of: bridge.isStreaming) { wasStreaming, nowStreaming in
-            if wasStreaming && !nowStreaming { voiceOut.speak(bridge.lastResponse) }
+        .onChange(of: voiceIn.isRecording) { _, _ in refreshPulse() }
+        .onChange(of: bridge.isStreaming) { _, _ in refreshPulse() }
+        .onChange(of: inputFocused) { _, _ in refreshPulse() }
+        .onChange(of: minions.active.count) { _, _ in refreshPulse() }
+        .onReceive(NotificationCenter.default.publisher(for: HotKeyManager.didSummon)) { _ in
+            // ⌥Space brought bob to the front — drop the cursor straight in the box.
+            inputFocused = true
         }
         .animation(.easeInOut(duration: 0.35), value: isIdle)
+    }
+
+    /// Tell bob's pulse what's happening so the whole app's rhythm follows.
+    private func refreshPulse() {
+        pulse.refresh(
+            focused: inputFocused,
+            streaming: bridge.isStreaming,
+            listening: voiceIn.isRecording,
+            minions: minions.active.count
+        )
     }
 
     // MARK: stage (greeting or response)
@@ -42,11 +61,17 @@ struct CenterStage: View {
     private var stage: some View {
         if isIdle {
             VStack(spacing: 8) {
-                Text(greeting)
-                    .font(.system(size: 38, weight: .light, design: .rounded))
-                    .foregroundStyle(.primary.opacity(0.88))
-                    .scaleEffect(breathe ? 1.0 : 0.988)
-                    .opacity(breathe ? 1.0 : 0.9)
+                TimelineView(.animation) { timeline in
+                    // breath rate follows bob's pulse — calm at rest, quicker awake
+                    let t = timeline.date.timeIntervalSinceReferenceDate
+                    let phase = sin(t / pulse.breathPeriod * 2 * .pi)
+                    Text(greeting)
+                        .font(.system(size: 38, weight: .light, design: .rounded))
+                        .foregroundStyle(.primary.opacity(0.88))
+                        .scaleEffect(1.0 + phase * 0.012)
+                        .opacity(0.92 + phase * 0.08)
+                }
+                .fixedSize()
                 if case .bootstrapping(let msg) = home.status {
                     Text(msg)
                         .font(.system(size: 12, weight: .regular, design: .rounded))
@@ -99,12 +124,20 @@ struct CenterStage: View {
                     .textSelection(.enabled)
             }
         case .bob:
-            Text(turn.text.isEmpty ? "…" : turn.text)
-                .font(.system(size: 16, weight: .regular, design: .rounded))
-                .foregroundStyle(.primary.opacity(0.92))
-                .lineSpacing(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
+            if turn.text.isEmpty && bridge.isStreaming {
+                // the held breath before the first word — a living glyph, not "…"
+                ThinkingOrb(size: 28)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.scale.combined(with: .opacity))
+            } else {
+                Text(turn.text)
+                    .font(.system(size: 16, weight: .regular, design: .rounded))
+                    .foregroundStyle(.primary.opacity(0.92))
+                    .lineSpacing(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .transition(.opacity)
+            }
         }
     }
 
@@ -112,18 +145,38 @@ struct CenterStage: View {
 
     private var inputBar: some View {
         HStack(spacing: 12) {
-            TextField(
-                "",
-                text: $input,
-                prompt: Text(placeholder).foregroundStyle(.secondary.opacity(0.6)),
-                axis: .vertical
-            )
-            .textFieldStyle(.plain)
-            .font(.system(size: 16, weight: .regular, design: .rounded))
-            .focused($inputFocused)
-            .lineLimit(1...4)
-            .onSubmit(send)
-            .submitLabel(.send)
+            if voiceIn.isRecording {
+                // the box comes to life — a live waveform of your voice, with
+                // what bob's heard so far as a faint caption underneath.
+                VStack(alignment: .leading, spacing: 3) {
+                    WaveformView(levels: voiceIn.levels)
+                        .frame(height: 24)
+                    if !input.isEmpty {
+                        Text(input)
+                            .font(.system(size: 11, weight: .regular, design: .rounded))
+                            .foregroundStyle(.secondary.opacity(0.6))
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(minHeight: 24)
+                .transition(.opacity)
+            } else {
+                TextField(
+                    "",
+                    text: $input,
+                    prompt: Text(placeholder).foregroundStyle(.secondary.opacity(0.6)),
+                    axis: .vertical
+                )
+                .textFieldStyle(.plain)
+                .font(.system(size: 16, weight: .regular, design: .rounded))
+                .focused($inputFocused)
+                .lineLimit(1...4)
+                .onSubmit(send)
+                .submitLabel(.send)
+                .transition(.opacity)
+            }
 
             micButton
             speakerButton
@@ -135,9 +188,16 @@ struct CenterStage: View {
                 .fill(.ultraThinMaterial)
         }
         .overlay {
-            AnimatedBorder(cornerRadius: 26, bleed: 16)
-                .padding(-16)
+            AnimatedBorder(
+                cornerRadius: 26,
+                bleed: 16,
+                voiceLevel: Double(voiceIn.level),
+                streaming: bridge.isStreaming,
+                energy: pulse.energy
+            )
+            .padding(-16)
         }
+        .animation(.easeInOut(duration: 0.25), value: voiceIn.isRecording)
     }
 
     private var micButton: some View {
