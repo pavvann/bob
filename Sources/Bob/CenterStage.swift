@@ -14,6 +14,7 @@ struct CenterStage: View {
 
     @ObservedObject private var pulse = BobPulse.shared
     @ObservedObject private var minions = MinionService.shared
+    @ObservedObject private var openLine = OpenLine.shared
 
     @State private var input: String = ""
     @FocusState private var inputFocused: Bool
@@ -28,11 +29,17 @@ struct CenterStage: View {
         .onAppear {
             inputFocused = true
             refreshPulse()
+            openLine.refreshIfStale()
             // bob speaks each sentence as it streams (no-op unless voice is on).
             bridge.onSentence = { [weak voiceOut] sentence in
                 voiceOut?.speakSentence(sentence)
             }
         }
+        .onChange(of: isIdle) { _, idle in
+            // back to the resting screen — freshen bob's open line
+            if idle { openLine.refreshIfStale() }
+        }
+        .animation(.easeInOut(duration: 0.6), value: openLine.line)
         .onChange(of: voiceIn.transcript) { _, newValue in input = newValue }
         .onChange(of: voiceIn.isRecording) { _, _ in refreshPulse() }
         .onChange(of: bridge.isStreaming) { _, _ in refreshPulse() }
@@ -72,6 +79,16 @@ struct CenterStage: View {
                         .opacity(0.92 + phase * 0.08)
                 }
                 .fixedSize()
+                // bob's own line about your day — picks up where you left off
+                if home.status == .ready, let line = openLine.line, home.welcomeNote == nil {
+                    Text(line)
+                        .font(.system(size: 14, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 2)
+                        .padding(.horizontal, 24)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
                 if case .bootstrapping(let msg) = home.status {
                     Text(msg)
                         .font(.system(size: 12, weight: .regular, design: .rounded))
