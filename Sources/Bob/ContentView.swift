@@ -102,39 +102,101 @@ private struct MinionStrip: View {
 
 private struct MinionCard: View {
     let minion: MinionService.Minion
+    @ObservedObject private var service = MinionService.shared
     @State private var pulse = false
+    @State private var expanded = false
+
+    private var events: [MinionService.Event] { service.events(for: minion.id) }
 
     var body: some View {
-        HStack(spacing: 8) {
-            statusDot
-            VStack(alignment: .leading, spacing: 1) {
-                Text(minion.task)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(.primary.opacity(0.85))
-                    .lineLimit(1)
-                subtitle
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            if expanded && !events.isEmpty {
+                feed
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background {
-            Capsule(style: .continuous).fill(.ultraThinMaterial)
+        .background { shape.fill(.ultraThinMaterial) }
+        .overlay { shape.stroke(Color.white.opacity(0.06), lineWidth: 0.5) }
+        .animation(.easeInOut(duration: 0.2), value: events.count)
+    }
+
+    private var header: some View {
+        Button {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.8)) { expanded.toggle() }
+        } label: {
+            HStack(spacing: 8) {
+                statusDot
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(minion.task)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(.primary.opacity(0.85))
+                        .lineLimit(1)
+                    subtitle
+                }
+                if !events.isEmpty {
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.secondary.opacity(0.4))
+                        .padding(.leading, 2)
+                }
+            }
+            .contentShape(Rectangle())
         }
-        .overlay {
-            Capsule(style: .continuous)
-                .strokeBorder(.white.opacity(0.06), lineWidth: 0.5)
+        .buttonStyle(.plain)
+    }
+
+    private var feed: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(events.suffix(7)) { ev in
+                feedRow(ev)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
+        .padding(.top, 8)
+        .frame(maxWidth: 300, alignment: .leading)
+    }
+
+    private func feedRow(_ ev: MinionService.Event) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: ev.symbol)
+                .font(.system(size: 9))
+                .foregroundStyle(ev.isThought ? Color.accentColor.opacity(0.7) : Color.secondary.opacity(0.6))
+                .frame(width: 12)
+            Text(ev.text)
+                .font(.system(size: 10, weight: .regular, design: .rounded))
+                .foregroundStyle(ev.isThought ? Color.primary.opacity(0.8) : Color.secondary.opacity(0.75))
+                .italic(ev.isThought)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var shape: AnyShape {
+        expanded
+            ? AnyShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            : AnyShape(Capsule(style: .continuous))
     }
 
     @ViewBuilder
     private var subtitle: some View {
-        if minion.status == "working", let start = minion.startedAt {
-            // live elapsed timer while the minion grinds in the background
-            TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                Text("working · \(elapsed(from: start, to: ctx.date))")
+        if minion.status == "working" {
+            if let latest = events.last(where: { !$0.isThought }) ?? events.last {
+                // show what the minion is doing RIGHT NOW
+                Text(latest.text)
                     .font(.system(size: 9, weight: .regular, design: .rounded))
-                    .foregroundStyle(.secondary.opacity(0.6))
+                    .foregroundStyle(.secondary.opacity(0.65))
                     .lineLimit(1)
+                    .truncationMode(.tail)
+            } else if let start = minion.startedAt {
+                TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                    Text("working · \(elapsed(from: start, to: ctx.date))")
+                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.6))
+                        .lineLimit(1)
+                }
             }
         } else if let detail = minion.detail, !detail.isEmpty {
             Text(detail)
