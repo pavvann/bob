@@ -52,6 +52,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ⌥Space summons bob from anywhere — the Spotlight feel.
         HotKeyManager.shared.onTrigger = { HotKeyManager.toggleBob() }
         HotKeyManager.shared.register()
+
+        // Esc steps bob aside, like dismissing Spotlight.
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 { // esc
+                NSApp.hide(nil)
+                return nil // consume
+            }
+            return event
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
