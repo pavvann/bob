@@ -58,6 +58,7 @@ final class VoiceOutput: ObservableObject {
             t = t.replacingOccurrences(of: pattern, with: repl, options: .regularExpression)
         }
         sub("```[\\s\\S]*?```", "")          // fenced code blocks — drop entirely
+        sub("https?://\\S+", "link")         // bare URLs — say "link", don't spell it
         sub("`([^`]*)`", "$1")               // inline code
         sub("\\*\\*([^*]+)\\*\\*", "$1")     // bold
         sub("\\*([^*]+)\\*", "$1")           // italic

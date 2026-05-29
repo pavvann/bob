@@ -21,7 +21,14 @@ final class VoiceInput: ObservableObject {
         if isRecording { stop() } else { start() }
     }
 
+    private var starting = false
+
     func start() {
+        // guard against rapid on/off/on: isRecording is still false during the
+        // async authorization window, so a second start() could install a second
+        // tap on a running engine. `starting` closes that gap.
+        guard !isRecording, !starting else { return }
+        starting = true
         transcript = ""
         status = nil
         SFSpeechRecognizer.requestAuthorization { [weak self] auth in
@@ -35,6 +42,7 @@ final class VoiceInput: ObservableObject {
                 @unknown default:
                     self.status = "speech permission unknown state"
                 }
+                self.starting = false
             }
         }
     }

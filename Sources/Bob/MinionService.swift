@@ -95,7 +95,15 @@ final class MinionService: ObservableObject {
                   let m = try? decoder.decode(Minion.self, from: data) else { continue }
 
             if m.status == "queued", !spawned.contains(m.id) {
-                spawn(m)
+                // the wrapper creates <id>.events.jsonl as its first act, so if
+                // one already exists this minion was already started (e.g.
+                // before a bob restart) — don't double-launch it.
+                let evURL = minionsDir.appendingPathComponent("\(m.id).events.jsonl")
+                if FileManager.default.fileExists(atPath: evURL.path) {
+                    spawned.insert(m.id)
+                } else {
+                    spawn(m)
+                }
             }
 
             // tail the live event stream for anything in flight
@@ -105,18 +113,23 @@ final class MinionService: ObservableObject {
 
             if m.status == "done" || m.status == "failed" {
                 tailEvents(id: m.id) // catch the final events
-                // fire the debrief exactly once, the moment it finishes
+                // fire the debrief exactly once, and only if it JUST finished —
+                // a done record left in active/ from before bob launched
+                // shouldn't trigger a stale "i finished X" out of nowhere.
                 if !debriefed.contains(m.id) {
                     debriefed.insert(m.id)
-                    NotificationCenter.default.post(
-                        name: Self.minionFinished,
-                        object: nil,
-                        userInfo: [
-                            "task": m.task,
-                            "detail": m.detail ?? "",
-                            "ok": m.status == "done",
-                        ]
-                    )
+                    let fresh = m.finishedAt.map { Date().timeIntervalSince($0) < 25 } ?? false
+                    if fresh {
+                        NotificationCenter.default.post(
+                            name: Self.minionFinished,
+                            object: nil,
+                            userInfo: [
+                                "task": m.task,
+                                "detail": m.detail ?? "",
+                                "ok": m.status == "done",
+                            ]
+                        )
+                    }
                 }
                 let age = m.finishedAt.map { Date().timeIntervalSince($0) } ?? 999
                 if age > 10 {
@@ -159,15 +172,35 @@ final class MinionService: ObservableObject {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? handle.close() }
 
-        let offset = eventOffsets[id] ?? 0
+        let firstRead = (eventOffsets[id] == nil)
+        var offset = eventOffsets[id] ?? 0
+        if firstRead {
+            // only the last ~40 events ever render — on the first read (which
+            // after a restart may sit over a multi-MB file) start from a bounded
+            // tail rather than re-reading the whole thing on the main loop.
+            let end = (try? handle.seekToEnd()) ?? 0
+            offset = end > 65_536 ? end - 65_536 : 0
+        }
         do {
             try handle.seek(toOffset: offset)
         } catch { return }
         let data = handle.readDataToEndOfFile()
         guard !data.isEmpty else { return }
-        eventOffsets[id] = offset + UInt64(data.count)
 
-        guard let text = String(data: data, encoding: .utf8) else { return }
+        // Only consume through the LAST complete line — a JSON object whose line
+        // hasn't finished writing yet would fail to parse and be lost forever if
+        // we advanced past it. Leave the partial tail for the next poll.
+        guard let lastNewline = data.lastIndex(of: 0x0A) else { return }
+        let throughLast = data[...lastNewline]
+        eventOffsets[id] = offset + UInt64(throughLast.count)
+
+        // If we jumped into the middle of the file, the first line is a partial
+        // fragment — drop it.
+        var consumable = throughLast
+        if firstRead, offset > 0, let firstNewline = consumable.firstIndex(of: 0x0A) {
+            consumable = consumable[consumable.index(after: firstNewline)...]
+        }
+        guard let text = String(data: Data(consumable), encoding: .utf8) else { return }
         var appended: [Event] = []
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let lineData = line.data(using: .utf8),
@@ -325,7 +358,7 @@ final class MinionService: ObservableObject {
             proc = subprocess.Popen(
                 [claude_path, "-p", "--output-format", "stream-json", "--verbose",
                  "--permission-mode", "auto", prompt],
-                cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 env=env, text=True, bufsize=1,
             )
             for line in proc.stdout:

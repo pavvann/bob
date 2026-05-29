@@ -16,7 +16,9 @@ final class OpenLine: ObservableObject {
 
     private let cacheURL: URL
     private var generating = false
+    private var lastAttempt: Date?
     private let maxAgeSec: TimeInterval = 30 * 60
+    private let minRetrySec: TimeInterval = 5 * 60
 
     private init() {
         cacheURL = BobHome.shared.root
@@ -37,12 +39,18 @@ final class OpenLine: ObservableObject {
            Date().timeIntervalSince(mtime) < maxAgeSec {
             return // cache still fresh
         }
+        // back off failures: don't re-spawn claude on every launch/idle if a
+        // recent attempt didn't produce a cache (slow/failed generation).
+        if let la = lastAttempt, Date().timeIntervalSince(la) < minRetrySec {
+            return
+        }
         generate()
     }
 
     private func generate() {
         guard !generating else { return }
         generating = true
+        lastAttempt = Date()
 
         let nowPlaying: String = {
             if let t = MusicService.shared.current, t.state == "playing", let track = t.track {
@@ -101,7 +109,13 @@ final class OpenLine: ObservableObject {
         process.standardError = Pipe()
         do {
             try process.run()
+            // watchdog: never let a wedged subprocess hold `generating` forever.
+            let watchdog = DispatchWorkItem { [weak process] in
+                if process?.isRunning == true { process?.terminate() }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 45, execute: watchdog)
             process.waitUntilExit()
+            watchdog.cancel()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             guard process.terminationStatus == 0 else { return nil }
             return String(data: data, encoding: .utf8)
