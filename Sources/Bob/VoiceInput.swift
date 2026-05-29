@@ -7,29 +7,37 @@ final class VoiceInput: ObservableObject {
     @Published var isRecording: Bool = false
     @Published var transcript: String = ""
     @Published var status: String? = nil
-    /// Live mic amplitude, 0...1, smoothed — drives the listening waveform.
+    /// Live mic amplitude, 0...1, smoothed — drives the listening waveform + comet.
     @Published var level: CGFloat = 0
     /// A short rolling history of recent levels for a scrolling waveform.
     @Published var levels: [CGFloat] = Array(repeating: 0, count: 48)
 
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private let engine = AVAudioEngine()
-    private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+
+    /// The current recognition request. Read from the realtime audio tap, swapped
+    /// on the main actor when recognition restarts — nonisolated(unsafe) because
+    /// SFSpeechAudioBufferRecognitionRequest.append is itself thread-safe and a
+    /// benign one-buffer race on a swap is harmless.
+    private nonisolated(unsafe) var liveRequest: SFSpeechAudioBufferRecognitionRequest?
+
+    /// Stays true from the user pressing the mic until they press it again — so
+    /// recognition restarts through natural pauses instead of ending on silence.
+    private var keepListening = false
+    /// Finalized text from prior recognition segments this session.
+    private var committed = ""
+    private var starting = false
 
     func toggle() {
         if isRecording { stop() } else { start() }
     }
 
-    private var starting = false
-
     func start() {
-        // guard against rapid on/off/on: isRecording is still false during the
-        // async authorization window, so a second start() could install a second
-        // tap on a running engine. `starting` closes that gap.
         guard !isRecording, !starting else { return }
         starting = true
         transcript = ""
+        committed = ""
         status = nil
         SFSpeechRecognizer.requestAuthorization { [weak self] auth in
             DispatchQueue.main.async {
@@ -52,16 +60,13 @@ final class VoiceInput: ObservableObject {
             status = "speech recognizer unavailable"
             return
         }
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        self.request = request
+        keepListening = true
 
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            request.append(buffer)
+            self?.liveRequest?.append(buffer)
             self?.publishLevel(from: buffer)
         }
 
@@ -71,38 +76,59 @@ final class VoiceInput: ObservableObject {
             isRecording = true
         } catch {
             status = "audio engine failed: \(error.localizedDescription)"
+            keepListening = false
             return
         }
+        startRecognitionSegment()
+    }
+
+    /// Begin (or restart) a recognition request against the already-running
+    /// engine. SFSpeechRecognizer finalizes after a pause; we just open a fresh
+    /// segment so the mic keeps listening until the user stops it.
+    private func startRecognitionSegment() {
+        guard keepListening, let recognizer else { return }
+        task?.cancel()
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        liveRequest = request
 
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
             Task { @MainActor in
+                guard let self, self.keepListening else { return }
                 if let result {
-                    self.transcript = result.bestTranscription.formattedString
-                }
-                if error != nil || result?.isFinal == true {
-                    self.stop()
+                    let partial = result.bestTranscription.formattedString
+                    self.transcript = self.committed.isEmpty
+                        ? partial
+                        : (self.committed + " " + partial)
+                    if result.isFinal {
+                        self.committed = self.transcript
+                        self.startRecognitionSegment() // keep listening through the pause
+                    }
+                } else if error != nil {
+                    // a silence/no-speech timeout — reopen and keep waiting
+                    self.startRecognitionSegment()
                 }
             }
         }
     }
 
     func stop() {
+        keepListening = false
         if engine.isRunning {
             engine.stop()
             engine.inputNode.removeTap(onBus: 0)
         }
-        request?.endAudio()
+        liveRequest?.endAudio()
         task?.cancel()
-        request = nil
+        liveRequest = nil
         task = nil
         isRecording = false
         level = 0
         levels = Array(repeating: 0, count: 48)
     }
 
-    /// Compute RMS amplitude of a mic buffer, map to a pleasant 0...1 curve,
-    /// and push it (smoothed) to the published level + rolling history.
+    /// RMS amplitude of a mic buffer, lifted into a visible 0...1 range and
+    /// heavily smoothed so the comet leans in gently rather than strobing.
     private nonisolated func publishLevel(from buffer: AVAudioPCMBuffer) {
         guard let channelData = buffer.floatChannelData else { return }
         let frames = Int(buffer.frameLength)
@@ -114,12 +140,12 @@ final class VoiceInput: ObservableObject {
             sum += s * s
         }
         let rms = sqrt(sum / Float(frames))
-        // Mic RMS is tiny; lift into a visible range and clamp.
         let normalized = min(1, max(0, CGFloat(rms) * 14))
 
         Task { @MainActor in
-            // Smooth so the dot/bars breathe rather than jitter.
-            self.level = self.level * 0.6 + normalized * 0.4
+            // strong smoothing on the comet driver kills the per-word flicker;
+            // the waveform history keeps the rawer value so bars still ripple.
+            self.level = self.level * 0.82 + normalized * 0.18
             var next = self.levels
             next.removeFirst()
             next.append(normalized)

@@ -214,6 +214,7 @@ struct CenterStage: View {
                 cornerRadius: 26,
                 bleed: 16,
                 voiceLevel: Double(voiceIn.level),
+                listening: voiceIn.isRecording,
                 streaming: bridge.isStreaming,
                 energy: pulse.energy
             )
