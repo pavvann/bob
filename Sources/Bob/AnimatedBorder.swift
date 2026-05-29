@@ -13,6 +13,9 @@ struct AnimatedBorder: View {
 
     /// Live mic amplitude 0...1 while listening — the comet leans toward you.
     var voiceLevel: Double = 0
+    /// True while the mic is open — keeps the glow steadily on so it doesn't
+    /// pop in and out as your voice crosses a threshold between words.
+    var listening: Bool = false
     /// True while bob is streaming a reply — drives a slow exhale pulse.
     var streaming: Bool = false
     /// bob's pulse 0...1 — sets the resting lap speed.
@@ -54,8 +57,10 @@ struct AnimatedBorder: View {
 
                 // soft outer glow, clipped outside the path. The inverse-clipped
                 // Gaussian blur is the single heaviest op per frame, so skip it
-                // entirely at rest — only the moving head needs the halo.
-                if drive > 0.04 {
+                // entirely at rest. Gate on the STABLE listening/streaming state
+                // (not the noisy instantaneous level) so it doesn't flicker as
+                // your voice dips between words.
+                if listening || streaming || drive > 0.04 {
                     ctx.drawLayer { glow in
                         glow.clip(to: path, options: .inverse)
                         glow.addFilter(.blur(radius: glowBlur))
