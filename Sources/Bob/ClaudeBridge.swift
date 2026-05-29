@@ -44,7 +44,22 @@ final class ClaudeBridge: ObservableObject {
         spokenUpTo = 0
     }
 
-    func send(_ rawPrompt: String) {
+    /// A minion bob dispatched just finished — let bob debrief you in his own
+    /// voice as a normal bob turn (no "you" turn, since you didn't just ask).
+    /// Skipped if bob's mid-reply so it never clobbers a live answer.
+    func debrief(task: String, detail: String, ok: Bool) {
+        guard !isStreaming else { return }
+        let prompt = """
+        [system note — not from pawan] a minion you dispatched just finished.
+        task: "\(task)"
+        outcome: \(ok ? "succeeded" : "failed")
+        result: "\(detail)"
+        tell pawan in ONE short lowercase line, in your voice, like a bro who just got it done. no preamble, no "the minion" — just say what happened. under 16 words.
+        """
+        send(prompt, hidden: true)
+    }
+
+    func send(_ rawPrompt: String, hidden: Bool = false) {
         let prompt = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
 
@@ -52,8 +67,11 @@ final class ClaudeBridge: ObservableObject {
         lastError = nil
         isStreaming = true
         spokenUpTo = 0
-        // Append the user's turn and an empty bob turn to stream into.
-        turns.append(Turn(role: .you, text: prompt))
+        // A hidden turn (e.g. a minion debrief) shows only bob's reply, not the
+        // prompt that triggered it.
+        if !hidden {
+            turns.append(Turn(role: .you, text: prompt))
+        }
         turns.append(Turn(role: .bob, text: ""))
 
         let process = Process()

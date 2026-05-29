@@ -40,6 +40,11 @@ final class MinionService: ObservableObject {
     @Published private(set) var active: [Minion] = []
     @Published private(set) var eventsByID: [String: [Event]] = [:]
 
+    /// Posted once when a minion transitions to done/failed, so bob can debrief
+    /// you in his own voice. userInfo: task, detail, ok (Bool).
+    static let minionFinished = Notification.Name("bob.minionFinished")
+    private var debriefed: Set<String> = []
+
     private let minionsDir: URL
     private let activeDir: URL
     private let doneDir: URL
@@ -100,6 +105,19 @@ final class MinionService: ObservableObject {
 
             if m.status == "done" || m.status == "failed" {
                 tailEvents(id: m.id) // catch the final events
+                // fire the debrief exactly once, the moment it finishes
+                if !debriefed.contains(m.id) {
+                    debriefed.insert(m.id)
+                    NotificationCenter.default.post(
+                        name: Self.minionFinished,
+                        object: nil,
+                        userInfo: [
+                            "task": m.task,
+                            "detail": m.detail ?? "",
+                            "ok": m.status == "done",
+                        ]
+                    )
+                }
                 let age = m.finishedAt.map { Date().timeIntervalSince($0) } ?? 999
                 if age > 10 {
                     archive(m)
