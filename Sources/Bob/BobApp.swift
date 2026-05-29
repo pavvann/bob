@@ -50,17 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         // ⌥Space summons bob from anywhere — the Spotlight feel.
+        // (Esc-to-dismiss is handled in CenterStage's input so it clears the
+        // field first and only hides when empty — see .onKeyPress(.escape).)
         HotKeyManager.shared.onTrigger = { HotKeyManager.toggleBob() }
         HotKeyManager.shared.register()
-
-        // Esc steps bob aside, like dismissing Spotlight.
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if event.keyCode == 53 { // esc
-                NSApp.hide(nil)
-                return nil // consume
-            }
-            return event
-        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

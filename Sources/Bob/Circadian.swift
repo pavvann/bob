@@ -71,8 +71,18 @@ enum Circadian {
         (21, RGB(r: 1.00, g: 0.40, b: 0.42)),  // evening — warm coral
     ]
 
+    // Memoize per minute-of-day — the color is effectively constant over many
+    // seconds, but accent() is called every frame inside the comet's Canvas.
+    // Accessed from the main thread (Canvas/SwiftUI) only.
+    nonisolated(unsafe) private static var accentCache: (key: Int, color: Color)?
+
     static func accent(_ date: Date = Date()) -> Color {
-        sample(accentKeys, at: hour(date)).color
+        let h = hour(date)
+        let key = Int(h * 60)
+        if let c = accentCache, c.key == key { return c.color }
+        let color = sample(accentKeys, at: h).color
+        accentCache = (key, color)
+        return color
     }
 
     /// A trio of soft background-wash colors for the idle "hour wash" — the
@@ -87,14 +97,18 @@ enum Circadian {
         (21, [RGB(r: 0.34, g: 0.20, b: 0.44), RGB(r: 0.48, g: 0.22, b: 0.32), RGB(r: 0.18, g: 0.16, b: 0.38)]), // evening indigo ember
     ]
 
+    nonisolated(unsafe) private static var washCache: (key: Int, colors: [Color])?
+
     static func wash(_ date: Date = Date()) -> [Color] {
         let h = hour(date)
-        // sample each of the 3 slots independently
+        let key = Int(h * 6) // every 10 minutes is plenty for a background wash
+        if let c = washCache, c.key == key { return c.colors }
         var out: [Color] = []
         for slot in 0..<3 {
             let keys = washKeys.map { ($0.0, $0.1[slot]) }
             out.append(sample(keys, at: h).color)
         }
+        washCache = (key, out)
         return out
     }
 }

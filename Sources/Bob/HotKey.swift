@@ -52,7 +52,7 @@ final class HotKeyManager {
             app.activate(ignoringOtherApps: true)
             if let window = app.windows.first(where: { $0.canBecomeKey }) {
                 window.makeKeyAndOrderFront(nil)
-                window.center()
+                // don't re-center — respect wherever you last dragged bob.
             }
             NotificationCenter.default.post(name: HotKeyManager.didSummon, object: nil)
         }

@@ -22,7 +22,9 @@ struct AnimatedBorder: View {
 
     var lineWidth: CGFloat = 2.0
     var trailLength: Double = 0.30
-    var segments: Int = 60
+    // 26 faded, blurred sub-strokes read identically to 60 but halve the
+    // per-frame trimmedPath cost.
+    var segments: Int = 26
 
     var body: some View {
         TimelineView(.animation) { timeline in
@@ -50,17 +52,21 @@ struct AnimatedBorder: View {
                 // ambient ring — always faintly present, brightens as bob listens
                 ctx.stroke(path, with: .color(accent.opacity(0.08 + drive * 0.12)), lineWidth: 0.5)
 
-                // soft outer glow, clipped outside the path
-                ctx.drawLayer { glow in
-                    glow.clip(to: path, options: .inverse)
-                    glow.addFilter(.blur(radius: glowBlur))
-                    let span = trailLength * 0.30
-                    let tail = (head - span + 1.0).truncatingRemainder(dividingBy: 1.0)
-                    glow.stroke(
-                        Self.subPath(of: path, from: tail, to: head),
-                        with: .color(accent.opacity(0.55 + drive * 0.35)),
-                        style: StrokeStyle(lineWidth: glowWidth, lineCap: .round)
-                    )
+                // soft outer glow, clipped outside the path. The inverse-clipped
+                // Gaussian blur is the single heaviest op per frame, so skip it
+                // entirely at rest — only the moving head needs the halo.
+                if drive > 0.04 {
+                    ctx.drawLayer { glow in
+                        glow.clip(to: path, options: .inverse)
+                        glow.addFilter(.blur(radius: glowBlur))
+                        let span = trailLength * 0.30
+                        let tail = (head - span + 1.0).truncatingRemainder(dividingBy: 1.0)
+                        glow.stroke(
+                            Self.subPath(of: path, from: tail, to: head),
+                            with: .color(accent.opacity(0.55 + drive * 0.35)),
+                            style: StrokeStyle(lineWidth: glowWidth, lineCap: .round)
+                        )
+                    }
                 }
 
                 // crisp fading comet trail

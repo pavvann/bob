@@ -192,6 +192,11 @@ struct CenterStage: View {
                 .lineLimit(1...4)
                 .onSubmit(send)
                 .submitLabel(.send)
+                .onKeyPress(.escape) {
+                    // esc clears the field first; an empty field hides bob.
+                    if input.isEmpty { NSApp.hide(nil) } else { input = "" }
+                    return .handled
+                }
                 .transition(.opacity)
             }
 

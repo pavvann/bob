@@ -71,7 +71,7 @@ struct ContentView: View {
                   let task = info["task"] as? String else { return }
             let detail = info["detail"] as? String ?? ""
             let ok = info["ok"] as? Bool ?? true
-            bridge.debrief(task: task, detail: detail, ok: ok)
+            bridge.enqueueDebrief(task: task, detail: detail, ok: ok)
         }
     }
 

@@ -23,7 +23,11 @@ final class ClaudeBridge: ObservableObject {
     /// he thinks rather than reading a finished wall of text. Wired by the view
     /// to VoiceOutput. No-op until set.
     var onSentence: ((String) -> Void)?
-    private var spokenUpTo: Int = 0
+    private var spokenIndex: String.Index?
+
+    /// Minion debriefs waiting to be spoken — queued so none is lost when bob
+    /// happens to be mid-reply (or when two minions finish at once).
+    private var pendingDebriefs: [(task: String, detail: String, ok: Bool)] = []
 
     /// Session UUID for this bob launch. First turn uses `--session-id` (creates).
     /// Subsequent turns use `--resume <id>` (continues). Reset by quit+relaunch
@@ -41,32 +45,40 @@ final class ClaudeBridge: ObservableObject {
         turns = []
         lastError = nil
         isStreaming = false
-        spokenUpTo = 0
+        spokenIndex = nil
+        pendingDebriefs.removeAll()
     }
 
-    /// A minion bob dispatched just finished — let bob debrief you in his own
-    /// voice as a normal bob turn (no "you" turn, since you didn't just ask).
-    /// Skipped if bob's mid-reply so it never clobbers a live answer.
-    func debrief(task: String, detail: String, ok: Bool) {
-        guard !isStreaming else { return }
+    /// A minion bob dispatched just finished — queue a debrief. It's delivered
+    /// when bob isn't mid-reply, so it's never lost in the busy moments. Runs
+    /// as an ISOLATED one-shot (no --resume) so the synthetic note never
+    /// pollutes the resumable session's continuity.
+    func enqueueDebrief(task: String, detail: String, ok: Bool) {
+        pendingDebriefs.append((task, detail, ok))
+        drainDebriefs()
+    }
+
+    private func drainDebriefs() {
+        guard !isStreaming, !pendingDebriefs.isEmpty else { return }
+        let d = pendingDebriefs.removeFirst()
         let prompt = """
-        [system note — not from pawan] a minion you dispatched just finished.
-        task: "\(task)"
-        outcome: \(ok ? "succeeded" : "failed")
-        result: "\(detail)"
-        tell pawan in ONE short lowercase line, in your voice, like a bro who just got it done. no preamble, no "the minion" — just say what happened. under 16 words.
+        [system note — not from the user] a minion you dispatched just finished.
+        task: "\(d.task)"
+        outcome: \(d.ok ? "succeeded" : "failed")
+        result: "\(d.detail)"
+        tell the user in ONE short lowercase line, in your voice, like a bro who just got it done. no preamble, no "the minion" — just say what happened. under 16 words.
         """
-        send(prompt, hidden: true)
+        send(prompt, hidden: true, useSession: false)
     }
 
-    func send(_ rawPrompt: String, hidden: Bool = false) {
+    func send(_ rawPrompt: String, hidden: Bool = false, useSession: Bool = true) {
         let prompt = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
 
         currentProcess?.terminate()
         lastError = nil
         isStreaming = true
-        spokenUpTo = 0
+        spokenIndex = nil
         // A hidden turn (e.g. a minion debrief) shows only bob's reply, not the
         // prompt that triggered it.
         if !hidden {
@@ -99,9 +111,15 @@ final class ClaudeBridge: ObservableObject {
         // First turn: --session-id creates a new session with this UUID.
         // Subsequent turns: --resume continues that session. Using --session-id
         // for every turn errors with "Session ID ... is already in use".
-        let sessionArgs: [String] = sessionStarted
-            ? ["--resume", sessionId]
-            : ["--session-id", sessionId]
+        // Session turns thread through --session-id/--resume for continuity.
+        // Isolated turns (minion debriefs) carry no session args so they never
+        // become part of the resumable conversation.
+        let sessionArgs: [String]
+        if useSession {
+            sessionArgs = sessionStarted ? ["--resume", sessionId] : ["--session-id", sessionId]
+        } else {
+            sessionArgs = []
+        }
         process.arguments = [
             "-p",
         ] + sessionArgs + [
@@ -117,9 +135,18 @@ final class ClaudeBridge: ObservableObject {
         process.standardOutput = pipe
         process.standardError = pipe
 
+        // Pipe reads break at arbitrary byte boundaries; a multibyte UTF-8
+        // sequence (emoji, em-dash) split across two reads would fail to decode
+        // and be dropped. Buffer raw bytes and only emit a codepoint-complete
+        // prefix, keeping the incomplete tail for the next read.
+        var pendingData = Data()
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            pendingData.append(chunk)
+            let (text, remainder) = Self.decodeUTF8Prefix(pendingData)
+            pendingData = remainder
+            guard !text.isEmpty else { return }
             Task { @MainActor in
                 self?.appendToReply(text)
             }
@@ -135,14 +162,18 @@ final class ClaudeBridge: ObservableObject {
                 }
                 self.isStreaming = false
                 self.currentProcess = nil
+                // a debrief that arrived while bob was replying can fire now
+                self.drainDebriefs()
             }
         }
 
         do {
             try process.run()
             currentProcess = process
-            // After a successful spawn, any future turn should resume the session.
-            sessionStarted = true
+            // Only real session turns advance the session; isolated one-shots
+            // (debriefs) must not, or the next turn would try to --resume a
+            // session that was never created.
+            if useSession { sessionStarted = true }
         } catch {
             isStreaming = false
             lastError = "couldn't start claude: \(error.localizedDescription)"
@@ -158,31 +189,49 @@ final class ClaudeBridge: ObservableObject {
         flushSpeakable(turns[idx].text)
     }
 
-    /// Emit any newly-completed sentences (since `spokenUpTo`) to `onSentence`.
+    /// Emit any newly-completed sentences (since `spokenIndex`) to `onSentence`.
     /// A sentence ends at . ? ! or newline followed by whitespace or end.
+    /// Scans only the unspoken suffix — no O(n) Array copy of the whole reply.
     private func flushSpeakable(_ full: String, final: Bool = false) {
         guard onSentence != nil else { return }
-        let chars = Array(full)
-        guard spokenUpTo < chars.count else { return }
+        let start = spokenIndex ?? full.startIndex
+        guard start < full.endIndex else { return }
 
-        var lastBoundary = spokenUpTo
-        var i = spokenUpTo
-        while i < chars.count {
-            let ch = chars[i]
+        var lastBoundary = start
+        var i = start
+        while i < full.endIndex {
+            let ch = full[i]
+            let next = full.index(after: i)
             if ch == "." || ch == "!" || ch == "?" || ch == "\n" {
-                let nextIsBreak = (i + 1 >= chars.count) || chars[i + 1].isWhitespace
-                if nextIsBreak { lastBoundary = i + 1 }
+                if next == full.endIndex || full[next].isWhitespace {
+                    lastBoundary = next
+                }
             }
-            i += 1
+            i = next
         }
-        // On the final flush, speak whatever's left even without a terminator.
-        if final { lastBoundary = chars.count }
+        if final { lastBoundary = full.endIndex }
 
-        guard lastBoundary > spokenUpTo else { return }
-        let chunk = String(chars[spokenUpTo..<lastBoundary])
+        guard lastBoundary > start else { return }
+        let chunk = String(full[start..<lastBoundary])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        spokenUpTo = lastBoundary
+        spokenIndex = lastBoundary
         if !chunk.isEmpty { onSentence?(chunk) }
+    }
+
+    /// Decode the longest valid UTF-8 prefix of `data`, returning the decoded
+    /// string and any trailing incomplete-codepoint bytes to retain.
+    private nonisolated static func decodeUTF8Prefix(_ data: Data) -> (String, Data) {
+        if let s = String(data: data, encoding: .utf8) { return (s, Data()) }
+        // A UTF-8 codepoint is at most 4 bytes, so only the last ≤3 can dangle.
+        var end = data.count - 1
+        let floor = max(0, data.count - 3)
+        while end >= floor && end > 0 {
+            if let s = String(data: data.subdata(in: 0..<end), encoding: .utf8) {
+                return (s, data.subdata(in: end..<data.count))
+            }
+            end -= 1
+        }
+        return ("", data)
     }
 
     /// Replace the in-flight bob turn's text (used for error messages).
