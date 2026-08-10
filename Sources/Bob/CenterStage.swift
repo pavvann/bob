@@ -15,9 +15,12 @@ struct CenterStage: View {
     @ObservedObject private var pulse = BobPulse.shared
     @ObservedObject private var minions = MinionService.shared
     @ObservedObject private var openLine = OpenLine.shared
+    @ObservedObject private var slash = SlashCommandService.shared
 
     @State private var input: String = ""
     @State private var breath = PhaseClock(period: 5.2)
+    @State private var slashSelection = 0
+    @State private var slashDismissed = false
     @FocusState private var inputFocused: Bool
 
     private var isIdle: Bool { bridge.turns.isEmpty && !bridge.isStreaming }
@@ -26,6 +29,7 @@ struct CenterStage: View {
         VStack(spacing: 24) {
             stage
             inputBar
+                .overlay(alignment: .top) { slashPalette }
         }
         .onAppear {
             inputFocused = true
@@ -41,6 +45,13 @@ struct CenterStage: View {
             if idle { openLine.refreshIfStale() }
         }
         .animation(.easeInOut(duration: 0.6), value: openLine.line)
+        .onChange(of: input) { _, _ in
+            // any edit reopens a dismissed palette and rests the highlight —
+            // standard palette feel, and it makes Esc's dismissal one-shot.
+            slashDismissed = false
+            slashSelection = 0
+            if input.hasPrefix("/") { slash.refresh() }
+        }
         .onChange(of: voiceIn.transcript) { _, newValue in input = newValue }
         .onChange(of: voiceIn.isRecording) { _, _ in refreshPulse() }
         .onChange(of: bridge.isStreaming) { _, _ in refreshPulse() }
@@ -196,8 +207,29 @@ struct CenterStage: View {
                 .onSubmit(send)
                 .submitLabel(.send)
                 .onKeyPress(.escape) {
-                    // esc clears the field first; an empty field hides bob.
-                    if input.isEmpty { NSApp.hide(nil) } else { input = "" }
+                    // esc peels one layer: palette → text → the whole app.
+                    if !slashMatches.isEmpty {
+                        slashDismissed = true
+                    } else if input.isEmpty {
+                        NSApp.hide(nil)
+                    } else {
+                        input = ""
+                    }
+                    return .handled
+                }
+                .onKeyPress(.upArrow) {
+                    guard !slashMatches.isEmpty else { return .ignored }
+                    slashSelection = max(0, slashSelected - 1)
+                    return .handled
+                }
+                .onKeyPress(.downArrow) {
+                    guard !slashMatches.isEmpty else { return .ignored }
+                    slashSelection = min(slashMatches.count - 1, slashSelected + 1)
+                    return .handled
+                }
+                .onKeyPress(.tab) {
+                    guard !slashMatches.isEmpty else { return .ignored }
+                    completeSlash(slashMatches[slashSelected])
                     return .handled
                 }
                 .transition(.opacity)
@@ -247,6 +279,49 @@ struct CenterStage: View {
             .help("\(lens) lens is on — click to clear (or send @none)")
             .transition(.opacity.combined(with: .scale(scale: 0.9)))
         }
+    }
+
+    // MARK: slash palette
+
+    /// The token being typed after a leading `/` — nil once a space is typed
+    /// (you're writing arguments now) or while the mic owns the box. `/` and
+    /// `@` never collide: a lens starts with `@`, a command with `/`.
+    private var slashQuery: String? {
+        guard !voiceIn.isRecording, input.hasPrefix("/") else { return nil }
+        let token = input.dropFirst()
+        guard !token.contains(where: { $0.isWhitespace }) else { return nil }
+        return String(token)
+    }
+
+    private var slashMatches: [SlashCommand] {
+        guard !slashDismissed, let q = slashQuery else { return [] }
+        return slash.matches(q)
+    }
+
+    /// Selection clamped to the live match list — arrows move it, every
+    /// keystroke rests it back to the top.
+    private var slashSelected: Int {
+        min(slashSelection, max(0, slashMatches.count - 1))
+    }
+
+    @ViewBuilder
+    private var slashPalette: some View {
+        if !slashMatches.isEmpty {
+            SlashPalette(matches: slashMatches, selected: slashSelected) { cmd in
+                completeSlash(cmd)
+                inputFocused = true
+            }
+            .frame(maxWidth: .infinity)
+            // sit fully above the bar: this view's bottom+8 becomes its top
+            .alignmentGuide(.top) { $0[.bottom] + 8 }
+            .transition(.opacity)
+        }
+    }
+
+    /// Put the picked name in the box, trailing space ready for arguments.
+    /// The space also hides the palette, so Enter now sends as usual.
+    private func completeSlash(_ cmd: SlashCommand) {
+        input = "/" + cmd.name + " "
     }
 
     private var micButton: some View {
@@ -301,6 +376,18 @@ struct CenterStage: View {
     }
 
     private func send() {
+        // Enter with the palette up completes the highlighted name; Enter on a
+        // name that's already complete falls through and sends. A `/command`
+        // message goes to claude verbatim — the CLI expands and runs it in -p,
+        // in-session, with the active lens riding along untouched.
+        if !slashMatches.isEmpty {
+            let cmd = slashMatches[slashSelected]
+            if input.trimmingCharacters(in: .whitespaces) != "/" + cmd.name {
+                completeSlash(cmd)
+                return
+            }
+        }
+
         let raw = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return }
         input = ""
