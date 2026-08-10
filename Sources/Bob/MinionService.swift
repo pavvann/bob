@@ -19,11 +19,17 @@ final class MinionService: ObservableObject {
         var workdir: String?
         var status: String        // queued | working | done | failed
         var detail: String?
+        /// Optional lens spec (`bob-dev`, `project:lootgo`) — resolved by the
+        /// swift layer at spawn time and appended to the minion's system prompt.
+        var lens: String?
+        /// Who queued this: "user" (default) | "retro" | "self". Carried so a
+        /// debrief can say whose minion just finished.
+        var origin: String?
         var startedAt: Date?
         var finishedAt: Date?
 
         enum CodingKeys: String, CodingKey {
-            case id, task, prompt, workdir, status, detail
+            case id, task, prompt, workdir, status, detail, lens, origin
             case startedAt = "started_at"
             case finishedAt = "finished_at"
         }
@@ -146,13 +152,15 @@ final class MinionService: ObservableObject {
 
     private func spawn(_ minion: Minion) {
         spawned.insert(minion.id)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: Self.pythonPath)
-        process.arguments = [
+        var args = [
             wrapperURL.path,
             recordURL(minion.id, inDone: false).path,
             ClaudeBridge.claudePath,
         ]
+        if let lensPath = prepareLens(for: minion) { args.append(lensPath) }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: Self.pythonPath)
+        process.arguments = args
         do {
             try process.run()
         } catch {
@@ -163,6 +171,29 @@ final class MinionService: ObservableObject {
             m.finishedAt = Date()
             write(m)
         }
+    }
+
+    /// Assemble the minion's lens (if it carries one) into `<id>.lens.txt` and
+    /// hand back that path for the wrapper's argv[3]. Never fails a minion: a
+    /// missing or broken lens just means it runs with today's plain system
+    /// prompt — LensStore has already logged why to `state/lens-debug.log`.
+    private func prepareLens(for minion: Minion) -> String? {
+        let url = lensURL(minion.id)
+        guard let spec = minion.lens?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !spec.isEmpty,
+              let ctx = LensStore.shared.resolve(spec),
+              (try? ctx.text.write(to: url, atomically: true, encoding: .utf8)) != nil
+        else {
+            // never leave a stale block from an earlier attempt lying around
+            // where the wrapper could pick it up.
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return url.path
+    }
+
+    private func lensURL(_ id: String) -> URL {
+        minionsDir.appendingPathComponent("\(id).lens.txt")
     }
 
     // MARK: live event tailing
@@ -278,6 +309,7 @@ final class MinionService: ObservableObject {
         let evDone = doneDir.appendingPathComponent("\(m.id).events.jsonl")
         try? fm.removeItem(at: evDone)
         try? fm.moveItem(at: evActive, to: evDone)
+        try? fm.removeItem(at: lensURL(m.id))   // the assembled block was scratch
         eventsByID[m.id] = nil
         eventOffsets[m.id] = nil
     }
@@ -302,7 +334,8 @@ final class MinionService: ObservableObject {
         return "/usr/bin/python3"
     }()
 
-    /// Self-reporting minion runner. Args: <record-json-path> <claude-path>.
+    /// Self-reporting minion runner.
+    /// Args: <record-json-path> <claude-path> [<lens-file-path>].
     /// Runs claude in stream-json mode, teeing events to <id>.events.jsonl, then
     /// writes its own done/failed status + a prose summary pulled from the final
     /// `result` event — so it completes even if bob is gone.
@@ -312,6 +345,7 @@ final class MinionService: ObservableObject {
 
     record_path = sys.argv[1]
     claude_path = sys.argv[2]
+    lens_path = sys.argv[3] if len(sys.argv) > 3 else None
 
     def now_iso():
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -350,14 +384,19 @@ final class MinionService: ObservableObject {
               "CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR"]:
         env.pop(k, None)
 
+    argv = [claude_path, "-p", "--output-format", "stream-json", "--verbose",
+            "--permission-mode", "auto"]
+    if lens_path and os.path.exists(lens_path):
+        argv += ["--append-system-prompt-file", lens_path]
+    argv.append(prompt)
+
     summary = None
     is_error = True
     rc = 1
     try:
         with open(events_path, "w") as evf:
             proc = subprocess.Popen(
-                [claude_path, "-p", "--output-format", "stream-json", "--verbose",
-                 "--permission-mode", "auto", prompt],
+                argv,
                 cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 env=env, text=True, bufsize=1,
             )
