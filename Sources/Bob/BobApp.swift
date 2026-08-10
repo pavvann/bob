@@ -26,6 +26,9 @@ struct BobApp: App {
     }
 
     static func style(_ window: NSWindow) {
+        // the panel controller (and ⌥Space toggle) need to tell bob's main
+        // window apart from floating session panels
+        SessionPanelController.shared.adoptMainWindow(window)
         window.isOpaque = false
         window.backgroundColor = .clear
         window.titlebarAppearsTransparent = true

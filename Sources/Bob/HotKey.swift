@@ -41,20 +41,25 @@ final class HotKeyManager {
     }
 
     /// Toggle bob's presence the way a launcher would: summon-and-focus if it's
-    /// not the active foreground window, step aside otherwise.
+    /// not the active foreground window, step aside otherwise. Session panels
+    /// float alongside the main window now, so bob's window is identified
+    /// explicitly — never "whichever window is visible/keyable" (that could
+    /// raise a panel thinking it's bob). Always invoked on the main queue.
     static func toggleBob() {
-        let app = NSApp!
-        let bobIsFront = app.isActive && (app.windows.first(where: { $0.isVisible })?.isKeyWindow ?? false)
+        MainActor.assumeIsolated {
+            let app = NSApp!
+            let main = SessionPanelController.shared.mainWindow
+            let bobIsFront = app.isActive && (main?.isKeyWindow ?? false)
 
-        if bobIsFront {
-            app.hide(nil)
-        } else {
-            app.activate(ignoringOtherApps: true)
-            if let window = app.windows.first(where: { $0.canBecomeKey }) {
-                window.makeKeyAndOrderFront(nil)
+            if bobIsFront {
+                app.hide(nil)
+            } else {
+                app.activate(ignoringOtherApps: true)
+                let window = main ?? app.windows.first { $0.canBecomeKey && !($0 is NSPanel) }
+                window?.makeKeyAndOrderFront(nil)
                 // don't re-center — respect wherever you last dragged bob.
+                NotificationCenter.default.post(name: HotKeyManager.didSummon, object: nil)
             }
-            NotificationCenter.default.post(name: HotKeyManager.didSummon, object: nil)
         }
     }
 }
