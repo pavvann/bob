@@ -17,6 +17,7 @@ struct CenterStage: View {
     @ObservedObject private var openLine = OpenLine.shared
 
     @State private var input: String = ""
+    @State private var breath = PhaseClock(period: 5.2)
     @FocusState private var inputFocused: Bool
 
     private var isIdle: Bool { bridge.turns.isEmpty && !bridge.isStreaming }
@@ -69,14 +70,15 @@ struct CenterStage: View {
         if isIdle {
             VStack(spacing: 8) {
                 TimelineView(.animation) { timeline in
-                    // breath rate follows bob's pulse — calm at rest, quicker awake
-                    let t = timeline.date.timeIntervalSinceReferenceDate
-                    let phase = sin(t / pulse.breathPeriod * 2 * .pi)
+                    // breath rate follows bob's pulse — calm at rest, quicker
+                    // awake. Integrated, not `t / period`: dividing absolute
+                    // time by a period that moves snaps the breath mid-inhale.
+                    let wave = sin(breath.tick(timeline.date, period: pulse.breathPeriod) * 2 * .pi)
                     Text(greeting)
                         .font(.system(size: 38, weight: .light, design: .rounded))
                         .foregroundStyle(.primary.opacity(0.88))
-                        .scaleEffect(1.0 + phase * 0.012)
-                        .opacity(0.92 + phase * 0.08)
+                        .scaleEffect(1.0 + wave * 0.012)
+                        .opacity(0.92 + wave * 0.08)
                 }
                 .fixedSize()
                 // bob's own line about your day — picks up where you left off
@@ -113,7 +115,8 @@ struct CenterStage: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .frame(maxHeight: 380)
+                .frame(maxHeight: 300)
+                .defaultScrollAnchor(.bottom)
                 .scrollIndicators(.never)
                 .onChange(of: bridge.turns) { _, _ in
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -142,10 +145,10 @@ struct CenterStage: View {
             }
         case .bob:
             if turn.text.isEmpty && bridge.isStreaming {
-                // the held breath before the first word — a living glyph, not "…"
-                ThinkingOrb(size: 28)
+                // a quiet breathing dot where the reply will appear
+                ThinkingOrb()
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .transition(.scale.combined(with: .opacity))
+                    .transition(.opacity)
             } else {
                 Text(turn.text)
                     .font(.system(size: 16, weight: .regular, design: .rounded))
@@ -210,15 +213,15 @@ struct CenterStage: View {
                 .fill(.ultraThinMaterial)
         }
         .overlay {
+            // No padding here — AnimatedBorder owns its own bleed, so the
+            // canvas and the halo can never drift out of agreement again.
             AnimatedBorder(
                 cornerRadius: 26,
-                bleed: 16,
                 voiceLevel: Double(voiceIn.level),
                 listening: voiceIn.isRecording,
                 streaming: bridge.isStreaming,
                 energy: pulse.energy
             )
-            .padding(-16)
         }
         .animation(.easeInOut(duration: 0.25), value: voiceIn.isRecording)
     }
