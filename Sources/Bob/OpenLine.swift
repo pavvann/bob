@@ -63,14 +63,28 @@ final class OpenLine: ObservableObject {
         fmt.dateFormat = "EEEE h:mm a"
         let when = fmt.string(from: Date())
 
-        let prompt = """
+        // With the `open-line` lens, what bob reads (and how he sounds doing it)
+        // lives in lenses/open-line.md — editable without touching Swift. The
+        // prompt then carries only the task and the live facts of this moment.
+        let lensedPrompt = """
+        it's \(when) (IST). \(nowPlaying)
+        write ONE short lowercase line you'd open with to pawan right now — like a bro picking up where you left off. under 14 words. no greeting word (shown separately). no quotes, no preamble — output only the line.
+        """
+        // No lens on disk (or a broken one) — the hand-typed original, verbatim.
+        let plainPrompt = """
         you are bob. read USER.md, the last ~15 lines of MEMORY.md, and the last few lines of log.md in this directory. it's \(when) (IST). \(nowPlaying)
         write ONE short lowercase line you'd open with to pawan right now — like a bro picking up where you left off. reference something real and recent if it fits (a project, a thread you two had, the hour, the music). keep it under 14 words. do NOT start with a greeting word like hey/morning/evening (that's shown separately). no quotes, no preamble — output only the line.
         """
 
         let root = BobHome.shared.root
         Task.detached(priority: .utility) {
-            let result = Self.runClaude(prompt: prompt, cwd: root)
+            // resolved here, off the main thread — resolve() reads files
+            let lens = LensStore.shared.resolve("open-line")
+            let result = Self.runClaude(
+                prompt: lens == nil ? plainPrompt : lensedPrompt,
+                systemPrompt: lens?.text,
+                cwd: root
+            )
             await MainActor.run {
                 self.generating = false
                 guard let raw = result else { return }
@@ -93,7 +107,7 @@ final class OpenLine: ObservableObject {
         return String(t.prefix(120))
     }
 
-    private nonisolated static func runClaude(prompt: String, cwd: URL) -> String? {
+    private nonisolated static func runClaude(prompt: String, systemPrompt: String? = nil, cwd: URL) -> String? {
         var env = ProcessInfo.processInfo.environment
         for key in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT",
                     "CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR"] {
@@ -101,7 +115,10 @@ final class OpenLine: ObservableObject {
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ClaudeBridge.claudePath)
-        process.arguments = ["-p", "--permission-mode", "auto", prompt]
+        var args = ["-p", "--permission-mode", "auto"]
+        if let systemPrompt { args += ["--append-system-prompt", systemPrompt] }
+        args.append(prompt)
+        process.arguments = args
         process.currentDirectoryURL = cwd
         process.environment = env
         let pipe = Pipe()
