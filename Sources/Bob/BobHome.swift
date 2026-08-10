@@ -31,9 +31,11 @@ final class BobHome: ObservableObject {
     var indexPath: URL { root.appendingPathComponent("index.md") }
     var logPath: URL { root.appendingPathComponent("log.md") }
     var claudeMdPath: URL { root.appendingPathComponent("CLAUDE.md") }
+    var backlogPath: URL { root.appendingPathComponent("backlog.md") }
 
     var wikiDir: URL { root.appendingPathComponent("wiki", isDirectory: true) }
     var skillsDir: URL { root.appendingPathComponent("skills", isDirectory: true) }
+    var lensesDir: URL { root.appendingPathComponent("lenses", isDirectory: true) }
     var rawDir: URL { root.appendingPathComponent("raw", isDirectory: true) }
     var stateDir: URL { root.appendingPathComponent("state", isDirectory: true) }
     var wikiBobDir: URL { wikiDir.appendingPathComponent("bob", isDirectory: true) }
@@ -100,7 +102,7 @@ final class BobHome: ObservableObject {
         let fm = FileManager.default
         let minionsActive = root.appendingPathComponent("minions/active", isDirectory: true)
         let minionsDone = root.appendingPathComponent("minions/done", isDirectory: true)
-        for dir in [root, wikiDir, skillsDir, rawDir, stateDir, wikiBobDir, wikiTemplatesDir, minionsActive, minionsDone] {
+        for dir in [root, wikiDir, skillsDir, lensesDir, rawDir, stateDir, wikiBobDir, wikiTemplatesDir, minionsActive, minionsDone] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
     }
@@ -109,7 +111,7 @@ final class BobHome: ObservableObject {
     private func ensureSeedFiles() throws {
         let fm = FileManager.default
 
-        let seeds: [(URL, String)] = [
+        var seeds: [(URL, String)] = [
             (soulPath, seedSoul),
             (userPath, seedUser),
             (claudeMdPath, seedClaudeMd),
@@ -119,6 +121,7 @@ final class BobHome: ObservableObject {
             (wikiTemplatesDir.appendingPathComponent("raw.md"), seedRawTemplate),
             (skillsDir.appendingPathComponent("play-music.md"), seedPlayMusicSkill),
         ]
+        seeds.append(contentsOf: lensSeedFiles)      // lenses/, backlog.md, wiki/bob/{retro,self-improvement}.md
 
         for (path, content) in seeds {
             if !fm.fileExists(atPath: path.path) {
