@@ -203,6 +203,7 @@ struct CenterStage: View {
                 .transition(.opacity)
             }
 
+            lensChip
             micButton
             speakerButton
         }
@@ -224,6 +225,28 @@ struct CenterStage: View {
             )
         }
         .animation(.easeInOut(duration: 0.25), value: voiceIn.isRecording)
+        .animation(.easeInOut(duration: 0.2), value: bridge.activeLens)
+    }
+
+    /// The mode bob is in, if any — `@music`, `@project:lootgo`. Sits just left
+    /// of the mic; click it to drop back to plain bob.
+    @ViewBuilder
+    private var lensChip: some View {
+        if let lens = bridge.activeLens {
+            Button { bridge.activeLens = nil } label: {
+                Text("@\(lens)")
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.accentColor.opacity(0.9))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background { Capsule().fill(Color.accentColor.opacity(0.14)) }
+            }
+            .buttonStyle(.plain)
+            .help("\(lens) lens is on — click to clear (or send @none)")
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+        }
     }
 
     private var micButton: some View {
@@ -278,12 +301,47 @@ struct CenterStage: View {
     }
 
     private func send() {
-        let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
+        let raw = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return }
         input = ""
         home.welcomeNote = nil
+
+        // A leading `@token` picks the session's lens and is stripped from what
+        // bob sees: `@music play something moody` switches and sends the rest,
+        // `@music` alone only switches, `@none` clears. An unknown token is left
+        // in the text untouched — a typo reaches bob as words, never as a mode.
+        var prompt = raw
+        if let (spec, rest) = Self.lensPrefix(raw) {
+            if spec.lowercased() == "none" || spec.lowercased() == "off" {
+                bridge.activeLens = nil
+                prompt = rest
+            } else if LensStore.shared.resolve(spec) != nil {
+                // resolving here is the honest gate: the chip only goes up for a
+                // lens that actually assembles (file present, argument supplied).
+                // This copy is thrown away — ClaudeBridge resolves again per turn
+                // so edits to the lens file land on the very next message.
+                bridge.activeLens = spec
+                prompt = rest
+            }
+        }
+
+        guard !prompt.isEmpty else { return }   // lens switch only — nothing to say
         voiceOut.stop()
         bridge.send(prompt)
+    }
+
+    /// Splits a leading `@<token>` off a message: `("music", "play something")`.
+    /// Nil when the message doesn't start with one.
+    private static func lensPrefix(_ text: String) -> (spec: String, rest: String)? {
+        guard text.hasPrefix("@") else { return nil }
+        let body = text.dropFirst()
+        let token = String(body.prefix { !$0.isWhitespace })
+        // "@music," / "@music." — punctuation belongs to the sentence, not the name
+        let spec = token.trimmingCharacters(in: CharacterSet(charactersIn: ",.;:!?"))
+        guard !spec.isEmpty else { return nil }
+        let rest = String(body.dropFirst(token.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (spec, rest)
     }
 
     private func toggleVoice() {

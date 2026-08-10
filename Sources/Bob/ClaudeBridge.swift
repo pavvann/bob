@@ -16,6 +16,12 @@ final class ClaudeBridge: ObservableObject {
     @Published var isStreaming: Bool = false
     @Published var lastError: String? = nil
 
+    /// The lens riding on this session — `"music"`, `"project:lootgo"`, or nil for
+    /// none. Set by typing `@<name>` in the input bar and sticky until `@none` or
+    /// a session reset: a lens is a *mode*, not a one-shot. Resolved fresh every
+    /// turn, so editing the lens file lands on the very next message.
+    @Published var activeLens: String? = nil
+
     /// bob's most recent reply text (used for text-to-speech).
     var lastResponse: String { turns.last(where: { $0.role == .bob })?.text ?? "" }
 
@@ -42,6 +48,7 @@ final class ClaudeBridge: ObservableObject {
         currentProcess?.terminate()
         sessionId = UUID().uuidString
         sessionStarted = false
+        activeLens = nil
         turns = []
         lastError = nil
         isStreaming = false
@@ -120,9 +127,18 @@ final class ClaudeBridge: ObservableObject {
         } else {
             sessionArgs = []
         }
+        // A lens rides on top of the default system prompt, per turn. Resolve
+        // failure is silent on purpose — LensStore already logged why to
+        // state/lens-debug.log, and we fall through to exactly today's argv.
+        // Isolated one-shots (minion debriefs) skip it: they're bob's voice
+        // reporting a result, not work done inside a mode.
+        var lensArgs: [String] = []
+        if useSession, let spec = activeLens, let ctx = LensStore.shared.resolve(spec) {
+            lensArgs = ["--append-system-prompt", ctx.text]
+        }
         process.arguments = [
             "-p",
-        ] + sessionArgs + [
+        ] + sessionArgs + lensArgs + [
             // --permission-mode auto engages claude code's classifier: each tool
             // call (Edit, Write, Bash, etc) is judged for safety and auto-allowed
             // when low-risk, blocked when destructive.
