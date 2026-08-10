@@ -57,6 +57,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // field first and only hides when empty — see .onKeyPress(.escape).)
         HotKeyManager.shared.onTrigger = { HotKeyManager.toggleBob() }
         HotKeyManager.shared.register()
+
+        // start the nightly retro clock (first check 2 minutes from now)
+        _ = RetroService.shared
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
