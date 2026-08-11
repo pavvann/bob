@@ -1,65 +1,321 @@
 import Foundation
+import Combine
 
+/// bob's mouth. Since P1c this is an *adapter*: with the persistent session on
+/// (the default now), `turns`/`isStreaming` are a republished view of
+/// SessionManager.companion's transcript, and sending a message is one line
+/// down a living process's stdin instead of a fresh `claude -p` per turn. The
+/// old one-shot implementation is still here as `sendLegacy` — reachable by
+/// flag, and taken automatically for the rest of the run if the streaming
+/// session ever falls over (plan D7). Nothing above this file knows which path
+/// is live.
 @MainActor
 final class ClaudeBridge: ObservableObject {
+    // MARK: - the turn model
+
+    /// Transitional two-case role — CenterStage's `turnRow` still switches on
+    /// it, so notices render as bob's text until P1d's rewrite switches to
+    /// `Turn.kind` (three cases). Delete this and the accessor below with that
+    /// commit.
     enum Role: String { case you, bob }
+
+    /// One row of the running conversation. `notice` is bob's system-styled
+    /// aside — a background task finished, the session dropped, the bridge fell
+    /// back. `activity` is the live tool line ("reading Foo.swift") and is
+    /// non-nil only on the in-flight bob turn.
     struct Turn: Identifiable, Equatable {
-        let id = UUID()
-        let role: Role
+        enum Kind: Equatable { case you, bob, notice }
+        let id: UUID
+        var kind: Kind
         var text: String
+        var activity: String?
+
+        init(id: UUID = UUID(), kind: Kind, text: String, activity: String? = nil) {
+            self.id = id
+            self.kind = kind
+            self.text = text
+            self.activity = activity
+        }
+
+        var role: Role { kind == .you ? .you : .bob }
     }
 
     /// The running conversation for this session — your turns and bob's
-    /// streamed replies, in order. Replaces the old single `response` so the
-    /// chat history stays visible instead of getting wiped each message.
+    /// streamed replies, in order. On the streaming path this is a projection
+    /// of the companion session's entries (hidden ones filtered out); on the
+    /// legacy path the bridge appends to it directly.
     @Published private(set) var turns: [Turn] = []
     @Published var isStreaming: Bool = false
     @Published var lastError: String? = nil
 
     /// The lens riding on this session — `"music"`, `"project:lootgo"`, or nil for
     /// none. Set by typing `@<name>` in the input bar and sticky until `@none` or
-    /// a session reset: a lens is a *mode*, not a one-shot. Resolved fresh every
-    /// turn, so editing the lens file lands on the very next message.
+    /// a session reset: a lens is a *mode*, not a one-shot. On the streaming path
+    /// it rides the process's system prompt (swapped by a graceful respawn), so
+    /// re-sending `@music` after editing the file is what picks up the edit.
     @Published var activeLens: String? = nil
 
     /// bob's most recent reply text (used for text-to-speech).
-    var lastResponse: String { turns.last(where: { $0.role == .bob })?.text ?? "" }
+    var lastResponse: String { turns.last(where: { $0.kind == .bob })?.text ?? "" }
 
     /// Called with each completed sentence as bob streams, so bob can speak as
     /// he thinks rather than reading a finished wall of text. Wired by the view
-    /// to VoiceOutput. No-op until set.
-    var onSentence: ((String) -> Void)?
+    /// to VoiceOutput. No-op until set. Forwarded to the live session, which
+    /// owns the sentence flushing on the streaming path.
+    var onSentence: ((String) -> Void)? {
+        didSet { session?.onSentence = onSentence }
+    }
     private var spokenIndex: String.Index?
 
     /// Minion debriefs waiting to be spoken — queued so none is lost when bob
     /// happens to be mid-reply (or when two minions finish at once).
     private var pendingDebriefs: [(task: String, detail: String, ok: Bool)] = []
 
-    /// Session UUID for this bob launch. First turn uses `--session-id` (creates).
-    /// Subsequent turns use `--resume <id>` (continues). Reset by quit+relaunch
-    /// or by calling `resetSession()`.
-    private(set) var sessionId: String = UUID().uuidString
+    /// Session UUID for this bob launch — the ONE id both paths use, so a
+    /// fallback mid-conversation resumes the same CLI session file instead of
+    /// starting a stranger. Lowercased because that's what ClaudeSession passes
+    /// and the transcript is named after the literal string.
+    private(set) var sessionId: String = UUID().uuidString.lowercased()
+    /// True once the CLI has actually created that session on disk. First
+    /// legacy turn of a fresh id uses `--session-id` (creates); every later one
+    /// uses `--resume` (continues).
     private var sessionStarted: Bool = false
 
     private var currentProcess: Process?
 
+    // MARK: - streaming plumbing
+
+    /// The companion session this bridge mirrors (SessionManager's session #0).
+    private var session: ClaudeSession?
+    private var mirrors: Set<AnyCancellable> = []
+    private var managerWatch: AnyCancellable?
+    /// Lens spec last pushed at the process — lets a direct `activeLens = x`
+    /// (today's CenterStage) still land at the next send.
+    private var pushedLens: String?
+    /// The prompt whose turn hasn't finished yet. If the session dies on it,
+    /// this is what the legacy path re-sends (D7).
+    private var pendingPrompt: String?
+    /// One-way door: once the streaming path has failed, the rest of the run is
+    /// legacy. A relaunch (or a flag flip) is how you get back.
+    private var fellBack = false
+
+    /// P1c makes the persistent session the default. Back to the old one-shot
+    /// path with `defaults write app.bob.mac bob.streamingSession -bool false`.
+    /// Registration is a default, not a write — the owner's explicit choice
+    /// always wins. `SessionManager.streamingFlagKey` is the same string.
+    nonisolated static let registerDefaults: Void = {
+        UserDefaults.standard.register(defaults: ["bob.streamingSession": true])
+    }()
+
+    /// Reads the flag *after* making sure the default-true registration has
+    /// run, whatever order the app happens to touch things in.
+    static var streamingEnabled: Bool {
+        _ = registerDefaults
+        return SessionManager.streamingEnabled
+    }
+
+    /// True while messages should go down the live process's stdin.
+    private var useStreaming: Bool { Self.streamingEnabled && !fellBack }
+
+    init() {
+        _ = Self.registerDefaults
+        guard Self.streamingEnabled else { return }
+        // the companion may already be up (BobApp spawns it post-bootstrap) or
+        // may still be waiting on ~/bob — either way, attach the moment it
+        // appears so a spontaneous turn can render before the owner has typed
+        // anything at all.
+        attach(SessionManager.shared.companion)
+        managerWatch = SessionManager.shared.$sessions.sink { [weak self] sessions in
+            let companion = sessions.first
+            Task { @MainActor in self?.attach(companion) }
+        }
+        // belt and braces on the launch race: BobApp's spawn-at-launch may read
+        // the flag before this file's default registration ran, in which case
+        // it no-oped. Calling it again once ~/bob is real is free (it guards on
+        // companion == nil) and keeps the cold start off the first message.
+        Task { @MainActor [weak self] in
+            for _ in 0..<100 {
+                if BobHome.shared.isInitialized { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            SessionManager.shared.launchCompanionIfEnabled()
+            self?.attach(SessionManager.shared.companion)
+        }
+    }
+
+    /// Mirror a session's transcript and state onto the published surface.
+    private func attach(_ candidate: ClaudeSession?) {
+        guard useStreaming, let live = candidate, live !== session else { return }
+        mirrors.removeAll()
+        session = live
+        // both paths must name the same conversation (D7) — adopt the session's
+        // id, whoever minted it
+        sessionId = live.config.sessionId.uuidString.lowercased()
+        sessionStarted = live.lastResult != nil || live.entries.contains { $0.role == .bob }
+        live.onSentence = onSentence
+
+        // @Published fires on willSet from the main actor, so these run inline
+        // and in order — the new value arrives as the argument, never by
+        // re-reading the property.
+        live.$entries.sink { [weak self] entries in
+            MainActor.assumeIsolated { self?.republish(entries) }
+        }.store(in: &mirrors)
+        live.$state.sink { [weak self] state in
+            MainActor.assumeIsolated { self?.mirror(state) }
+        }.store(in: &mirrors)
+        live.$lastError.sink { [weak self] error in
+            MainActor.assumeIsolated { if let error { self?.lastError = error } }
+        }.store(in: &mirrors)
+
+        republish(live.entries)
+        mirror(live.state)
+        syncLens(to: live, force: true)
+    }
+
+    private func detach() {
+        mirrors.removeAll()
+        managerWatch = nil
+        session = nil
+    }
+
+    /// The companion's entries become bob's turns. Hidden entries (debrief
+    /// injections) are dropped here and nowhere else — that filter is the whole
+    /// reason a debrief shows only bob's reply. Entry ids carry through so
+    /// SwiftUI keeps its rows.
+    private func republish(_ entries: [ClaudeSession.Entry]) {
+        turns = entries.compactMap { entry in
+            guard !entry.hidden else { return nil }
+            return Turn(id: entry.id, kind: Self.kind(of: entry.role), text: entry.text, activity: entry.activity)
+        }
+    }
+
+    private static func kind(of role: ClaudeSession.Role) -> Turn.Kind {
+        switch role {
+        case .you: return .you
+        case .bob: return .bob
+        case .notice: return .notice
+        }
+    }
+
+    private func mirror(_ state: ClaudeSession.State) {
+        let streaming: Bool
+        switch state {
+        case .turnActive, .interrupting: streaming = true
+        default: streaming = false
+        }
+        if isStreaming != streaming { isStreaming = streaming }
+
+        if case .failed(let reason) = state {
+            fallBackToLegacy(reason)
+            return
+        }
+        if case .idle = state {
+            pendingPrompt = nil
+            // a debrief that arrived while bob was replying can fire now
+            drainDebriefs()
+        }
+    }
+
+    /// Bring the companion up if nothing has yet — the launch wiring might not
+    /// have fired (or ~/bob only just became real). Cold start costs this first
+    /// message ~8s, exactly like the legacy path did every message.
+    private func ensureCompanion() -> ClaudeSession? {
+        if let session { return session }
+        guard useStreaming else { return nil }
+        let manager = SessionManager.shared
+        if let companion = manager.companion {
+            attach(companion)
+            return session
+        }
+        attach(manager.spawn(SessionConfig(
+            // the id legacy would have used, so a later fallback is seamless
+            sessionId: UUID(uuidString: sessionId) ?? UUID(),
+            cwd: BobHome.shared.root,
+            appendSystemPrompt: activeLens.flatMap { LensStore.shared.resolve($0)?.text },
+            permissions: .auto,     // parity with the legacy argv (edge 11)
+            name: "bob",
+            voiced: true
+        )))
+        return session
+    }
+
+    /// The compatibility door (D7). Spawn threw, the readiness handshake timed
+    /// out, or the process died twice in a minute — say so once, quietly, and
+    /// finish the run on the path that has always worked. The turns already on
+    /// screen stay; the interrupted prompt is re-sent hidden so the owner's
+    /// message isn't echoed twice.
+    private func fallBackToLegacy(_ reason: String) {
+        guard !fellBack else { return }
+        fellBack = true
+        detach()
+        turns.append(Turn(kind: .notice, text: "running in compatibility mode"))
+        logToSink("streaming session failed (\(reason)) — falling back to the legacy one-shot path")
+        isStreaming = false
+        if let prompt = pendingPrompt {
+            pendingPrompt = nil
+            sendLegacy(prompt, hidden: true, useSession: true)
+        } else {
+            drainDebriefs()
+        }
+    }
+
+    /// Push the chip's lens onto the process when what it's running differs.
+    /// Resolution happens here, per process epoch: same text means no respawn,
+    /// edited text means a graceful one (D4).
+    private func syncLens(to live: ClaudeSession, force: Bool = false) {
+        guard force || pushedLens != activeLens else { return }
+        pushedLens = activeLens
+        // resolve failure is silent on purpose — LensStore already logged why to
+        // state/lens-debug.log, and bob falls through to plain claude
+        let text = activeLens.flatMap { LensStore.shared.resolve($0)?.text }
+        if text != live.config.appendSystemPrompt {
+            live.setAppendSystemPrompt(text)
+        }
+    }
+
+    // MARK: - public verbs
+
     /// Start a fresh conversation. Drops continuity with prior turns.
     func resetSession() {
         currentProcess?.terminate()
-        sessionId = UUID().uuidString
-        sessionStarted = false
+        currentProcess = nil
         activeLens = nil
+        pushedLens = nil
         turns = []
         lastError = nil
         isStreaming = false
         spokenIndex = nil
+        pendingPrompt = nil
         pendingDebriefs.removeAll()
+        if useStreaming, let live = session {
+            live.reset()            // mints a new id, clears entries + lens
+            sessionId = live.config.sessionId.uuidString.lowercased()
+        } else {
+            sessionId = UUID().uuidString.lowercased()
+        }
+        sessionStarted = false
+    }
+
+    /// Switch the mode bob is in — `@music`, `@project:lootgo`, nil for none.
+    /// The chip updates now; on the streaming path the process respawns with
+    /// the new system prompt while the owner types, and anything sent during
+    /// the swap is queued and flushed, never dropped (D4).
+    func setLens(_ spec: String?) {
+        activeLens = spec
+        guard useStreaming, let live = session else {
+            // no process yet — the lens rides into the config at spawn
+            pushedLens = spec
+            return
+        }
+        // force: re-sending the same @lens is how an edited lens file lands, so
+        // always re-resolve; the text comparison inside decides on a respawn
+        syncLens(to: live, force: true)
     }
 
     /// A minion bob dispatched just finished — queue a debrief. It's delivered
-    /// when bob isn't mid-reply, so it's never lost in the busy moments. Runs
-    /// as an ISOLATED one-shot (no --resume) so the synthetic note never
-    /// pollutes the resumable session's continuity.
+    /// when bob isn't mid-reply, so it's never lost in the busy moments. On the
+    /// streaming path it folds into bob's own session as a hidden user message
+    /// (D3): the prompt never renders, only bob's one-line report.
     func enqueueDebrief(task: String, detail: String, ok: Bool) {
         pendingDebriefs.append((task, detail, ok))
         drainDebriefs()
@@ -75,10 +331,47 @@ final class ClaudeBridge: ObservableObject {
         result: "\(d.detail)"
         tell the user in ONE short lowercase line, in your voice, like a bro who just got it done. no preamble, no "the minion" — just say what happened. under 16 words.
         """
-        send(prompt, hidden: true, useSession: false)
+        if useStreaming, let live = ensureCompanion() {
+            live.send(prompt, hidden: true, source: .injected)
+        } else {
+            // legacy debriefs stay ISOLATED one-shots (no --resume) so the
+            // synthetic note never pollutes the resumable session
+            sendLegacy(prompt, hidden: true, useSession: false)
+        }
     }
 
     func send(_ rawPrompt: String, hidden: Bool = false, useSession: Bool = true) {
+        let prompt = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+
+        if useStreaming, let live = ensureCompanion() {
+            lastError = nil
+            syncLens(to: live)          // catches a directly-set activeLens
+            if !hidden { pendingPrompt = prompt }
+            live.send(prompt, hidden: hidden, source: hidden ? .injected : .user)
+            return
+        }
+        sendLegacy(prompt, hidden: hidden, useSession: useSession)
+    }
+
+    /// Stop the reply. On the streaming path this is an interrupt control
+    /// request — the turn aborts, the process lives (probe 1.4). On the legacy
+    /// path it's the old kill.
+    func cancel() {
+        if useStreaming, let live = session, live.isStreaming {
+            live.interrupt()
+            return
+        }
+        currentProcess?.terminate()
+    }
+
+    // MARK: - legacy path (one `claude -p` per turn)
+
+    /// Bob's original send: a fresh process per turn, `--resume` for
+    /// continuity, stdout streamed straight into the reply. Kept verbatim as
+    /// the fallback — same session id as the streaming path, so a conversation
+    /// can cross over mid-flight and stay one conversation.
+    private func sendLegacy(_ rawPrompt: String, hidden: Bool = false, useSession: Bool = true) {
         let prompt = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
 
@@ -89,9 +382,9 @@ final class ClaudeBridge: ObservableObject {
         // A hidden turn (e.g. a minion debrief) shows only bob's reply, not the
         // prompt that triggered it.
         if !hidden {
-            turns.append(Turn(role: .you, text: prompt))
+            turns.append(Turn(kind: .you, text: prompt))
         }
-        turns.append(Turn(role: .bob, text: ""))
+        turns.append(Turn(kind: .bob, text: ""))
 
         let process = Process()
         let pipe = Pipe()
@@ -116,14 +409,16 @@ final class ClaudeBridge: ObservableObject {
         // pins the newer copy at ~/.local/bin/claude when present.
         process.executableURL = URL(fileURLWithPath: Self.claudePath)
         // First turn: --session-id creates a new session with this UUID.
-        // Subsequent turns: --resume continues that session. Using --session-id
-        // for every turn errors with "Session ID ... is already in use".
-        // Session turns thread through --session-id/--resume for continuity.
+        // Subsequent turns use --resume. A streaming session that already got
+        // as far as creating the file on disk counts as started too — that's
+        // what makes the fallback re-send land in the same conversation instead
+        // of erroring with "Session ID is already in use".
         // Isolated turns (minion debriefs) carry no session args so they never
         // become part of the resumable conversation.
         let sessionArgs: [String]
         if useSession {
-            sessionArgs = sessionStarted ? ["--resume", sessionId] : ["--session-id", sessionId]
+            let started = sessionStarted || Self.sessionExistsOnDisk(sessionId, cwd: BobHome.shared.root)
+            sessionArgs = started ? ["--resume", sessionId] : ["--session-id", sessionId]
         } else {
             sessionArgs = []
         }
@@ -177,7 +472,7 @@ final class ClaudeBridge: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 // speak any trailing fragment that never got a terminator
-                if let idx = self.turns.lastIndex(where: { $0.role == .bob }) {
+                if let idx = self.turns.lastIndex(where: { $0.kind == .bob }) {
                     self.flushSpeakable(self.turns[idx].text, final: true)
                 }
                 self.isStreaming = false
@@ -204,7 +499,7 @@ final class ClaudeBridge: ObservableObject {
     /// Append streamed text to the in-flight bob turn, and speak any sentences
     /// that just completed.
     private func appendToReply(_ text: String) {
-        guard let idx = turns.lastIndex(where: { $0.role == .bob }) else { return }
+        guard let idx = turns.lastIndex(where: { $0.kind == .bob }) else { return }
         turns[idx].text += text
         flushSpeakable(turns[idx].text)
     }
@@ -256,16 +551,32 @@ final class ClaudeBridge: ObservableObject {
 
     /// Replace the in-flight bob turn's text (used for error messages).
     private func setReply(_ text: String) {
-        guard let idx = turns.lastIndex(where: { $0.role == .bob }) else { return }
+        guard let idx = turns.lastIndex(where: { $0.kind == .bob }) else { return }
         turns[idx].text = text
     }
 
-    func cancel() {
-        currentProcess?.terminate()
+    // MARK: - shared plumbing
+
+    /// Does the CLI already have a session file for this id? The transcript
+    /// lives at `~/.claude/projects/<cwd-with-slashes-as-dashes>/<id>.jsonl`;
+    /// its existence is what decides `--resume` vs `--session-id` when the
+    /// streaming path created the session and the legacy path inherits it.
+    private nonisolated static func sessionExistsOnDisk(_ id: String, cwd: URL) -> Bool {
+        let slug = cwd.path
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ".", with: "-")
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects", isDirectory: true)
+            .appendingPathComponent(slug, isDirectory: true)
+            .appendingPathComponent("\(id).jsonl")
+        return FileManager.default.fileExists(atPath: url.path)
     }
 
-    private static func shellQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    /// Forensics for the compatibility switch — same log a curious owner
+    /// already checks when bob goes quiet.
+    private func logToSink(_ line: String) {
+        let sink = Self.stderrSink(root: BobHome.shared.root)
+        try? sink.write(contentsOf: Data("[bob:bridge] \(line)\n".utf8))
     }
 
     /// An append handle onto `~/bob/state/bridge-stderr.log` — where every
