@@ -1,23 +1,32 @@
 import SwiftUI
 
-/// The strip of little agent cards under centerstage — bob's own minions plus
-/// any external claude code sessions running in terminal tabs. Scrolls
-/// sideways when the row outgrows its box. Hover lifts a card (the HoverTile
-/// spring); click floats its live panel.
+/// The strip of little agent cards along the bottom of the window — bob's own
+/// minions plus any external claude code sessions running in terminal tabs. The
+/// row sits centered while it's narrower than the window and scrolls sideways
+/// once it outgrows it. Hover lifts a card (the HoverTile spring); click floats
+/// its live panel.
 struct MinionStrip: View {
     let minions: [MinionService.Minion]
     let sessions: [SessionWatcher.Session]
 
     var body: some View {
-        ScrollView(.horizontal) {
-            HStack(spacing: 10) {
-                ForEach(minions) { MinionCard(minion: $0) }
-                ForEach(sessions) { SessionCard(session: $0) }
+        // The width has to come from a reader: inside a horizontal ScrollView the
+        // scroll axis is proposed as unspecified, so `maxWidth: .infinity` on the
+        // row would collapse to the cards instead of centering them.
+        GeometryReader { geo in
+            ScrollView(.horizontal) {
+                HStack(spacing: 10) {
+                    ForEach(minions) { MinionCard(minion: $0) }
+                    ForEach(sessions) { SessionCard(session: $0) }
+                }
+                // vertical slack so a hovered card's lift and shadow aren't
+                // shaved off by the scroll view's clip
+                .padding(.vertical, 10)
+                .padding(.horizontal, 4)
+                .frame(minWidth: geo.size.width, alignment: .center)
             }
-            .padding(.vertical, 8)
-            .padding(.horizontal, 4)
+            .scrollIndicators(.never)
         }
-        .scrollIndicators(.never)
     }
 }
 
