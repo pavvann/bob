@@ -1,32 +1,23 @@
 import SwiftUI
 
 /// A comet of light that orbits the input bar — and *reacts*. It hears your
-/// voice (the trail thickens and quickens the instant you speak), it breathes
-/// while bob is replying, it speeds with bob's pulse, and its color glides
-/// through the day via `Circadian` (bob's blue by morning, amber at golden
-/// hour, coral ember past midnight).
+/// voice (the trail thickens and quickens the instant you speak), it speeds
+/// with bob's pulse, and its color glides through the day via `Circadian`
+/// (bob's blue by morning, amber at golden hour, coral ember past midnight).
 ///
-/// Every reactive quantity is integrated or eased on the render clock by
-/// `CometMotion` — never read straight off `t / period`, never stepped off a
-/// boolean — so submitting, streaming and toggling the mic all *glide*. The
-/// glow is blurred inside its own layer and only then clipped to the outside of
-/// the path, so it radiates outward without smearing back over the bar; the
-/// canvas carries `bleed` of slack on every side so the halo isn't cut off.
+/// One thin line, always — no glow, no bloom, nothing that smears the bar while
+/// bob is thinking. Every reactive quantity is integrated or eased on the render
+/// clock by `CometMotion` — never read straight off `t / period`, never stepped
+/// off a boolean — so submitting and toggling the mic *glide*.
 struct AnimatedBorder: View {
     let cornerRadius: CGFloat
-    /// Slack around the bar for the halo to live in — must cover
-    /// `glowWidth / 2` plus a couple of blur radii, or the blur gets hard-cut
-    /// in a square edge that travels with the comet. The canvas grows by this
-    /// on every side and insets straight back, so the path lands on the bar.
-    var bleed: CGFloat = 36
+    /// Slack around the bar so the stroke isn't clipped at its widest. The
+    /// canvas grows by this on every side and insets straight back, so the path
+    /// still lands exactly on the bar.
+    var bleed: CGFloat = 6
 
     /// Live mic amplitude 0...1 while listening — the comet leans toward you.
     var voiceLevel: Double = 0
-    /// True while the mic is open — keeps the glow steadily on so it doesn't
-    /// pop in and out as your voice crosses a threshold between words.
-    var listening: Bool = false
-    /// True while bob is streaming a reply — drives a slow exhale pulse.
-    var streaming: Bool = false
     /// bob's pulse 0...1 — the single input that sets the resting lap speed.
     var energy: Double = 0
     /// Optional hard color override; default follows the hour.
@@ -34,8 +25,8 @@ struct AnimatedBorder: View {
 
     var lineWidth: CGFloat = 2.0
     var trailLength: Double = 0.30
-    // 26 faded, blurred sub-strokes read identically to 60 but halve the
-    // per-frame trimmedPath cost.
+    // 26 fading sub-strokes read identically to 60 but halve the per-frame
+    // trimmedPath cost.
     var segments: Int = 26
 
     @State private var motion = CometMotion()
@@ -47,44 +38,19 @@ struct AnimatedBorder: View {
                 to: timeline.date,
                 // Resting lap speed from bob's pulse, shortened as you speak.
                 period: lerpD(max(BobPulse.borderPeriod(at: energy), 3.8), 3.0, voiceLevel),
-                voice: voiceLevel,
-                streaming: streaming,
-                lit: listening || streaming
+                voice: voiceLevel
             )
             let head = m.phase
             let drive = m.drive
 
             let lw = lineWidth * (0.7 + drive * 1.9)
-            let glowBlur = 7.0 * (1 + drive * 0.9)
-            let glowWidth = lw + 8 + drive * 6
 
             Canvas { ctx, size in
                 let rect = CGRect(origin: .zero, size: size).insetBy(dx: bleed, dy: bleed)
                 let path = Path(roundedRect: rect, cornerRadius: cornerRadius, style: .continuous)
 
-                // ambient ring — always faintly present, brightens as bob listens
+                // ambient ring — always faintly present, brightens as you speak
                 ctx.stroke(path, with: .color(accent.opacity(0.08 + drive * 0.12)), lineWidth: 0.5)
-
-                // Soft outer glow. The inverse-clipped Gaussian blur is the
-                // single heaviest op per frame, so skip it while `halo` has
-                // faded away. Blur happens in the inner layer and the clip sits
-                // on the outer one: clipping first would leave a hard edge for
-                // the blur to smear back across the bar.
-                if m.halo > 0.01 {
-                    ctx.drawLayer { glow in
-                        glow.clip(to: path, options: .inverse)
-                        glow.drawLayer { lit in
-                            lit.addFilter(.blur(radius: glowBlur))
-                            let span = trailLength * 0.30
-                            let tail = (head - span + 1.0).truncatingRemainder(dividingBy: 1.0)
-                            lit.stroke(
-                                Self.subPath(of: path, from: tail, to: head),
-                                with: .color(accent.opacity((0.55 + drive * 0.35) * m.halo)),
-                                style: StrokeStyle(lineWidth: glowWidth, lineCap: .round)
-                            )
-                        }
-                    }
-                }
 
                 // crisp fading comet trail
                 for i in 0..<segments {
@@ -121,42 +87,21 @@ struct AnimatedBorder: View {
 }
 
 /// The comet's memory between frames. `phase` rides a `PhaseClock` so it stays
-/// continuous while the lap period changes underneath it; `drive` (how thick
-/// and bright the comet burns) and `halo` (whether the glow is present at all)
-/// are eased on the same clock so no state flip lands as a step.
+/// continuous while the lap period changes underneath it; `drive` (how thick and
+/// bright the comet burns) is eased on the same clock, so your voice lifts and
+/// releases it instead of stepping.
 private final class CometMotion {
     struct Frame {
         let phase: Double
         let drive: Double
-        let halo: Double
     }
 
     private let clock = PhaseClock(period: 13)
     private var drive = 0.0
-    private var halo = 0.0
-    // Own integrated phase for the exhale, reset to the trough of the sine on
-    // each reply so the breath always starts from calm.
-    private var exhale = -Double.pi / 2
-    private var wasStreaming = false
-    private var seeded = false
 
-    func advance(to date: Date, period: Double, voice: Double, streaming: Bool, lit: Bool) -> Frame {
+    func advance(to date: Date, period: Double, voice: Double) -> Frame {
         clock.tick(date, period: period)
-
-        if streaming && !wasStreaming { exhale = -.pi / 2 }
-        wasStreaming = streaming
-        exhale += clock.dt * 2.0
-
-        let breath = streaming ? 0.30 + 0.30 * (0.5 + 0.5 * sin(exhale)) : 0
-        let target = max(voice, breath)
-        if !seeded {
-            seeded = true
-            drive = target
-            halo = lit ? 1 : 0
-        }
-        drive = clock.chase(drive, to: target, tau: 0.30)
-        halo = clock.chase(halo, to: lit ? 1 : 0, tau: 0.35)
-
-        return Frame(phase: clock.phase, drive: drive, halo: halo)
+        drive = clock.chase(drive, to: voice, tau: 0.30)
+        return Frame(phase: clock.phase, drive: drive)
     }
 }

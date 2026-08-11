@@ -123,7 +123,9 @@ final class OpenLine: ObservableObject {
         process.environment = env
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        // never a Pipe: nothing drains it here, and 64K of CLI noise would wedge
+        // the process against `waitUntilExit()`. Same log as the chat bridge.
+        process.standardError = ClaudeBridge.stderrSink(root: cwd)
         do {
             try process.run()
             // watchdog: never let a wedged subprocess hold `generating` forever.

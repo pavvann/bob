@@ -149,7 +149,11 @@ final class ClaudeBridge: ObservableObject {
         // (bob's wiki schema) and `Read`/`Write`/`Edit` operate on the wiki by default.
         process.currentDirectoryURL = BobHome.shared.root
         process.standardOutput = pipe
-        process.standardError = pipe
+        // stderr gets its own sink. Sharing stdout's pipe meant the CLI's own
+        // noise — hook failures, `node: command not found`, deprecation warnings
+        // — arrived mid-sentence inside bob's reply. A file handle also needs no
+        // draining, so that channel can never fill up and stall claude.
+        process.standardError = Self.stderrSink(root: BobHome.shared.root)
 
         // Pipe reads break at arbitrary byte boundaries; a multibyte UTF-8
         // sequence (emoji, em-dash) split across two reads would fail to decode
@@ -262,6 +266,29 @@ final class ClaudeBridge: ObservableObject {
 
     private static func shellQuote(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// An append handle onto `~/bob/state/bridge-stderr.log` — where every
+    /// `claude -p` bob spawns sends its stderr, so chat text is stdout and only
+    /// stdout. Opened `O_APPEND` so two claudes writing at once interleave whole
+    /// writes instead of clobbering each other, and rotated one generation back
+    /// past a megabyte so it can't grow forever. Falls back to /dev/null rather
+    /// than ever letting the noise back into the reply.
+    nonisolated static func stderrSink(root: URL) -> FileHandle {
+        let url = root
+            .appendingPathComponent("state", isDirectory: true)
+            .appendingPathComponent("bridge-stderr.log")
+        let fm = FileManager.default
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let attrs = try? fm.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? Int, size > 1_000_000 {
+            let previous = url.appendingPathExtension("1")
+            try? fm.removeItem(at: previous)
+            try? fm.moveItem(at: url, to: previous)
+        }
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard fd >= 0 else { return .nullDevice }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
     /// Resolve the claude binary at startup. Prefer `~/.local/bin/claude` (where

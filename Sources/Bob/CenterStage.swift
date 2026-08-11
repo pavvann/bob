@@ -126,7 +126,11 @@ struct CenterStage: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .frame(maxHeight: 300)
+                // takes whatever height the window offers, up to this — tall
+                // enough that a real conversation reads like a thread instead of
+                // a letterbox. Bottom-anchored, so the newest turn always sits
+                // right above the input bar however short the exchange is.
+                .frame(maxHeight: 520)
                 .defaultScrollAnchor(.bottom)
                 .scrollIndicators(.never)
                 .onChange(of: bridge.turns) { _, _ in
@@ -247,12 +251,10 @@ struct CenterStage: View {
         }
         .overlay {
             // No padding here — AnimatedBorder owns its own bleed, so the
-            // canvas and the halo can never drift out of agreement again.
+            // canvas and the stroke can never drift out of agreement again.
             AnimatedBorder(
                 cornerRadius: 26,
                 voiceLevel: Double(voiceIn.level),
-                listening: voiceIn.isRecording,
-                streaming: bridge.isStreaming,
                 energy: pulse.energy
             )
         }

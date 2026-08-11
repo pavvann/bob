@@ -35,22 +35,14 @@ struct ContentView: View {
                     .frame(height: 110, alignment: .top)
                     .zIndex(2)
 
-                    Spacer(minLength: 0)
-
-                    // bob — the conductor, centered
+                    // bob — the conductor, centered in everything the tiles and
+                    // the minion band leave behind. The greedy frame is what
+                    // pins the band to the window's bottom edge.
                     CenterStage(bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home)
                         .frame(maxWidth: 640)
+                        .frame(maxHeight: .infinity)
 
-                    // minions bob has delegated tasks to, plus live claude
-                    // code sessions running in terminal tabs — click any card
-                    // to float its live panel
-                    if !minions.active.isEmpty || !sessions.live.isEmpty {
-                        MinionStrip(minions: minions.active, sessions: sessions.live)
-                            .frame(maxWidth: 640)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
-
-                    Spacer(minLength: 0)
+                    minionBand
                 }
                 .frame(maxWidth: .infinity)
 
@@ -77,6 +69,21 @@ struct ContentView: View {
             let ok = info["ok"] as? Bool ?? true
             bridge.enqueueDebrief(task: task, detail: detail, ok: ok)
         }
+    }
+
+    /// The bottom band: minions bob has delegated tasks to, plus live claude code
+    /// sessions running in terminal tabs — click any card to float its live
+    /// panel. Its height is held whether or not anything is running, so a hand
+    /// arriving never shoves the input bar upward.
+    private var minionBand: some View {
+        ZStack {
+            if !minions.active.isEmpty || !sessions.live.isEmpty {
+                MinionStrip(minions: minions.active, sessions: sessions.live)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .frame(height: 62)
+        .frame(maxWidth: .infinity)
     }
 
     private var memoryToggle: some View {
