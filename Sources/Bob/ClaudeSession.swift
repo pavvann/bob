@@ -76,6 +76,11 @@ final class ClaudeSession: ObservableObject, Identifiable {
         var text: String
         var hidden: Bool = false      // injected prompts (debriefs) — never rendered
         var activity: String? = nil   // live tool line ("reading Foo.swift") while in flight
+        /// Non-nil on a background-task notice: this row is *live status* for one
+        /// task — rewritten in place as the task talks, swept once it settles
+        /// (D3). Every other notice (session dropped, compatibility mode) leaves
+        /// this nil and stays in the transcript forever.
+        var taskId: String? = nil
     }
 
     let id = UUID()
@@ -117,6 +122,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     private let claudePath: String
     private let stderrSink: FileHandle
+    /// How long a settled task's notice lingers before it's swept. Injected so
+    /// harnesses don't have to wait out the real thing.
+    private let taskNoticeLinger: TimeInterval
     private var process: Process?
     private var stdinPipe: Pipe?
     private var readerTask: Task<Void, Never>?
@@ -143,13 +151,18 @@ final class ClaudeSession: ObservableObject, Identifiable {
     private var handshakeId: String?
     private var recentDeaths: [Date] = []
     private var closing = false
+    /// Pending sweeps, one per task id — cancelled and re-armed whenever the
+    /// task speaks again, so a late ping never leaves two rows or a stale timer.
+    private var taskSweeps: [String: Task<Void, Never>] = [:]
 
     /// `claudePath`/`stderrSink` are injected (SessionManager passes
     /// ClaudeBridge's statics) so the core stays testable standalone.
-    init(config: SessionConfig, claudePath: String, stderrSink: FileHandle) {
+    init(config: SessionConfig, claudePath: String, stderrSink: FileHandle,
+         taskNoticeLinger: TimeInterval = 10) {
         self.config = config
         self.claudePath = claudePath
         self.stderrSink = stderrSink
+        self.taskNoticeLinger = taskNoticeLinger
     }
 
     // MARK: - public verbs
@@ -237,6 +250,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         spokenIndex = nil
         pendingPromptChange = nil
         recentDeaths.removeAll()
+        cancelSweeps()
         switch state {
         case .unspawned:
             break
@@ -496,10 +510,17 @@ final class ClaudeSession: ObservableObject, Identifiable {
             for case .toolUse(_, let activity) in blocks { setActivity(activity) }
         case .toolResult:
             setActivity(nil)
-        case .taskNotification(_, let status, let summary):
-            // the notice row above the spontaneous turn that follows (D3)
-            appendNotice(summary ?? "background task \(status)")
-        case .taskStarted, .taskUpdated, .backgroundTasksChanged:
+        case .taskNotification(let id, let status, let summary):
+            // the notice row above the spontaneous turn that follows (D3) —
+            // one row per task, live, and gone once the task has settled
+            noteTask(id: id, text: summary ?? "background task \(status)", settled: Self.hasSettled(status))
+        case .taskUpdated(let id, let status):
+            // no row of its own (the in-turn activity line covers a live task) —
+            // but a patch saying "completed" settles a row that's already up
+            if let status, Self.hasSettled(status), taskNoticeIndex(id) != nil {
+                armSweep(id)
+            }
+        case .taskStarted, .backgroundTasksChanged:
             break
         case .permissionDenied:
             break   // in-turn auto-denial; result.permission_denials carries the tally
@@ -634,6 +655,58 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     private func appendNotice(_ text: String) {
         entries.append(Entry(role: .notice, text: text))
+    }
+
+    // MARK: - task notices (live status, not history)
+
+    /// A watcher the owner started and killed shouldn't leave a dim row in the
+    /// thread forever, so task chatter gets exactly one row per task: written
+    /// once, rewritten as the task talks, swept `taskNoticeLinger` after it
+    /// settles. Everything else appendNotice writes is permanent.
+    private func noteTask(id: String, text: String, settled: Bool) {
+        taskSweeps.removeValue(forKey: id)?.cancel()
+        if let idx = taskNoticeIndex(id) {
+            entries[idx].text = text
+        } else {
+            entries.append(Entry(role: .notice, text: text, taskId: id))
+        }
+        if settled { armSweep(id) }
+    }
+
+    private func armSweep(_ id: String) {
+        taskSweeps.removeValue(forKey: id)?.cancel()
+        let linger = taskNoticeLinger
+        taskSweeps[id] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, linger) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.sweepTask(id)
+        }
+    }
+
+    private func sweepTask(_ id: String) {
+        taskSweeps[id] = nil
+        guard let idx = taskNoticeIndex(id) else { return }
+        entries.remove(at: idx)
+        // currentBobIndex is an index, not a reference — a row vanishing above
+        // the in-flight reply would otherwise point it one past the end
+        if let current = currentBobIndex, current > idx { currentBobIndex = current - 1 }
+    }
+
+    private func taskNoticeIndex(_ id: String) -> Int? {
+        entries.firstIndex { $0.taskId == id }
+    }
+
+    private func cancelSweeps() {
+        for sweep in taskSweeps.values { sweep.cancel() }
+        taskSweeps.removeAll()
+    }
+
+    /// Notifications only fire when a task is done with something (probe 1.2 saw
+    /// "completed"), so anything unrecognized counts as settled; the explicitly
+    /// in-flight words are the exception that keeps a row up.
+    private static func hasSettled(_ status: String) -> Bool {
+        !["running", "in_progress", "pending", "queued", "started", "active"]
+            .contains(status.lowercased())
     }
 
     /// Emit any newly-completed sentences (since `spokenIndex`) to

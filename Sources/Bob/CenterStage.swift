@@ -30,6 +30,12 @@ struct CenterStage: View {
         !bridge.isStreaming && !bridge.turns.contains(where: { $0.kind != .notice })
     }
 
+    /// Which notice rows are up — the one thing in the thread that comes and
+    /// goes on its own (see the animation on the turn list).
+    private var noticeRows: [UUID] {
+        bridge.turns.filter { $0.kind == .notice }.map(\.id)
+    }
+
     var body: some View {
         VStack(spacing: 24) {
             stage
@@ -130,6 +136,11 @@ struct CenterStage: View {
                         Color.clear.frame(height: 1).id("end")
                     }
                     .padding(.vertical, 4)
+                    // task notices are live status — they sweep themselves once
+                    // the task settles. Keyed on just the notice rows so their
+                    // arrival and departure fade while ordinary turns keep
+                    // landing instantly.
+                    .animation(.easeInOut(duration: 0.3), value: noticeRows)
                 }
                 // takes whatever height the window offers, up to this — tall
                 // enough that a real conversation reads like a thread instead of
