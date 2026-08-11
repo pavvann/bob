@@ -60,6 +60,17 @@ final class MusicService: ObservableObject {
         writeState()
     }
 
+    /// State-only update for the in-process catalog player (pause/resume/stop
+    /// from the bob://music transport deep links). No-op when something else
+    /// owns the tile, so a stray catalog event can't clobber a Music.app or
+    /// Spotify play.
+    func publishCatalogState(_ state: String) {
+        guard let cur = current, cur.source == "apple_music_catalog", cur.state != state else { return }
+        current = Playback(source: cur.source, state: state,
+                           track: state == "stopped" ? nil : cur.track, updatedAt: Date())
+        writeState()
+    }
+
     // MARK: album-art palette
 
     private func updatePalette(for url: URL?) async {
