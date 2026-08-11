@@ -76,6 +76,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if BobHome.shared.isInitialized { break }
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
+            // read the flag through the bridge: that's where the default-true
+            // registration lives, and launching is the first thing in the app
+            // that asks. Straight to SessionManager and we'd read a bare
+            // false, skip the pre-spawn, and pay the cold start on the first
+            // message — the exact cost this line exists to avoid.
+            _ = ClaudeBridge.streamingEnabled
             SessionManager.shared.launchCompanionIfEnabled()
         }
     }
