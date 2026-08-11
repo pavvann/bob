@@ -23,7 +23,12 @@ struct CenterStage: View {
     @State private var slashDismissed = false
     @FocusState private var inputFocused: Bool
 
-    private var isIdle: Bool { bridge.turns.isEmpty && !bridge.isStreaming }
+    /// The resting screen, or the thread. Notices don't count as conversation:
+    /// a system whisper ("running in compatibility mode") shouldn't take over
+    /// bob's face at launch — it shows in the thread the moment there's one.
+    private var isIdle: Bool {
+        !bridge.isStreaming && !bridge.turns.contains(where: { $0.kind != .notice })
+    }
 
     var body: some View {
         VStack(spacing: 24) {
@@ -145,10 +150,11 @@ struct CenterStage: View {
 
     /// One turn in the running conversation. Your turns sit right-aligned and
     /// muted (an echo of what you said); bob's replies are left, full reading
-    /// weight. Minimal — a thread, not chat bubbles.
+    /// weight; notices are a whisper the conversation flows around. Minimal —
+    /// a thread, not chat bubbles.
     @ViewBuilder
     private func turnRow(_ turn: ClaudeBridge.Turn) -> some View {
-        switch turn.role {
+        switch turn.kind {
         case .you:
             HStack {
                 Spacer(minLength: 48)
@@ -159,21 +165,65 @@ struct CenterStage: View {
                     .textSelection(.enabled)
             }
         case .bob:
-            if turn.text.isEmpty && bridge.isStreaming {
-                // a quiet breathing dot where the reply will appear
-                ThinkingOrb()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .transition(.opacity)
-            } else {
-                Text(turn.text)
-                    .font(.system(size: 16, weight: .regular, design: .rounded))
-                    .foregroundStyle(.primary.opacity(0.92))
-                    .lineSpacing(4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .transition(.opacity)
+            VStack(alignment: .leading, spacing: 5) {
+                if turn.text.isEmpty && bridge.isStreaming {
+                    // a quiet breathing dot where the reply will appear
+                    ThinkingOrb()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(.opacity)
+                } else {
+                    Text(turn.text)
+                        .font(.system(size: 16, weight: .regular, design: .rounded))
+                        .foregroundStyle(.primary.opacity(0.92))
+                        .lineSpacing(4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .transition(.opacity)
+                }
+                activityLine(turn)
             }
+        case .notice:
+            // system aside — a background task landing, a session reconnecting,
+            // the compatibility-mode fallback. Dim, small, out of the way; it
+            // reads as the room talking, not as bob.
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("⏺")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.secondary.opacity(0.4))
+                Text(turn.text)
+                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.55))
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .transition(.opacity)
         }
+    }
+
+    /// What bob's hands are doing right now — "reading Foo.swift" — under the
+    /// streaming reply. Only the in-flight turn carries one. The slot keeps its
+    /// height for as long as that turn is live, so a tool starting and ending
+    /// mid-reply fades in and out instead of shoving the text around; it
+    /// collapses once, when the reply lands.
+    @ViewBuilder
+    private func activityLine(_ turn: ClaudeBridge.Turn) -> some View {
+        if turn.activity != nil || isInFlight(turn) {
+            Text(turn.activity ?? " ")
+                .font(.system(size: 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.5))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .opacity(turn.activity == nil ? 0 : 1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .animation(.easeInOut(duration: 0.18), value: turn.activity)
+        }
+    }
+
+    /// The turn bob is speaking into right now — the last one, while streaming.
+    private func isInFlight(_ turn: ClaudeBridge.Turn) -> Bool {
+        bridge.isStreaming && bridge.turns.last?.id == turn.id
     }
 
     // MARK: input
@@ -211,13 +261,21 @@ struct CenterStage: View {
                 .onSubmit(send)
                 .submitLabel(.send)
                 .onKeyPress(.escape) {
-                    // esc peels one layer: palette → text → the whole app.
+                    // esc peels exactly one layer per press:
+                    // palette → text in the box → bob mid-reply → the whole app.
                     if !slashMatches.isEmpty {
                         slashDismissed = true
-                    } else if input.isEmpty {
-                        NSApp.hide(nil)
-                    } else {
+                    } else if !input.isEmpty {
                         input = ""
+                    } else if bridge.isStreaming {
+                        // an interrupt, not a kill — the session survives and
+                        // takes the next message. So esc here means "stop
+                        // talking", never "go away": bob stays on screen and
+                        // the voice stops with the text.
+                        bridge.cancel()
+                        voiceOut.stop()
+                    } else {
+                        NSApp.hide(nil)
                     }
                     return .handled
                 }
@@ -267,7 +325,10 @@ struct CenterStage: View {
     @ViewBuilder
     private var lensChip: some View {
         if let lens = bridge.activeLens {
-            Button { bridge.activeLens = nil } label: {
+            // setLens, not a direct write: dropping the lens respawns the
+            // session with the plain system prompt (D4), and the chip goes
+            // down the moment you click it.
+            Button { bridge.setLens(nil) } label: {
                 Text("@\(lens)")
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(Color.accentColor.opacity(0.9))
@@ -402,14 +463,16 @@ struct CenterStage: View {
         var prompt = raw
         if let (spec, rest) = Self.lensPrefix(raw) {
             if spec.lowercased() == "none" || spec.lowercased() == "off" {
-                bridge.activeLens = nil
+                bridge.setLens(nil)
                 prompt = rest
             } else if LensStore.shared.resolve(spec) != nil {
                 // resolving here is the honest gate: the chip only goes up for a
                 // lens that actually assembles (file present, argument supplied).
-                // This copy is thrown away — ClaudeBridge resolves again per turn
-                // so edits to the lens file land on the very next message.
-                bridge.activeLens = spec
+                // This copy is thrown away — the bridge resolves it again when
+                // it swaps the lens in, so an edit to the lens file lands the
+                // next time you name it (a lens now rides a whole process, not
+                // a single turn — plan D4.3).
+                bridge.setLens(spec)
                 prompt = rest
             }
         }

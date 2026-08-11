@@ -60,10 +60,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // start the nightly retro clock (first check 2 minutes from now)
         _ = RetroService.shared
+
+        // bob's persistent claude session — session #0. Spawned as early as
+        // ~/bob is real so the cold start burns while the window is still
+        // fading in, instead of costing the first message ~8s. Self-gates on
+        // the bob.streamingSession flag, so this is a no-op while it's off.
+        Task { @MainActor in
+            // ContentView's .task owns the bootstrap; wait for it rather than
+            // racing a second one — ~/bob is the session's cwd, so the
+            // directory has to exist before a process can sit in it. Bounded:
+            // a bootstrap that never finishes must not wedge the session
+            // forever, and a spawn into a missing cwd fails cleanly into the
+            // legacy path (D7 auto-fallback) rather than hanging.
+            for _ in 0..<100 {
+                if BobHome.shared.isInitialized { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            SessionManager.shared.launchCompanionIfEnabled()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Graceful goodbye for every live session (D1): close stdin so the CLI
+    /// exits on its own, 2s grace, terminate the stragglers. Quit waits on it
+    /// via `.terminateLater` — safe because `shutdown()` only ever awaits a
+    /// bounded `Task.sleep` (and returns immediately when no session is up),
+    /// so the reply always comes back.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            await SessionManager.shared.shutdown()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     /// Backup URL handler. SwiftUI's `.onOpenURL` should fire first; this
