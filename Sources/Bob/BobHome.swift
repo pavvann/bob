@@ -560,13 +560,28 @@ final class BobHome: ObservableObject {
 
     3. catalog fallback — hand off to bob:
        ```
-       open -g "bob://music/play?id=<trackId>"
+       open -g "bob://music/play?ids=<trackId>[,<trackId>,...]"
        ```
-       bob plays via MusicKit's `SystemMusicPlayer`. first time will prompt for Apple Music access.
+       bob plays in-process via MusicKit's `ApplicationMusicPlayer` (Music.app
+       won't show it). multiple ids queue in order; when the queue drains bob
+       keeps going with song radio for the last track. first time will prompt
+       for Apple Music access.
 
     4. confirm: "playing <trackName> by <artistName>."
 
     ## transport controls
+
+    route by source in `state/music.json` — catalog plays live inside bob, so
+    AppleScript can't see them.
+
+    source `apple_music_catalog`:
+
+    - "play" / "resume" → `open -g "bob://music/resume"`
+    - "pause" → `open -g "bob://music/pause"`
+    - "next" / "skip" → `open -g "bob://music/next"`
+    - "previous" → `open -g "bob://music/prev"`
+
+    anything else (Music.app library plays):
 
     - "play" / "resume" → `osascript -e 'tell application "Music" to play'`
     - "pause" → `osascript -e 'tell application "Music" to pause'`
@@ -579,7 +594,7 @@ final class BobHome: ObservableObject {
 
     ## notes
 
-    music tile updates via `com.apple.Music.playerInfo` distributed notification. catalog debug info at `~/bob/state/music-debug.log`.
+    music tile updates via `com.apple.Music.playerInfo` distributed notification for Music.app plays; catalog plays are pushed straight from bob's swift layer on every track change. catalog debug info at `~/bob/state/music-debug.log`.
     """
     }
 }

@@ -95,23 +95,41 @@ enum BobURLHandler {
         }
     }
 
-    /// `bob://music/play?id=<catalog-id>` — play an Apple Music catalog track
-    /// via MusicKit (SystemMusicPlayer). The skill curls iTunes Search to get
-    /// the trackId, then opens this URL so bob's Swift code does the play.
+    /// `bob://music/...` — catalog playback + transport for bob's in-process
+    /// MusicKit player. `play` takes `ids=<a,b,c>` (comma-separated, queued in
+    /// order) or a single `id=`. The skill curls iTunes Search to get trackIds,
+    /// then opens this URL so bob's Swift code does the play. The transport
+    /// actions exist because AppleScript can't see ApplicationMusicPlayer —
+    /// Music.app transport keeps going through osascript as before.
     private static func handleMusicCommand(_ url: URL) {
         let action = url.pathComponents.dropFirst().first ?? ""
         switch action {
         case "play":
-            guard let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                .queryItems?
-                .first(where: { $0.name == "id" })?.value, !id.isEmpty else {
-                log("bob://music/play missing id query parameter")
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+            let raw = query?.first(where: { $0.name == "ids" })?.value
+                ?? query?.first(where: { $0.name == "id" })?.value
+                ?? ""
+            let ids = raw.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            guard !ids.isEmpty else {
+                log("bob://music/play missing id/ids query parameter")
                 return
             }
-            log("bob://music/play id=\(id)")
+            log("bob://music/play ids=\(ids.joined(separator: ","))")
             Task { @MainActor in
-                await MusicCatalogService.shared.play(catalogId: id)
+                await MusicCatalogService.shared.play(catalogIds: ids)
             }
+        case "pause":
+            Task { @MainActor in MusicCatalogService.shared.pause() }
+        case "resume":
+            Task { @MainActor in await MusicCatalogService.shared.resume() }
+        case "next":
+            Task { @MainActor in await MusicCatalogService.shared.skipToNext() }
+        case "prev", "previous":
+            Task { @MainActor in await MusicCatalogService.shared.skipToPrevious() }
+        case "stop":
+            Task { @MainActor in MusicCatalogService.shared.stop() }
         default:
             log("unknown bob://music action: '\(action)'")
         }
