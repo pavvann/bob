@@ -14,6 +14,11 @@ struct SessionConfig {
     var model: String? = nil                // nil = CLI default
     var name: String                        // tab label / log prefix
     var voiced: Bool = false                // onSentence wiring
+    /// `sessionId` names a conversation the CLI already has on disk, so the
+    /// very first spawn must `--resume` it instead of `--session-id` (which
+    /// hard-errors: "Session ID … is already in use"). Restored tabs set this;
+    /// a brand-new session leaves it false.
+    var resumed: Bool = false
 }
 
 enum PermissionPolicy: Equatable {
@@ -145,7 +150,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// the next idle; the prompt itself may be nil (@none).
     private var pendingPromptChange: String?? = nil
     /// False until the CLI confirms the session exists (first init). First
-    /// spawn uses --session-id; every respawn uses --resume (D1).
+    /// spawn uses --session-id; every respawn uses --resume (D1). Seeded true
+    /// for a restored conversation — its id is already on disk, so its very
+    /// first spawn is a resume too (`SessionConfig.resumed`).
     private var sessionOnDisk = false
     /// request_id of the readiness handshake sent at spawn (see launchProcess).
     private var handshakeId: String?
@@ -163,6 +170,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         self.claudePath = claudePath
         self.stderrSink = stderrSink
         self.taskNoticeLinger = taskNoticeLinger
+        self.sessionOnDisk = config.resumed
     }
 
     // MARK: - public verbs

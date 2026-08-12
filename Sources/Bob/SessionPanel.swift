@@ -1,23 +1,32 @@
 import SwiftUI
 import AppKit
 
-/// What a floating panel is watching — one of bob's own minions, or an
-/// external claude code session discovered under ~/.claude/projects.
+/// What a floating panel is watching — one of bob's own minions, an external
+/// claude code session discovered under ~/.claude/projects, or one of bob's own
+/// live in-app sessions. The first two are files on disk; the third is an
+/// object in this process, read straight from its published transcript.
 enum PanelSource {
     case minion(MinionService.Minion)
     case external(SessionWatcher.Session)
+    case live(ClaudeSession)
 
+    /// Main-actor because a live session's config is main-actor state. Every
+    /// caller is the controller, which is @MainActor anyway.
+    @MainActor
     var key: String {
         switch self {
         case .minion(let m): return "minion-\(m.id)"
         case .external(let s): return "session-\(s.id)"
+        case .live(let s): return "live-\(s.id)"
         }
     }
 
+    @MainActor
     var windowTitle: String {
         switch self {
         case .minion(let m): return m.task
         case .external(let s): return s.projectName
+        case .live(let s): return s.config.name
         }
     }
 }
@@ -66,6 +75,24 @@ final class SessionPanelController: NSObject {
         models[key] = model
         model.start()
         panel.makeKeyAndOrderFront(nil)
+    }
+
+    /// Float (or dismiss) a glance panel on one of bob's own live sessions —
+    /// the non-active tab you want to watch while you work in another. Same
+    /// toggle semantics as every other panel, keyed by session id.
+    func toggleLive(session: ClaudeSession) {
+        toggle(.live(session))
+    }
+
+    /// The counterpart to `SessionManager.close`: a tab the owner closed must
+    /// not leave a floating panel behind, still offering to wake a session that
+    /// no longer exists anywhere. Safe to call for a session that never had one.
+    func forgetLive(session: ClaudeSession) {
+        let key = PanelSource.live(session).key
+        let panel = panels.removeValue(forKey: key)
+        let model = models.removeValue(forKey: key)
+        panel?.close()      // already out of the dictionaries — the delegate no-ops
+        model?.stop()
     }
 
     func closeAll() {
@@ -140,7 +167,11 @@ struct SessionPanelView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 10)
                 Rectangle().fill(.white.opacity(0.07)).frame(height: 0.5)
+                if model.isCold { wake }
                 feed
+                if let activity = model.activity {
+                    activityLine(activity)
+                }
                 if let final = model.final {
                     footer(final)
                 }
@@ -176,7 +207,7 @@ struct SessionPanelView: View {
         }
     }
 
-    private enum Status { case queued, working, done, failed, live, idle }
+    private enum Status { case queued, working, done, failed, live, idle, cold, awaiting, attention }
 
     private func status(_ now: Date) -> Status {
         if let m = model.minion {
@@ -185,6 +216,17 @@ struct SessionPanelView: View {
             case "failed": return .failed
             case "queued": return .queued
             default: return .working
+            }
+        }
+        // a live session knows its own state — no clock guessing required
+        if let live = model.liveStatus {
+            if model.isCold { return .cold }
+            switch live {
+            case .working: return .working
+            case .awaitingInput: return .awaiting
+            case .needsAttention: return .attention
+            case .error: return .failed
+            case .done: return .idle
             }
         }
         guard let last = model.lastActivity else { return .idle }
@@ -214,6 +256,18 @@ struct SessionPanelView: View {
             Circle()
                 .fill(.secondary.opacity(0.4))
                 .frame(width: 7, height: 7)
+        case .cold:
+            Image(systemName: "moon.zzz.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary.opacity(0.5))
+        case .awaiting:
+            Image(systemName: "questionmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(.yellow.opacity(0.8))
+        case .attention:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange.opacity(0.85))
         }
     }
 
@@ -251,14 +305,56 @@ struct SessionPanelView: View {
         m.hasPrefix("claude-") ? String(m.dropFirst("claude-".count)) : m
     }
 
+    // MARK: cold + activity
+
+    /// A restored tab that has never been woken has no process and no events —
+    /// without this the panel is just an empty box. One click starts it; the
+    /// transcript it already carries stays on screen underneath.
+    private var wake: some View {
+        Button { model.wake() } label: {
+            HStack(spacing: 7) {
+                Image(systemName: "power")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("cold — click to wake")
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.secondary.opacity(0.85))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background { RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.06)) }
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+    }
+
+    /// What the session's hands are doing right now ("reading Foo.swift").
+    /// Pinned below the feed rather than scrolling with it — it's status, not
+    /// history, and it's the line you open a panel to see.
+    private func activityLine(_ text: String) -> some View {
+        HStack(spacing: 7) {
+            PulseDot(color: .accentColor)
+            Text(text)
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.85))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 10)
+    }
+
     // MARK: feed
 
     private var feed: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 7) {
-                    if model.events.isEmpty {
-                        Text("waiting for the first event…")
+                    if model.events.isEmpty, !model.isCold {
+                        Text(model.isLive ? "nothing said yet…" : "waiting for the first event…")
                             .font(.system(size: 11, weight: .regular, design: .rounded))
                             .foregroundStyle(.secondary.opacity(0.5))
                     }
