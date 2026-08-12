@@ -58,6 +58,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         HotKeyManager.shared.onTrigger = { HotKeyManager.toggleBob() }
         HotKeyManager.shared.register()
 
+        // Warm spawnPATH's login-shell resolution off the main actor now, so
+        // the companion session's first launchProcess() below finds it already
+        // cached instead of paying the (bounded, but non-zero) shell cost on
+        // the main thread.
+        Task.detached { _ = ClaudeBridge.spawnPATH }
+
         // start the nightly retro clock (first check 2 minutes from now)
         _ = RetroService.shared
 
