@@ -125,12 +125,14 @@ struct ContentView: View {
                 .zIndex(3)
             ProjectPicker(
                 currentRepo: currentRepo,
-                onPick: { url in
+                onPick: { url, permissions in
                     withAnimation(.easeOut(duration: 0.18)) { showProjectPicker = false }
                     // spawn (idempotent per cwd — a cold restored tab wakes
                     // instead of forking), then activate: spawnWorkSession
-                    // deliberately doesn't touch activeID itself
-                    let session = sessionManager.spawnWorkSession(cwd: url)
+                    // deliberately doesn't touch activeID itself. The picker's
+                    // ask-first hand rides along as the permission policy.
+                    let session = sessionManager.spawnWorkSession(cwd: url, permissions: permissions)
+                    SurfaceRouter.shared.close()   // picking = "put it on stage"
                     sessionManager.activate(session.id)
                 },
                 onClose: { closeProjectPicker() }
