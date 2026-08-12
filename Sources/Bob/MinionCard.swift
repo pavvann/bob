@@ -61,49 +61,65 @@ struct SessionTab: View {
     @ObservedObject var session: ClaudeSession
     let isActive: Bool
     @State private var hover = false
+    @ObservedObject private var broker = UIPermissionBroker.shared
 
     private var status: SessionStatus { SessionManager.status(of: session) }
+    /// The oldest tool call this session is holding for an answer, if any — an
+    /// ask-first claude is stopped dead until this is settled.
+    private var ask: PermissionRequest? { broker.ask(for: session.id) }
+    /// A pill while it's a tab; a small panel while it's asking, because a
+    /// capsule can't hold two lines and two buttons without looking silly.
+    private var shape: AnyShape {
+        ask == nil
+            ? AnyShape(Capsule(style: .continuous))
+            : AnyShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
 
     var body: some View {
-        // not a Button: peek/✕ live inside, and a nested Button's click can
-        // bleed into its host's action. A tap gesture yields to child buttons.
-        HStack(spacing: 8) {
-            statusDot
-            VStack(alignment: .leading, spacing: 1) {
-                Text(session.config.name)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(.primary.opacity(isActive ? 0.95 : 0.85))
-                    .lineLimit(1)
-                Text(cwdTail)
-                    .font(.system(size: 9, weight: .regular, design: .rounded))
-                    .foregroundStyle(.secondary.opacity(0.6))
-                    .lineLimit(1)
-                    .truncationMode(.head)
-                    .frame(maxWidth: 160, alignment: .leading)
+        // not a Button: peek/✕/allow/deny live inside, and a nested Button's
+        // click can bleed into its host's action. A tap gesture yields to them.
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                statusDot
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(session.config.name)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(.primary.opacity(isActive ? 0.95 : 0.85))
+                        .lineLimit(1)
+                    Text(cwdTail)
+                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.6))
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                        .frame(maxWidth: 160, alignment: .leading)
+                }
+                if ask != nil { askBadge }
+                if hover {
+                    peekButton
+                    closeButton
+                }
             }
-            if hover {
-                peekButton
-                closeButton
+            if let ask {
+                PermissionAskCard(ask: ask, compact: true)
+                    .frame(maxWidth: 236, alignment: .leading)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background {
-            Capsule(style: .continuous).fill(.ultraThinMaterial)
+            shape.fill(.ultraThinMaterial)
                 .overlay {
-                    if isActive {
-                        Capsule(style: .continuous).fill(Color.accentColor.opacity(0.10))
+                    if ask != nil {
+                        shape.fill(Color.orange.opacity(0.10))
+                    } else if isActive {
+                        shape.fill(Color.accentColor.opacity(0.10))
                     }
                 }
         }
         .overlay {
-            Capsule(style: .continuous)
-                .stroke(
-                    isActive ? Color.accentColor.opacity(0.45) : Color.white.opacity(hover ? 0.18 : 0.06),
-                    lineWidth: isActive ? 1 : 0.5
-                )
+            shape.stroke(strokeTint, lineWidth: ask != nil || isActive ? 1 : 0.5)
         }
-        .contentShape(Capsule(style: .continuous))
+        .contentShape(shape)
         .onTapGesture {
             // activate, never activeID directly — a cold restored tab only
             // spawns through this door
@@ -119,6 +135,32 @@ struct SessionTab: View {
             Button("close session") { SessionManager.shared.close(session.id) }
         }
         .help(isActive ? "this session is on stage" : "switch to \(session.config.name)")
+    }
+
+    private var strokeTint: Color {
+        if ask != nil { return .orange.opacity(0.55) }
+        if isActive { return .accentColor.opacity(0.45) }
+        return .white.opacity(hover ? 0.18 : 0.06)
+    }
+
+    /// "waiting on you" at a glance, counted when more than one tool is queued
+    /// behind the card.
+    private var askBadge: some View {
+        let count = broker.count(for: session.id)
+        return HStack(spacing: 3) {
+            Image(systemName: "hand.raised.fill")
+                .font(.system(size: 8, weight: .semibold))
+            if count > 1 {
+                Text("\(count)")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+        }
+        .foregroundStyle(.orange.opacity(0.95))
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
+        .background { Capsule().fill(.orange.opacity(0.16)) }
+        .help(count > 1 ? "\(count) tool calls waiting on you" : "a tool call is waiting on you")
     }
 
     /// "~/Code/lootgo" — where this claude lives, home-abbreviated.
@@ -197,6 +239,86 @@ struct NewSessionButton: View {
             withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) { hover = isHover }
         }
         .help("new work session")
+    }
+}
+
+// MARK: - ask-first approval
+
+/// The safety affordance, not a dialog system: one tool call, the argument that
+/// matters, two answers (three in a panel, where "always" earns its room). Amber
+/// because it's attention rather than alarm — nothing is wrong, something is
+/// waiting, and the claude on the other end is stopped until it isn't.
+///
+/// Drawn wherever the session is visible — on its tab and in any panel watching
+/// it — all reading one broker, so answering in either place closes both.
+struct PermissionAskCard: View {
+    let ask: PermissionRequest
+    /// Tab cards tighten the type and drop "always": a tab is the doorbell, a
+    /// panel is where you read before deciding.
+    var compact = false
+
+    @ObservedObject private var broker = UIPermissionBroker.shared
+
+    private var queued: Int { max(0, broker.count(for: ask.sessionId) - 1) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: compact ? 5 : 8) {
+            HStack(spacing: 5) {
+                Image(systemName: ask.symbol)
+                    .font(.system(size: compact ? 9 : 11, weight: .medium))
+                    .foregroundStyle(.orange.opacity(0.9))
+                Text(ask.toolName)
+                    .font(.system(size: compact ? 10 : 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.primary.opacity(0.9))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if queued > 0 {
+                    Text("+\(queued) waiting")
+                        .font(.system(size: 8, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.7))
+                }
+            }
+            Text(ask.detail)
+                .font(.system(size: compact ? 9 : 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.9))
+                .lineLimit(compact ? 1 : 3)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 6) {
+                answer("allow", filled: true) { broker.allow(ask) }
+                answer("deny") { broker.deny(ask) }
+                if !compact {
+                    answer("always") { broker.allowAlways(ask) }
+                        .help(ask.alwaysScope)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, compact ? 8 : 10)
+        .padding(.vertical, compact ? 7 : 9)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.orange.opacity(0.10))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(.orange.opacity(0.30), lineWidth: 0.5)
+        }
+    }
+
+    private func answer(_ title: String, filled: Bool = false,
+                        action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: compact ? 9 : 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(filled ? .black.opacity(0.85) : .primary.opacity(0.8))
+                .padding(.horizontal, compact ? 8 : 10)
+                .padding(.vertical, compact ? 3 : 4)
+                .background {
+                    Capsule().fill(filled ? Color.orange.opacity(0.85) : Color.white.opacity(0.10))
+                }
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 }
 
