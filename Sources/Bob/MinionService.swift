@@ -25,11 +25,15 @@ final class MinionService: ObservableObject {
         /// Who queued this: "user" (default) | "retro" | "self". Carried so a
         /// debrief can say whose minion just finished.
         var origin: String?
+        /// Optional model override (`sonnet`, `haiku`, or a full id) — passed
+        /// through to `claude --model` by the wrapper. Absent → the
+        /// user-settings default.
+        var model: String?
         var startedAt: Date?
         var finishedAt: Date?
 
         enum CodingKeys: String, CodingKey {
-            case id, task, prompt, workdir, status, detail, lens, origin
+            case id, task, prompt, workdir, status, detail, lens, origin, model
             case startedAt = "started_at"
             case finishedAt = "finished_at"
         }
@@ -388,6 +392,9 @@ final class MinionService: ObservableObject {
             "--permission-mode", "auto"]
     if lens_path and os.path.exists(lens_path):
         argv += ["--append-system-prompt-file", lens_path]
+    model = d.get("model")
+    if model:
+        argv += ["--model", model]
     argv.append(prompt)
 
     summary = None
