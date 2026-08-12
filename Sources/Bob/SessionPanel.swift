@@ -156,6 +156,18 @@ extension SessionPanelController: NSWindowDelegate {
 /// the live feed, and the closing numbers once a minion reports in.
 struct SessionPanelView: View {
     @ObservedObject var model: SessionFeedModel
+    @ObservedObject private var broker = UIPermissionBroker.shared
+
+    /// Only bob's own live sessions can be asking permission for anything — a
+    /// file-fed panel is watching someone else's hands.
+    private var liveSession: ClaudeSession? {
+        if case .live(let session) = model.source { return session }
+        return nil
+    }
+
+    private var ask: PermissionRequest? {
+        liveSession.flatMap { broker.ask(for: $0.id) }
+    }
 
     var body: some View {
         ZStack {
@@ -167,6 +179,13 @@ struct SessionPanelView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 10)
                 Rectangle().fill(.white.opacity(0.07)).frame(height: 0.5)
+                // above the feed, not in it: the session is stopped until this
+                // is answered, so it isn't history yet
+                if let ask {
+                    PermissionAskCard(ask: ask)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 10)
+                }
                 if model.isCold { wake }
                 feed
                 if let activity = model.activity {

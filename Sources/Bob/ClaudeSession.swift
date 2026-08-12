@@ -34,6 +34,9 @@ enum PermissionPolicy: Equatable {
 
 enum PermissionDecision {
     case allow
+    /// Allow *and* adopt the permission updates the CLI itself offered with the
+    /// ask (`permission_suggestions`, probe 1.6) — the "always allow" button.
+    case allowAdopting([PermissionSuggestion])
     case deny(message: String)
 }
 
@@ -42,13 +45,22 @@ enum PermissionDecision {
 /// if the hidden stdio flag ever breaks (risk #1).
 @MainActor
 protocol PermissionBroker {
-    func decide(toolName: String, requestJSON: String) async -> PermissionDecision
+    func decide(_ request: PermissionRequest) async -> PermissionDecision
+    /// The process behind these asks is gone — drop them. Nobody is waiting on
+    /// the answer any more, and a card offering to approve a dead session's
+    /// Write is worse than no card.
+    func abandon(sessionId: UUID)
 }
 
-/// The no-op broker phase 1 ships with. The companion runs --permission-mode
-/// auto, so this never fires; it exists so the seam is real.
+extension PermissionBroker {
+    func abandon(sessionId: UUID) {}
+}
+
+/// The no-op broker `.auto` sessions carry. --permission-mode auto never asks,
+/// so this never fires; it exists so the seam is real (and so harnesses can
+/// answer without a UI).
 struct AutoAllowBroker: PermissionBroker {
-    func decide(toolName: String, requestJSON: String) async -> PermissionDecision { .allow }
+    func decide(_ request: PermissionRequest) async -> PermissionDecision { .allow }
 }
 
 // MARK: - the session
@@ -99,6 +111,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// Called with each completed sentence as the reply streams (D5). Only
     /// fires when `config.voiced`. Wired to VoiceOutput by the view layer.
     var onSentence: ((String) -> Void)?
+    /// Who answers can_use_tool. Ask-first sessions get the UI broker at init
+    /// (the approval card is the whole point of the mode); `.auto` sessions keep
+    /// the no-op one, which nothing ever calls.
     var broker: PermissionBroker = AutoAllowBroker()
 
     /// The single derived Bool CenterStage/BobPulse key off (D2).
@@ -154,6 +169,16 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// for a restored conversation — its id is already on disk, so its very
     /// first spawn is a resume too (`SessionConfig.resumed`).
     private var sessionOnDisk = false
+    /// True only once the CLI has *said* so (a system/init). `sessionOnDisk` can
+    /// be seeded true by a restored tab whose id never actually reached the CLI —
+    /// that id resumes into "No conversation found", and the difference between
+    /// believed and confirmed is what makes the one --session-id retry safe.
+    private var confirmedOnDisk = false
+    private var resumeFallbackUsed = false
+    /// Set when a spawn carrying `--permission-prompt-tool` died before saying a
+    /// word: this claude doesn't know the hidden flag (risk #1). Ask-first then
+    /// degrades to manual mode — every tool auto-denied, each denial surfaced.
+    private var stdioPromptUnsupported = false
     /// request_id of the readiness handshake sent at spawn (see launchProcess).
     private var handshakeId: String?
     private var recentDeaths: [Date] = []
@@ -171,6 +196,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         self.stderrSink = stderrSink
         self.taskNoticeLinger = taskNoticeLinger
         self.sessionOnDisk = config.resumed
+        if config.permissions == .askFirst { self.broker = UIPermissionBroker.shared }
     }
 
     // MARK: - public verbs
@@ -421,7 +447,11 @@ final class ClaudeSession: ObservableObject, Identifiable {
         case .auto:
             args += ["--permission-mode", "auto"]
         case .askFirst:
-            args += ["--permission-mode", "manual", "--permission-prompt-tool", "stdio"]
+            args += ["--permission-mode", "manual"]
+            // the hidden flag that turns manual mode from deny-by-default into a
+            // real question (probe 1.6, verified on 2.1.227/228). A claude that
+            // doesn't know it exits at once; we retry without it and say so.
+            if !stdioPromptUnsupported { args += ["--permission-prompt-tool", "stdio"] }
         }
         // first spawn of a conversation creates (--session-id); every respawn
         // — crash, lens swap — resumes. same id, history intact (D1). no
@@ -446,6 +476,8 @@ final class ClaudeSession: ObservableObject, Identifiable {
         readerTask = nil
         watchdog?.cancel()
         watchdog = nil
+        // nothing is listening on the other end of an open ask any more
+        broker.abandon(sessionId: id)
 
         if closing { state = .unspawned; return }
 
@@ -458,6 +490,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
             // session id (edge 6)
             launchProcess()
         case .spawning:
+            // a process that died before saying a word usually died of its
+            // ARGUMENTS, not of bad luck — one targeted retry first
+            if retryWithoutTheRefusedFlag() { return }
             respawnAfterUnexpectedDeath()
         case .idle:
             appendNotice("bob's session dropped — reconnecting")
@@ -479,6 +514,29 @@ final class ClaudeSession: ObservableObject, Identifiable {
             appendNotice("bob's session dropped — reconnecting")
             respawnAfterUnexpectedDeath()
         }
+    }
+
+    /// Two ways a first spawn is dead on arrival, each worth exactly one retry:
+    /// a persisted id the CLI never actually saw (`--resume` → "No conversation
+    /// found", rc=1) and a claude too old for the hidden stdio prompt tool
+    /// (risk #1). Neither is a crash, so neither counts toward the crash-loop
+    /// guard — we asked for something this CLI couldn't give, and the fix is to
+    /// stop asking for it.
+    private func retryWithoutTheRefusedFlag() -> Bool {
+        if sessionOnDisk, !confirmedOnDisk, !resumeFallbackUsed {
+            resumeFallbackUsed = true
+            sessionOnDisk = false          // --session-id: create it instead of resuming it
+            launchProcess()
+            return true
+        }
+        if config.permissions == .askFirst, !stdioPromptUnsupported {
+            stdioPromptUnsupported = true
+            appendNotice("this claude can't be asked first — running deny-by-default; "
+                       + "each blocked tool gets a line")
+            launchProcess()
+            return true
+        }
+        return false
     }
 
     private func respawnAfterUnexpectedDeath() {
@@ -506,6 +564,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
             // spawn) — it confirms the session file exists, and doubles as a
             // readiness fallback should a future CLI drop the handshake
             sessionOnDisk = true
+            confirmedOnDisk = true
             becomeReadyIfSpawning()
         case .status:
             spontaneousIfIdle()
@@ -530,8 +589,13 @@ final class ClaudeSession: ObservableObject, Identifiable {
             }
         case .taskStarted, .backgroundTasksChanged:
             break
-        case .permissionDenied:
-            break   // in-turn auto-denial; result.permission_denials carries the tally
+        case .permissionDenied(let tool, _):
+            // normally silent: result.permission_denials carries the tally, and a
+            // denial the owner just clicked needs no receipt. Degraded ask-first
+            // is the exception — nobody was asked, so nobody knows.
+            if stdioPromptUnsupported {
+                appendNotice("blocked \(tool) — this claude can't ask first")
+            }
         case .result(let r):
             finishTurn(r)
         case .controlRequest(let id, let subtype, let toolName, let raw):
@@ -770,22 +834,50 @@ final class ClaudeSession: ObservableObject, Identifiable {
     // MARK: - permissions (phase 3 seam)
 
     private func routeToBroker(requestId: String, toolName: String, rawJSON: String) {
-        // the CLI blocks the turn while the request is open (probe 1.6) —
-        // state stays turnActive; phase 3's UIPermissionBroker shows the card
+        // the CLI blocks the turn while the ask is open (probe 1.6) — state stays
+        // turnActive, so the tab keeps its working dot while the card waits
+        let ask = PermissionRequest(requestId: requestId, sessionId: id,
+                                    sessionName: config.name, toolName: toolName,
+                                    rawJSON: rawJSON)
         Task { [weak self] in
             guard let self else { return }
-            let payload: [String: Any]
-            switch await self.broker.decide(toolName: toolName, requestJSON: rawJSON) {
-            case .allow:
-                payload = ["behavior": "allow"]
-            case .deny(let message):
-                payload = ["behavior": "deny", "message": message]
-            }
-            self.writeLine([
-                "type": "control_response",
-                "response": ["subtype": "success", "request_id": requestId, "response": payload],
-            ])
+            let decision = await self.broker.decide(ask)
+            self.answer(ask, decision)
         }
+    }
+
+    /// The reply the CLI is blocking on. Deny carries a message the model reads
+    /// in place of the tool result — verified against 2.1.228: the tool does not
+    /// run, `result.permission_denials` names it, the model quotes the message,
+    /// and the session takes the next turn normally.
+    private func answer(_ ask: PermissionRequest, _ decision: PermissionDecision) {
+        let payload: [String: Any]
+        switch decision {
+        case .allow:
+            payload = allowPayload(ask, adopting: [])
+        case .allowAdopting(let suggestions):
+            payload = allowPayload(ask, adopting: suggestions)
+        case .deny(let message):
+            payload = ["behavior": "deny", "message": message]
+        }
+        writeLine([
+            "type": "control_response",
+            "response": ["subtype": "success", "request_id": ask.requestId, "response": payload],
+        ])
+    }
+
+    /// Allow echoes the tool's own input back as `updatedInput` (probe 1.6 — the
+    /// field exists so a broker can rewrite arguments; bob only ever agrees). An
+    /// ask whose input didn't decode gets no field at all: `{}` would run the
+    /// tool with its arguments erased. `updatedPermissions` hands the CLI's own
+    /// suggestion back when the owner said "always" — 2.1.228 acts on it (one ask
+    /// covered three writes), so the asking really does stop.
+    private func allowPayload(_ ask: PermissionRequest,
+                              adopting suggestions: [PermissionSuggestion]) -> [String: Any] {
+        var payload: [String: Any] = ["behavior": "allow"]
+        if let input = ask.input { payload["updatedInput"] = input }
+        if !suggestions.isEmpty { payload["updatedPermissions"] = suggestions.map(\.fields) }
+        return payload
     }
 
     // MARK: - forensics
