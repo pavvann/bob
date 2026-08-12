@@ -17,6 +17,8 @@ extension BobHome {
             (lensesDir.appendingPathComponent("open-line.md"), seedLensOpenLine),
             (lensesDir.appendingPathComponent("retro.md"), seedLensRetro),
             (lensesDir.appendingPathComponent("bob-dev.md"), seedLensBobDev),
+            (lensesDir.appendingPathComponent("notes.md"), seedLensNotes),
+            (lensesDir.appendingPathComponent("canvas.md"), seedLensCanvas),
             (backlogPath, seedBacklog),
             (wikiBobDir.appendingPathComponent("retro.md"), seedRetroProtocol),
             (wikiBobDir.appendingPathComponent("self-improvement.md"), seedSelfImprovement),
@@ -126,6 +128,37 @@ extension BobHome {
     the guardrails in `wiki/bob/self-improvement.md` are hard rules, not suggestions.
     branch, build, commit, never push. small diffs that match the house style beat
     clever ones.
+    """
+    }
+
+    var seedLensNotes: String { """
+    ---
+    budget: 4000
+    files:
+      - notes/*.md
+    ---
+
+    notes mode: these are pawan's own scratch notes, in his words. ground answers in
+    them; quote him back to himself when it helps. append only where he points you;
+    never reorganize or rewrite a note wholesale.
+    """
+    }
+
+    /// Wildcard `files:` on purpose — no `{arg}`, so plain `@canvas` resolves
+    /// (LensStore refuses a lens whose spec needs an argument it didn't get).
+    var seedLensCanvas: String { """
+    ---
+    budget: 5000
+    files:
+      - canvas/*.md
+      - MEMORY.md
+    ---
+
+    brainstorm mode — the board files above ARE the shared canvas (when pawan names
+    one, focus there). think out loud with him, reflect ideas back, and when one
+    lands, add it as a card (`## title`, 1-3 lines, `<!-- by bob -->`). build on
+    what's already on the board before inventing fresh. no minions, no tidy-ups he
+    didn't ask for.
     """
     }
 

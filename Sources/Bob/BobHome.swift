@@ -36,6 +36,8 @@ final class BobHome: ObservableObject {
     var wikiDir: URL { root.appendingPathComponent("wiki", isDirectory: true) }
     var skillsDir: URL { root.appendingPathComponent("skills", isDirectory: true) }
     var lensesDir: URL { root.appendingPathComponent("lenses", isDirectory: true) }
+    var notesDir: URL { root.appendingPathComponent("notes", isDirectory: true) }
+    var canvasDir: URL { root.appendingPathComponent("canvas", isDirectory: true) }
     var rawDir: URL { root.appendingPathComponent("raw", isDirectory: true) }
     var stateDir: URL { root.appendingPathComponent("state", isDirectory: true) }
     var wikiBobDir: URL { wikiDir.appendingPathComponent("bob", isDirectory: true) }
@@ -102,7 +104,7 @@ final class BobHome: ObservableObject {
         let fm = FileManager.default
         let minionsActive = root.appendingPathComponent("minions/active", isDirectory: true)
         let minionsDone = root.appendingPathComponent("minions/done", isDirectory: true)
-        for dir in [root, wikiDir, skillsDir, lensesDir, rawDir, stateDir, wikiBobDir, wikiTemplatesDir, minionsActive, minionsDone] {
+        for dir in [root, wikiDir, skillsDir, lensesDir, notesDir, canvasDir, rawDir, stateDir, wikiBobDir, wikiTemplatesDir, minionsActive, minionsDone] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
     }
@@ -319,6 +321,13 @@ final class BobHome: ObservableObject {
 
     - `wiki/<topic>/<article>.md` — topic pages for things that deserve their own space.
     - `wiki/templates/` — skeletons for new pages.
+    - `notes/<name>.md` — the user's own scratch notes, rendered in the app's notes tab.
+      his words, his files: you write into one ONLY when he points you at it — "add
+      that to my ideas note" → append under the fitting heading (or at the end), a
+      dated line, `(added by bob)` when the phrasing is yours. "start a note about X"
+      → create `notes/<kebab-name>.md` with an `# X` heading. never reorganize,
+      rewrite, or delete a note. a note is scratch, not memory — durable facts still
+      go to MEMORY.md / the wiki as usual.
 
     **storage and history:**
 
