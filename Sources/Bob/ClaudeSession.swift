@@ -164,6 +164,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// A lens change requested mid-turn (D4.2) — `.some(newPrompt)` applies at
     /// the next idle; the prompt itself may be nil (@none).
     private var pendingPromptChange: String?? = nil
+    private var pendingModelDrain = false
     /// False until the CLI confirms the session exists (first init). First
     /// spawn uses --session-id; every respawn uses --resume (D1). Seeded true
     /// for a restored conversation — its id is already on disk, so its very
@@ -265,6 +266,21 @@ final class ClaudeSession: ObservableObject, Identifiable {
             beginDrain()
         case .turnActive, .interrupting, .spawning, .draining:
             pendingPromptChange = .some(prompt)
+        }
+    }
+
+    /// Same drain doorway as a lens swap: the conversation survives (--resume),
+    /// only the model under it changes. Config updates at once — a restored tab
+    /// keeps the choice even if the respawn waits for the turn to end.
+    func setModel(_ model: String?) {
+        config.model = model
+        switch state {
+        case .unspawned, .failed:
+            break                        // next spawn reads config
+        case .idle:
+            beginDrain()
+        case .turnActive, .interrupting, .spawning, .draining:
+            pendingModelDrain = true
         }
     }
 
@@ -699,11 +715,17 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     private func afterIdle() {
         guard state == .idle else { return }
+        var wantsDrain = false
         if let change = pendingPromptChange {
             pendingPromptChange = nil
             config.appendSystemPrompt = change
-            beginDrain()
+            wantsDrain = true
         }
+        if pendingModelDrain {
+            pendingModelDrain = false
+            wantsDrain = true
+        }
+        if wantsDrain { beginDrain() }
     }
 
     private func beginDrain() {

@@ -392,7 +392,9 @@ final class MinionService: ObservableObject {
             "--permission-mode", "auto"]
     if lens_path and os.path.exists(lens_path):
         argv += ["--append-system-prompt-file", lens_path]
-    model = d.get("model")
+    # workers default to sonnet — never the CLI default, which follows the
+    # newest (priciest) tier and once burned a monthly spend cap (2026-08-13)
+    model = d.get("model") or "sonnet"
     if model:
         argv += ["--model", model]
     argv.append(prompt)

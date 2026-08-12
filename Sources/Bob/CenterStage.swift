@@ -501,6 +501,18 @@ struct CenterStage: View {
             showWhisper(ack)
             return
         }
+
+        // `/model` is bob's own dial, not a CLI command: bare = say the current
+        // model, `/model opus` switches this conversation in place (the same
+        // drain doorway a lens swap uses — history intact). Unknown names fall
+        // through to bob verbatim, like a lens typo. Work tabs pick theirs in
+        // the "+" picker instead.
+        if let ack = Self.modelCommand(raw, manager: manager) {
+            input = ""
+            home.welcomeNote = nil
+            showWhisper(ack)
+            return
+        }
         input = ""
         home.welcomeNote = nil
 
@@ -544,6 +556,29 @@ struct CenterStage: View {
 
     /// Splits a leading `@<token>` off a message: `("music", "play something")`.
     /// Nil when the message doesn't start with one.
+    /// `/model` → whisper the current model; `/model opus|sonnet|haiku|fable`
+    /// → switch the companion in place; `/model default` → back to the CLI's
+    /// own choice. Returns the whisper ack, or nil when the text isn't a model
+    /// command at all (so it reaches bob as words).
+    static func modelCommand(_ raw: String, manager: SessionManager) -> String? {
+        let parts = raw.split(separator: " ", maxSplits: 1).map(String.init)
+        guard parts.first?.lowercased() == "/model",
+              let companion = manager.companion else { return nil }
+        guard parts.count > 1 else {
+            let current = companion.config.model ?? "cli default"
+            return "bob runs on \(current) — /model "
+                 + SessionManager.modelChoices.joined(separator: "·") + "·default"
+        }
+        let word = parts[1].trimmingCharacters(in: .whitespaces).lowercased()
+        if word == "default" {
+            manager.setModel(nil, for: companion.id)
+            return "→ model: cli default — same conversation"
+        }
+        guard SessionManager.modelChoices.contains(word) else { return nil }
+        manager.setModel(word, for: companion.id)
+        return "→ model: \(word) — same conversation, new brain"
+    }
+
     private static func lensPrefix(_ text: String) -> (spec: String, rest: String)? {
         guard text.hasPrefix("@") else { return nil }
         let body = text.dropFirst()
