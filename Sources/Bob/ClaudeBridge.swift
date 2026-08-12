@@ -431,6 +431,12 @@ final class ClaudeBridge: ObservableObject {
         if useSession, let spec = activeLens, let ctx = LensStore.shared.resolve(spec) {
             lensArgs = ["--append-system-prompt", ctx.text]
         }
+        // The one-shot is bob's voice too, so it rides the companion's model
+        // choice — the fallback path shouldn't quietly cost a different tier.
+        var modelArgs: [String] = []
+        if let model = SessionManager.preferredCompanionModel() {
+            modelArgs = ["--model", model]
+        }
         process.arguments = [
             "-p",
         ] + sessionArgs + lensArgs + [
@@ -438,6 +444,7 @@ final class ClaudeBridge: ObservableObject {
             // call (Edit, Write, Bash, etc) is judged for safety and auto-allowed
             // when low-risk, blocked when destructive.
             "--permission-mode", "auto",
+        ] + modelArgs + [
             prompt
         ]
         // Run claude inside ~/bob/ so it picks up that directory's CLAUDE.md

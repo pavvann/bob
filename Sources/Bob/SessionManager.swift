@@ -83,6 +83,7 @@ final class SessionManager: ObservableObject {
                 cwd: BobHome.shared.root,
                 appendSystemPrompt: nil,    // lenses ride in later via setAppendSystemPrompt
                 permissions: .auto,         // behavior parity with today's bridge (edge 11)
+                model: Self.preferredCompanionModel(),
                 name: "bob",
                 voiced: true
             ))
@@ -156,6 +157,36 @@ final class SessionManager: ObservableObject {
             name: name ?? Self.defaultName(for: dir),
             voiced: false                   // only bob speaks
         ))
+    }
+
+    // MARK: - model choice
+
+    /// The aliases the CLI resolves itself — bob never hardcodes a dated id.
+    static let modelChoices = ["opus", "sonnet", "haiku", "fable"]
+
+    /// `~/bob/state/model` — one word, the companion's model. Absent = opus:
+    /// bob's chat is conversation, not heavy lifting, and the CLI's own
+    /// default (the newest, priciest tier) has burned a real spend cap once.
+    static func preferredCompanionModel() -> String? {
+        let file = BobHome.shared.stateDir.appendingPathComponent("model")
+        let word = (try? String(contentsOf: file, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if word == "default" { return nil }     // explicit opt back into CLI default
+        return word.isEmpty ? "opus" : word
+    }
+
+    /// Switch a session's model in place — conversation intact (drain doorway).
+    /// The companion's choice persists in state/model; a work session's rides
+    /// its SessionRecord like every other config field.
+    func setModel(_ alias: String?, for id: UUID) {
+        guard let session = sessions.first(where: { $0.id == id }) else { return }
+        session.setModel(alias)
+        if id == companionID {
+            let file = BobHome.shared.stateDir.appendingPathComponent("model")
+            try? (alias ?? "default").write(to: file, atomically: true, encoding: .utf8)
+        } else {
+            save()
+        }
     }
 
     /// Make a session the one CenterStage renders — and light it up if it's

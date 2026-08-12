@@ -384,9 +384,10 @@ struct PermissionAskCard: View {
 /// (wired by ContentView) still closes the picker before any app-hide.
 struct ProjectPicker: View {
     var currentRepo: URL? = nil
-    /// The policy rides with the pick: `.askFirst` when the little hand is up,
-    /// `.auto` otherwise — spawnWorkSession takes it from there.
-    let onPick: (URL, PermissionPolicy) -> Void
+    /// The policy and model ride with the pick: `.askFirst` when the little
+    /// hand is up, and whichever model the dial shows (nil = CLI default) —
+    /// spawnWorkSession takes it from there.
+    let onPick: (URL, PermissionPolicy, String?) -> Void
     let onClose: () -> Void
 
     struct Row: Identifiable {
@@ -402,6 +403,9 @@ struct ProjectPicker: View {
     /// Spawn the session with tool calls held for approval (P3a). Off by
     /// default — ask-first is a choice, not a toll.
     @State private var askFirst = false
+    /// opus, not the CLI default — the default tier priced a chat at
+    /// heavy-lifting rates once already (2026-08-13).
+    @State private var model: String = "opus"
     @FocusState private var focused: Bool
 
     private var policy: PermissionPolicy { askFirst ? .askFirst : .auto }
@@ -433,11 +437,12 @@ struct ProjectPicker: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 13, weight: .regular, design: .rounded))
                 .focused($focused)
-                .onSubmit { if let first = matches.first { onPick(first.url, policy) } }
+                .onSubmit { if let first = matches.first { onPick(first.url, policy, pickedModel) } }
                 .onKeyPress(.escape) {
                     onClose()
                     return .handled
                 }
+                modelDial
                 askFirstToggle
             }
             .padding(.horizontal, 14)
@@ -453,7 +458,7 @@ struct ProjectPicker: View {
                         hint("nothing matches")
                     }
                     ForEach(matches) { row in
-                        PickerRow(row: row) { onPick(row.url, policy) }
+                        PickerRow(row: row) { onPick(row.url, policy, pickedModel) }
                     }
                 }
                 .padding(6)
@@ -489,6 +494,39 @@ struct ProjectPicker: View {
     /// The small hand beside the field — same amber language as the approval
     /// cards, because it's the same idea a step earlier: this session's tools
     /// will wait on you.
+    private var pickedModel: String? { model.isEmpty ? nil : model }
+
+    /// Which claude the new tab runs. A quiet word, not a control — click for
+    /// the menu. "auto" = whatever the CLI would pick on its own.
+    private var modelDial: some View {
+        Menu {
+            ForEach(SessionManager.modelChoices, id: \.self) { choice in
+                Button { model = choice } label: {
+                    if choice == model {
+                        Label(choice, systemImage: "checkmark")
+                    } else {
+                        Text(choice)
+                    }
+                }
+            }
+            Button { model = "" } label: {
+                if model.isEmpty {
+                    Label("auto (cli default)", systemImage: "checkmark")
+                } else {
+                    Text("auto (cli default)")
+                }
+            }
+        } label: {
+            Text(model.isEmpty ? "auto" : model)
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.75))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("model for this session")
+    }
+
     private var askFirstToggle: some View {
         Button { askFirst.toggle() } label: {
             HStack(spacing: 4) {
