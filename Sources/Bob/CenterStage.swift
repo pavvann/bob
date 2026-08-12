@@ -30,6 +30,10 @@ struct CenterStage: View {
     @State private var breath = PhaseClock(period: 5.2)
     @State private var slashSelection = 0
     @State private var slashDismissed = false
+    /// The dispatch acknowledgment — "→ lootgo: fix the failing test" — shown
+    /// briefly above the input bar after a `>name …` send, then gone.
+    @State private var whisper: String?
+    @State private var whisperSweep: Task<Void, Never>?
     @FocusState private var inputFocused: Bool
 
     /// The work session on stage, if any. The companion (and the legacy
@@ -70,8 +74,12 @@ struct CenterStage: View {
     private var companion: some View {
         VStack(spacing: 24) {
             stage
-            inputBar
-                .overlay(alignment: .top) { slashPalette }
+            VStack(alignment: .leading, spacing: 8) {
+                if let whisper { DispatchWhisper(text: whisper) }
+                inputBar
+                    .overlay(alignment: .top) { slashPalette }
+            }
+            .animation(.easeInOut(duration: 0.25), value: whisper)
         }
         .onAppear {
             inputFocused = true
@@ -431,6 +439,17 @@ struct CenterStage: View {
 
         let raw = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return }
+
+        // A leading `>name` is the owner's hand on a work session (D9) —
+        // routed straight there, no model in the loop, mirroring the @lens
+        // parse below. Anything short of an unambiguous match falls through
+        // to bob verbatim, so he can see the attempt and say what's close.
+        if let ack = routeDispatch(raw, via: manager) {
+            input = ""
+            home.welcomeNote = nil
+            showWhisper(ack)
+            return
+        }
         input = ""
         home.welcomeNote = nil
 
@@ -458,6 +477,18 @@ struct CenterStage: View {
         guard !prompt.isEmpty else { return }   // lens switch only — nothing to say
         voiceOut.stop()
         bridge.send(prompt)
+    }
+
+    /// Put the ack up and take it down again after a beat — long enough to
+    /// read, short enough that the thread stays bob's.
+    private func showWhisper(_ line: String) {
+        whisper = line
+        whisperSweep?.cancel()
+        whisperSweep = Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            whisper = nil
+        }
     }
 
     /// Splits a leading `@<token>` off a message: `("music", "play something")`.
@@ -585,6 +616,8 @@ private struct WorkStage: View {
     var interceptHide: () -> Bool = { false }
 
     @State private var input = ""
+    @State private var whisper: String?
+    @State private var whisperSweep: Task<Void, Never>?
     @FocusState private var inputFocused: Bool
 
     /// Nothing is hidden in a work session today, but the filter keeps parity
@@ -594,7 +627,11 @@ private struct WorkStage: View {
     var body: some View {
         VStack(spacing: 24) {
             stage
-            inputBar
+            VStack(alignment: .leading, spacing: 8) {
+                if let whisper { DispatchWhisper(text: whisper) }
+                inputBar
+            }
+            .animation(.easeInOut(duration: 0.25), value: whisper)
         }
         .onAppear { inputFocused = true }
         .onReceive(NotificationCenter.default.publisher(for: HotKeyManager.didSummon)) { _ in
@@ -759,10 +796,114 @@ private struct WorkStage: View {
     private func send() {
         let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
+        // `>name …` works from any stage — commanding a sibling session (or
+        // this one) without walking back to the companion first.
+        if let ack = routeDispatch(prompt, via: SessionManager.shared) {
+            input = ""
+            whisper = ack
+            whisperSweep?.cancel()
+            whisperSweep = Task {
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard !Task.isCancelled else { return }
+                whisper = nil
+            }
+            return
+        }
         input = ""
         // verbatim — no @lens parsing, no palette. A `/command` rides as a
         // plain message and the CLI expands it in-session. Routed through the
         // manager so a cold tab spawns before the text would be lost.
         SessionManager.shared.send(prompt, to: session.id)
+    }
+}
+
+// MARK: - `>` dispatch (D9 — the owner's hand)
+
+/// Route a `>name …` message at its work session, from whichever stage it was
+/// typed on. Returns the whisper line to show, or nil when the text should
+/// travel as ordinary words instead — ambiguous and unknown names fall through
+/// on purpose, so bob (or the raw session) sees the attempt verbatim and can
+/// say so; a command is never silently swallowed.
+@MainActor
+private func routeDispatch(_ raw: String, via manager: SessionManager) -> String? {
+    let sessions = manager.workSessions
+    guard case .send(let name, let text, let bang) =
+            SessionDispatch.parse(raw, names: sessions.map(\.config.name)),
+          let target = sessions.first(where: { $0.config.name == name })
+    else { return nil }
+    if bang {
+        manager.stopAndTell(text, to: target.id)
+    } else {
+        manager.inject(text, into: target.id)
+    }
+    return "→ \(name)\(bang ? " (stopped)" : ""): \(text)"
+}
+
+/// The dispatch acknowledgment — styled exactly like a notice row (the room
+/// talking, not bob), floating above the input bar for a beat.
+private struct DispatchWhisper: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text("⏺")
+                .font(.system(size: 8))
+                .foregroundStyle(.secondary.opacity(0.4))
+            Text(text)
+                .font(.system(size: 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.55))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .transition(.opacity)
+    }
+}
+
+/// The `>` command grammar, mirroring the @lens parse: `>lootgo fix the test`
+/// sends into the session called lootgo, `>lootgo! stop, run the tests` stops
+/// it first (the ONLY road to an interrupt — never implicit). Names match by
+/// unambiguous case-insensitive prefix; an exact name beats a longer cousin.
+/// Pure, so the harness can table-test every verdict.
+enum SessionDispatch {
+    enum Verdict: Equatable {
+        /// Not a dispatch at all — no `>` head, `> quoted text`, or a name
+        /// with nothing to say after it.
+        case none
+        /// `>lo …` with lootgo AND lootwalk alive — the message travels
+        /// verbatim; bob can list what was close.
+        case ambiguous([String])
+        /// `>zzz …` — no session answers to that; verbatim again.
+        case noMatch(String)
+        /// The one clean verdict: a full session name, the text, and whether
+        /// the bang (stop-first) was on it.
+        case send(name: String, text: String, bang: Bool)
+    }
+
+    static func parse(_ raw: String, names: [String]) -> Verdict {
+        guard raw.hasPrefix(">") else { return .none }
+        let body = raw.dropFirst()
+        let token = String(body.prefix { !$0.isWhitespace })
+        guard !token.isEmpty else { return .none }   // "> a quote" — just words
+        let text = String(body.dropFirst(token.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return .none }    // nothing to deliver — words for bob
+        var name = token
+        var bang = false
+        if name.hasSuffix("!") {
+            bang = true
+            name.removeLast()
+        }
+        guard !name.isEmpty else { return .none }
+        let query = name.lowercased()
+        if let exact = names.first(where: { $0.lowercased() == query }) {
+            return .send(name: exact, text: text, bang: bang)
+        }
+        let hits = names.filter { $0.lowercased().hasPrefix(query) }
+        switch hits.count {
+        case 0: return .noMatch(name)
+        case 1: return .send(name: hits[0], text: text, bang: bang)
+        default: return .ambiguous(hits)
+        }
     }
 }

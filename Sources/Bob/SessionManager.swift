@@ -88,6 +88,9 @@ final class SessionManager: ObservableObject {
             ))
         }
         restoreWorkSessions()
+        // the manager's ear opens with the registry — status transitions in
+        // any work session become digests in bob's own thread (D9)
+        AttentionCenter.shared.start()
     }
 
     /// Last launch's work sessions come back as cold tabs: config only, no
@@ -171,6 +174,50 @@ final class SessionManager: ObservableObject {
         guard let session = sessions.first(where: { $0.id == id }) else { return }
         if case .unspawned = session.state { session.spawn() }
         session.send(text)
+    }
+
+    // MARK: - bob's hand (D9 — the owner commands, via prefix)
+
+    /// `>name text` lands here: the text goes to that session as a user-role
+    /// message wearing its provenance — `[via bob] …` — a visible `you` row in
+    /// the session's transcript, marked by the prefix itself. Queue semantics
+    /// on a busy session (probe 1.7): it runs as the next turn, terminal-style,
+    /// never interrupting. Spawn-if-cold same as send(_:to:).
+    func inject(_ text: String, into id: UUID) {
+        guard let session = sessions.first(where: { $0.id == id }) else { return }
+        if case .unspawned = session.state { session.spawn() }
+        session.send("[via bob] \(text)", source: .injected)
+    }
+
+    /// The explicit stop verb — `>name! text` — and the ONLY path that ever
+    /// interrupts a work session; nothing calls it implicitly (D9). Interrupt,
+    /// wait for the aborted result to land the session back on idle (probe
+    /// 1.4), then inject. The message is held client-side through the stop
+    /// because the CLI's own queue is ambiguous after an interrupt
+    /// (still_queued) — and it is never delivered to a session that died
+    /// instead of stopping.
+    func stopAndTell(_ text: String, to id: UUID) {
+        guard let session = sessions.first(where: { $0.id == id }) else { return }
+        if case .unspawned = session.state { session.spawn() }
+        guard session.isStreaming else {
+            session.send("[via bob] \(text)", source: .injected)
+            return
+        }
+        session.interrupt()
+        Task { @MainActor [weak session] in
+            for _ in 0..<600 {                       // bounded: 30s, watchdog scale
+                guard let session else { return }
+                switch session.state {
+                case .idle:
+                    session.send("[via bob] \(text)", source: .injected)
+                    return
+                case .failed, .unspawned:
+                    return                           // it died — don't pile on
+                default:
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+            }
+        }
     }
 
     /// The owner closing a tab: graceful stdin close, out of the registry, out
