@@ -401,6 +401,10 @@ final class ClaudeBridge: ObservableObject {
         ] {
             env.removeValue(forKey: key)
         }
+        // Give the child a real PATH (see spawnPATH) so plugin hooks that
+        // shell out to homebrew tools (e.g. node) can find them — doesn't
+        // change which `claude` binary we exec, only what its own PATH is.
+        env["PATH"] = Self.spawnPATH
         process.environment = env
 
         // Invoke claude directly, not via login shell. Going through `/bin/zsh -l`
@@ -627,5 +631,48 @@ final class ClaudeBridge: ObservableObject {
         // Last resort: let exec find it. If it's missing entirely, Process.run()
         // will throw and ClaudeBridge will surface the error.
         return "/usr/bin/env"
+    }()
+
+    /// The PATH every spawned `claude` process should see. Bob launches via
+    /// LaunchServices, not an interactive shell, so `ProcessInfo.processInfo
+    /// .environment["PATH"]` is launchd's bare default
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`) — homebrew tools like `node` aren't on
+    /// it, so a claude-side plugin hook that shells out (e.g. the vercel
+    /// plugin's SessionEnd hook calling `node`) fails with "command not found"
+    /// and that error text leaks into a reply. Resolve the PATH a login shell
+    /// would actually have (sources `.zprofile`, where `brew shellenv` usually
+    /// lives) once, instead of hardcoding a single homebrew prefix, so this
+    /// doesn't rot if tools move. Bounded at 2s in case `.zprofile` hangs;
+    /// falls back to a homebrew-prefixed PATH built from the inherited one.
+    /// Internal so MinionService / OpenLine / ClaudeSession can reuse it.
+    nonisolated static let spawnPATH: String = {
+        let inherited = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let fallback = "/opt/homebrew/bin:/usr/local/bin:" + inherited
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        proc.arguments = ["-lc", "echo -n $PATH"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+
+        let done = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in done.signal() }
+        do {
+            try proc.run()
+        } catch {
+            return fallback
+        }
+        guard done.wait(timeout: .now() + 2) == .success else {
+            proc.terminationHandler = nil
+            proc.terminate()
+            return fallback
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard proc.terminationStatus == 0,
+              let resolved = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !resolved.isEmpty
+        else { return fallback }
+        return resolved
     }()
 }
