@@ -1,140 +1,107 @@
 import SwiftUI
 
-/// A comet-style accent that orbits the border of a rounded rectangle.
-/// The crisp leading line sits directly on the path; the soft glow is clipped
-/// to the *outside* of the path so it radiates outward and never bleeds into
-/// the input bar interior. The canvas itself is `bleed` larger than the path
-/// in every direction so blur has room to extend without being clipped at the
-/// rectangular canvas bounds (which is what produced the "squared corners"
-/// artefact previously).
+/// A comet of light that orbits the input bar — and *reacts*. It hears your
+/// voice (the trail thickens and quickens the instant you speak), it speeds
+/// with bob's pulse, and its color glides through the day via `Circadian`
+/// (bob's blue by morning, amber at golden hour, coral ember past midnight).
 ///
-/// Tint defaults to time-aware: cool blue during the day, warm coral red
-/// between 8pm and 6am local time.
+/// One thin line, always — no glow, no bloom, nothing that smears the bar while
+/// bob is thinking. Every reactive quantity is integrated or eased on the render
+/// clock by `CometMotion` — never read straight off `t / period`, never stepped
+/// off a boolean — so submitting and toggling the mic *glide*.
 struct AnimatedBorder: View {
     let cornerRadius: CGFloat
-    /// Spacing between the rounded rect path and the canvas edges. The caller
-    /// should match this with `.padding(-bleed)` so the canvas extends beyond
-    /// the host view, giving blur room to render outward.
-    var bleed: CGFloat = 14
-    var tint: Tint = .auto
+    /// Slack around the bar so the stroke isn't clipped at its widest. The
+    /// canvas grows by this on every side and insets straight back, so the path
+    /// still lands exactly on the bar.
+    var bleed: CGFloat = 6
+
+    /// Live mic amplitude 0...1 while listening — the comet leans toward you.
+    var voiceLevel: Double = 0
+    /// bob's pulse 0...1 — the single input that sets the resting lap speed.
+    var energy: Double = 0
+    /// Optional hard color override; default follows the hour.
+    var tintOverride: Color? = nil
+
     var lineWidth: CGFloat = 2.0
     var trailLength: Double = 0.30
-    var period: Double = 7.5
-    var segments: Int = 60
+    // 26 fading sub-strokes read identically to 60 but halve the per-frame
+    // trimmedPath cost.
+    var segments: Int = 26
 
-    enum Tint {
-        case auto   // blue 6am–8pm, red 8pm–6am
-        case blue
-        case red
-    }
+    @State private var motion = CometMotion()
 
     var body: some View {
         TimelineView(.animation) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
-            let head = (t / period).truncatingRemainder(dividingBy: 1.0)
-            let theme = resolveTint(at: timeline.date)
+            let accent = tintOverride ?? Circadian.accent(timeline.date)
+            let m = motion.advance(
+                to: timeline.date,
+                // Resting lap speed from bob's pulse, shortened as you speak.
+                period: lerpD(max(BobPulse.borderPeriod(at: energy), 3.8), 3.0, voiceLevel),
+                voice: voiceLevel
+            )
+            let head = m.phase
+            let drive = m.drive
+
+            let lw = lineWidth * (0.7 + drive * 1.9)
 
             Canvas { ctx, size in
-                // Path sits `bleed` inset from canvas edges. This is where the
-                // visible border curve should align with the host view's edge.
                 let rect = CGRect(origin: .zero, size: size).insetBy(dx: bleed, dy: bleed)
                 let path = Path(roundedRect: rect, cornerRadius: cornerRadius, style: .continuous)
 
-                // 1) Faint ambient ring along the border.
-                ctx.stroke(path, with: .color(theme.ambient), lineWidth: 0.5)
+                // ambient ring — always faintly present, brightens as you speak
+                ctx.stroke(path, with: .color(accent.opacity(0.08 + drive * 0.12)), lineWidth: 0.5)
 
-                // 2) Outer glow — clipped to OUTSIDE the path so blur radiates
-                //    outward only and doesn't bleed into the host view interior.
-                ctx.drawLayer { glow in
-                    glow.clip(to: path, options: .inverse)
-                    glow.addFilter(.blur(radius: 8))
-                    let span = trailLength * 0.30
-                    let tail = (head - span + 1.0).truncatingRemainder(dividingBy: 1.0)
-                    glow.stroke(
-                        Self.subPath(of: path, from: tail, to: head),
-                        with: .color(theme.glow),
-                        style: StrokeStyle(lineWidth: lineWidth + 8, lineCap: .round)
-                    )
-                }
-
-                // 3) Crisp fading trail — sits exactly on the border. Not
-                //    clipped, so it traces the curve cleanly on both sides
-                //    of the edge.
+                // crisp fading comet trail
                 for i in 0..<segments {
-                    let f0 = Double(i)     / Double(segments)
+                    let f0 = Double(i) / Double(segments)
                     let f1 = Double(i + 1) / Double(segments)
                     let behind0 = trailLength * (1.0 - f0)
                     let behind1 = trailLength * (1.0 - f1)
                     let segStart = (head - behind0 + 1.0).truncatingRemainder(dividingBy: 1.0)
-                    let segEnd   = (head - behind1 + 1.0).truncatingRemainder(dividingBy: 1.0)
-
-                    let opacity = pow(f1, 1.8)
+                    let segEnd = (head - behind1 + 1.0).truncatingRemainder(dividingBy: 1.0)
+                    let opacity = pow(f1, 1.8) * (0.85 + drive * 0.15)
                     ctx.stroke(
                         Self.subPath(of: path, from: segStart, to: segEnd),
-                        with: .color(theme.trailColor(opacity)),
-                        style: StrokeStyle(lineWidth: lineWidth, lineCap: .butt)
+                        with: .color(accent.opacity(opacity)),
+                        style: StrokeStyle(lineWidth: lw, lineCap: .butt)
                     )
                 }
             }
+            .padding(-bleed)
             .allowsHitTesting(false)
         }
     }
 
-    /// Sub-path of `path` from `from` to `to`, splitting at the 1→0 seam when needed.
+    private func lerpD(_ a: Double, _ b: Double, _ t: Double) -> Double {
+        a + (b - a) * max(0, min(1, t))
+    }
+
     private static func subPath(of path: Path, from: Double, to: Double) -> Path {
         if from == to { return Path() }
-        if to > from {
-            return path.trimmedPath(from: from, to: to)
-        }
+        if to > from { return path.trimmedPath(from: from, to: to) }
         var p = path.trimmedPath(from: from, to: 1.0)
         p.addPath(path.trimmedPath(from: 0.0, to: to))
         return p
     }
+}
 
-    // MARK: tint
-
-    private struct Theme {
-        let ambient: Color
-        let glow: Color
-        let trailColor: (Double) -> Color
+/// The comet's memory between frames. `phase` rides a `PhaseClock` so it stays
+/// continuous while the lap period changes underneath it; `drive` (how thick and
+/// bright the comet burns) is eased on the same clock, so your voice lifts and
+/// releases it instead of stepping.
+private final class CometMotion {
+    struct Frame {
+        let phase: Double
+        let drive: Double
     }
 
-    private func resolveTint(at date: Date) -> Theme {
-        let isNight: Bool
-        switch tint {
-        case .red:
-            isNight = true
-        case .blue:
-            isNight = false
-        case .auto:
-            let hour = Calendar.current.component(.hour, from: date)
-            isNight = (hour >= 20 || hour < 6)
-        }
+    private let clock = PhaseClock(period: 13)
+    private var drive = 0.0
 
-        if isNight {
-            return Theme(
-                ambient: Color(red: 1.0, green: 0.30, blue: 0.35).opacity(0.10),
-                glow: Color(red: 1.0, green: 0.30, blue: 0.38).opacity(0.75),
-                trailColor: { opacity in
-                    Color(
-                        red:   1.0,
-                        green: 0.32 + 0.22 * opacity,
-                        blue:  0.38 + 0.22 * opacity
-                    ).opacity(opacity * 0.95)
-                }
-            )
-        } else {
-            return Theme(
-                ambient: Color.blue.opacity(0.08),
-                glow: Color.blue.opacity(0.70),
-                trailColor: { opacity in
-                    Color(
-                        red:   0.45 + 0.30 * opacity,
-                        green: 0.78 + 0.15 * opacity,
-                        blue:  1.0
-                    ).opacity(opacity * 0.95)
-                }
-            )
-        }
+    func advance(to date: Date, period: Double, voice: Double) -> Frame {
+        clock.tick(date, period: period)
+        drive = clock.chase(drive, to: voice, tau: 0.30)
+        return Frame(phase: clock.phase, drive: drive)
     }
 }

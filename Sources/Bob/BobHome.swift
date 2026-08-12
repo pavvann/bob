@@ -31,9 +31,13 @@ final class BobHome: ObservableObject {
     var indexPath: URL { root.appendingPathComponent("index.md") }
     var logPath: URL { root.appendingPathComponent("log.md") }
     var claudeMdPath: URL { root.appendingPathComponent("CLAUDE.md") }
+    var backlogPath: URL { root.appendingPathComponent("backlog.md") }
 
     var wikiDir: URL { root.appendingPathComponent("wiki", isDirectory: true) }
     var skillsDir: URL { root.appendingPathComponent("skills", isDirectory: true) }
+    var lensesDir: URL { root.appendingPathComponent("lenses", isDirectory: true) }
+    var notesDir: URL { root.appendingPathComponent("notes", isDirectory: true) }
+    var canvasDir: URL { root.appendingPathComponent("canvas", isDirectory: true) }
     var rawDir: URL { root.appendingPathComponent("raw", isDirectory: true) }
     var stateDir: URL { root.appendingPathComponent("state", isDirectory: true) }
     var wikiBobDir: URL { wikiDir.appendingPathComponent("bob", isDirectory: true) }
@@ -100,7 +104,7 @@ final class BobHome: ObservableObject {
         let fm = FileManager.default
         let minionsActive = root.appendingPathComponent("minions/active", isDirectory: true)
         let minionsDone = root.appendingPathComponent("minions/done", isDirectory: true)
-        for dir in [root, wikiDir, skillsDir, rawDir, stateDir, wikiBobDir, wikiTemplatesDir, minionsActive, minionsDone] {
+        for dir in [root, wikiDir, skillsDir, lensesDir, notesDir, canvasDir, rawDir, stateDir, wikiBobDir, wikiTemplatesDir, minionsActive, minionsDone] {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
     }
@@ -109,7 +113,7 @@ final class BobHome: ObservableObject {
     private func ensureSeedFiles() throws {
         let fm = FileManager.default
 
-        let seeds: [(URL, String)] = [
+        var seeds: [(URL, String)] = [
             (soulPath, seedSoul),
             (userPath, seedUser),
             (claudeMdPath, seedClaudeMd),
@@ -119,6 +123,7 @@ final class BobHome: ObservableObject {
             (wikiTemplatesDir.appendingPathComponent("raw.md"), seedRawTemplate),
             (skillsDir.appendingPathComponent("play-music.md"), seedPlayMusicSkill),
         ]
+        seeds.append(contentsOf: lensSeedFiles)      // lenses/, backlog.md, wiki/bob/{retro,self-improvement}.md
 
         for (path, content) in seeds {
             if !fm.fileExists(atPath: path.path) {
@@ -316,6 +321,13 @@ final class BobHome: ObservableObject {
 
     - `wiki/<topic>/<article>.md` — topic pages for things that deserve their own space.
     - `wiki/templates/` — skeletons for new pages.
+    - `notes/<name>.md` — the user's own scratch notes, rendered in the app's notes tab.
+      his words, his files: you write into one ONLY when he points you at it — "add
+      that to my ideas note" → append under the fitting heading (or at the end), a
+      dated line, `(added by bob)` when the phrasing is yours. "start a note about X"
+      → create `notes/<kebab-name>.md` with an `# X` heading. never reorganize,
+      rewrite, or delete a note. a note is scratch, not memory — durable facts still
+      go to MEMORY.md / the wiki as usual.
 
     **storage and history:**
 
@@ -557,13 +569,28 @@ final class BobHome: ObservableObject {
 
     3. catalog fallback — hand off to bob:
        ```
-       open -g "bob://music/play?id=<trackId>"
+       open -g "bob://music/play?ids=<trackId>[,<trackId>,...]"
        ```
-       bob plays via MusicKit's `SystemMusicPlayer`. first time will prompt for Apple Music access.
+       bob plays in-process via MusicKit's `ApplicationMusicPlayer` (Music.app
+       won't show it). multiple ids queue in order; when the queue drains bob
+       keeps going with song radio for the last track. first time will prompt
+       for Apple Music access.
 
     4. confirm: "playing <trackName> by <artistName>."
 
     ## transport controls
+
+    route by source in `state/music.json` — catalog plays live inside bob, so
+    AppleScript can't see them.
+
+    source `apple_music_catalog`:
+
+    - "play" / "resume" → `open -g "bob://music/resume"`
+    - "pause" → `open -g "bob://music/pause"`
+    - "next" / "skip" → `open -g "bob://music/next"`
+    - "previous" → `open -g "bob://music/prev"`
+
+    anything else (Music.app library plays):
 
     - "play" / "resume" → `osascript -e 'tell application "Music" to play'`
     - "pause" → `osascript -e 'tell application "Music" to pause'`
@@ -576,7 +603,7 @@ final class BobHome: ObservableObject {
 
     ## notes
 
-    music tile updates via `com.apple.Music.playerInfo` distributed notification. catalog debug info at `~/bob/state/music-debug.log`.
+    music tile updates via `com.apple.Music.playerInfo` distributed notification for Music.app plays; catalog plays are pushed straight from bob's swift layer on every track change. catalog debug info at `~/bob/state/music-debug.log`.
     """
     }
 }

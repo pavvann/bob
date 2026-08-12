@@ -26,6 +26,9 @@ struct BobApp: App {
     }
 
     static func style(_ window: NSWindow) {
+        // the panel controller (and ⌥Space toggle) need to tell bob's main
+        // window apart from floating session panels
+        SessionPanelController.shared.adoptMainWindow(window)
         window.isOpaque = false
         window.backgroundColor = .clear
         window.titlebarAppearsTransparent = true
@@ -48,10 +51,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+
+        // ⌥Space summons bob from anywhere — the Spotlight feel.
+        // (Esc-to-dismiss is handled in CenterStage's input so it clears the
+        // field first and only hides when empty — see .onKeyPress(.escape).)
+        HotKeyManager.shared.onTrigger = { HotKeyManager.toggleBob() }
+        HotKeyManager.shared.register()
+
+        // Warm spawnPATH's login-shell resolution off the main actor now, so
+        // the companion session's first launchProcess() below finds it already
+        // cached instead of paying the (bounded, but non-zero) shell cost on
+        // the main thread.
+        Task.detached { _ = ClaudeBridge.spawnPATH }
+
+        // start the nightly retro clock (first check 2 minutes from now)
+        _ = RetroService.shared
+
+        // bob's persistent claude session — session #0. Spawned as early as
+        // ~/bob is real so the cold start burns while the window is still
+        // fading in, instead of costing the first message ~8s. Self-gates on
+        // the bob.streamingSession flag, so this is a no-op while it's off.
+        Task { @MainActor in
+            // ContentView's .task owns the bootstrap; wait for it rather than
+            // racing a second one — ~/bob is the session's cwd, so the
+            // directory has to exist before a process can sit in it. Bounded:
+            // a bootstrap that never finishes must not wedge the session
+            // forever, and a spawn into a missing cwd fails cleanly into the
+            // legacy path (D7 auto-fallback) rather than hanging.
+            for _ in 0..<100 {
+                if BobHome.shared.isInitialized { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            // read the flag through the bridge: that's where the default-true
+            // registration lives, and launching is the first thing in the app
+            // that asks. Straight to SessionManager and we'd read a bare
+            // false, skip the pre-spawn, and pay the cold start on the first
+            // message — the exact cost this line exists to avoid.
+            _ = ClaudeBridge.streamingEnabled
+            SessionManager.shared.launchCompanionIfEnabled()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Graceful goodbye for every live session (D1): close stdin so the CLI
+    /// exits on its own, 2s grace, terminate the stragglers. Quit waits on it
+    /// via `.terminateLater` — safe because `shutdown()` only ever awaits a
+    /// bounded `Task.sleep` (and returns immediately when no session is up),
+    /// so the reply always comes back.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            await SessionManager.shared.shutdown()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     /// Backup URL handler. SwiftUI's `.onOpenURL` should fire first; this
@@ -83,23 +138,41 @@ enum BobURLHandler {
         }
     }
 
-    /// `bob://music/play?id=<catalog-id>` — play an Apple Music catalog track
-    /// via MusicKit (SystemMusicPlayer). The skill curls iTunes Search to get
-    /// the trackId, then opens this URL so bob's Swift code does the play.
+    /// `bob://music/...` — catalog playback + transport for bob's in-process
+    /// MusicKit player. `play` takes `ids=<a,b,c>` (comma-separated, queued in
+    /// order) or a single `id=`. The skill curls iTunes Search to get trackIds,
+    /// then opens this URL so bob's Swift code does the play. The transport
+    /// actions exist because AppleScript can't see ApplicationMusicPlayer —
+    /// Music.app transport keeps going through osascript as before.
     private static func handleMusicCommand(_ url: URL) {
         let action = url.pathComponents.dropFirst().first ?? ""
         switch action {
         case "play":
-            guard let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                .queryItems?
-                .first(where: { $0.name == "id" })?.value, !id.isEmpty else {
-                log("bob://music/play missing id query parameter")
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+            let raw = query?.first(where: { $0.name == "ids" })?.value
+                ?? query?.first(where: { $0.name == "id" })?.value
+                ?? ""
+            let ids = raw.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            guard !ids.isEmpty else {
+                log("bob://music/play missing id/ids query parameter")
                 return
             }
-            log("bob://music/play id=\(id)")
+            log("bob://music/play ids=\(ids.joined(separator: ","))")
             Task { @MainActor in
-                await MusicCatalogService.shared.play(catalogId: id)
+                await MusicCatalogService.shared.play(catalogIds: ids)
             }
+        case "pause":
+            Task { @MainActor in MusicCatalogService.shared.pause() }
+        case "resume":
+            Task { @MainActor in await MusicCatalogService.shared.resume() }
+        case "next":
+            Task { @MainActor in await MusicCatalogService.shared.skipToNext() }
+        case "prev", "previous":
+            Task { @MainActor in await MusicCatalogService.shared.skipToPrevious() }
+        case "stop":
+            Task { @MainActor in MusicCatalogService.shared.stop() }
         default:
             log("unknown bob://music action: '\(action)'")
         }
