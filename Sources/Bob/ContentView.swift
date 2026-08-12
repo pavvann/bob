@@ -9,7 +9,9 @@ struct ContentView: View {
     @ObservedObject private var minions = MinionService.shared
     @ObservedObject private var sessions = SessionWatcher.shared
     @ObservedObject private var music = MusicService.shared
+    @ObservedObject private var sessionManager = SessionManager.shared
     @State private var showMemory = false
+    @State private var showProjectPicker = false
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -38,9 +40,18 @@ struct ContentView: View {
                     // bob — the conductor, centered in everything the tiles and
                     // the minion band leave behind. The greedy frame is what
                     // pins the band to the window's bottom edge.
-                    CenterStage(bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home)
-                        .frame(maxWidth: 640)
-                        .frame(maxHeight: .infinity)
+                    CenterStage(
+                        bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home,
+                        interceptHide: {
+                            // the picker is one more esc layer, peeled before
+                            // app-hide — esc can never hide bob while it's up
+                            guard showProjectPicker else { return false }
+                            closeProjectPicker()
+                            return true
+                        }
+                    )
+                    .frame(maxWidth: 640)
+                    .frame(maxHeight: .infinity)
 
                     minionBand
                 }
@@ -55,8 +66,12 @@ struct ContentView: View {
             .padding(20)
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: minions.active)
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.live)
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.parked)
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessionManager.workSessions.map(\.id))
+            .animation(.easeInOut(duration: 0.2), value: sessionManager.activeID)
 
             memoryToggle
+            projectPickerOverlay
         }
         .task {
             await home.bootstrapIfNeeded()
@@ -71,19 +86,77 @@ struct ContentView: View {
         }
     }
 
-    /// The bottom band: minions bob has delegated tasks to, plus live claude code
-    /// sessions running in terminal tabs — click any card to float its live
-    /// panel. Its height is held whether or not anything is running, so a hand
-    /// arriving never shoves the input bar upward.
+    /// The bottom band: bob's own work-session tabs (click to take the stage),
+    /// the "+" that opens more, minions he's delegated to, and live claude
+    /// code sessions running in terminal tabs — click any card to float its
+    /// live panel; idle terminals fold behind a count. Its height is held
+    /// whether or not anything is running, so a hand arriving never shoves the
+    /// input bar upward. Always rendered now: the "+" is how the first work
+    /// session is born.
     private var minionBand: some View {
-        ZStack {
-            if !minions.active.isEmpty || !sessions.live.isEmpty {
-                MinionStrip(minions: minions.active, sessions: sessions.live)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+        MinionStrip(
+            minions: minions.active,
+            sessions: sessions.live,
+            parked: sessions.parked,
+            workSessions: sessionManager.workSessions,
+            activeID: sessionManager.activeID,
+            onNewSession: {
+                withAnimation(.easeOut(duration: 0.18)) { showProjectPicker.toggle() }
             }
-        }
+        )
         .frame(height: 62)
         .frame(maxWidth: .infinity)
+    }
+
+    // MARK: the "+" project picker
+
+    /// Floats just above the band (it lives at this level, not in CenterStage,
+    /// so tabs and picker share one owner). A whisper-thin scrim makes any
+    /// outside click a dismissal; esc closes it from inside (the picker's own
+    /// field holds focus) or via CenterStage's interceptHide when the main
+    /// input has focus instead.
+    @ViewBuilder
+    private var projectPickerOverlay: some View {
+        if showProjectPicker {
+            Color.black.opacity(0.001)
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+                .onTapGesture { closeProjectPicker() }
+                .zIndex(3)
+            ProjectPicker(
+                currentRepo: currentRepo,
+                onPick: { url in
+                    withAnimation(.easeOut(duration: 0.18)) { showProjectPicker = false }
+                    // spawn (idempotent per cwd — a cold restored tab wakes
+                    // instead of forking), then activate: spawnWorkSession
+                    // deliberately doesn't touch activeID itself
+                    let session = sessionManager.spawnWorkSession(cwd: url)
+                    sessionManager.activate(session.id)
+                },
+                onClose: { closeProjectPicker() }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .padding(.bottom, 88)
+            .zIndex(4)
+            .transition(.opacity.combined(with: .move(edge: .bottom)))
+        }
+    }
+
+    private func closeProjectPicker() {
+        withAnimation(.easeOut(duration: 0.18)) { showProjectPicker = false }
+        // hand the cursor back to the stage's input box — same signal ⌥Space
+        // sends, same listener catches it
+        NotificationCenter.default.post(name: HotKeyManager.didSummon, object: nil)
+    }
+
+    /// The repo the owner is most likely "in" right now — the busiest external
+    /// terminal session's cwd, for the picker's pinned shortcut. Absent when
+    /// nothing external is running.
+    private var currentRepo: URL? {
+        let ranked = sessions.live.sorted { $0.status > $1.status }
+        guard let cwd = ranked.first(where: { $0.status >= .waiting })?.cwd ?? ranked.first?.cwd
+        else { return nil }
+        return URL(fileURLWithPath: cwd)
     }
 
     private var memoryToggle: some View {

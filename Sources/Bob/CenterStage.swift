@@ -1,8 +1,11 @@
 import SwiftUI
 
-/// The center of bob — the conductor. A time-aware greeting when idle, the
-/// streaming response when bob's talking, and the comet-bordered input below.
-/// This is where you talk to bob; the tiles are ambient periphery.
+/// The center of bob — the conductor. Which claude it fronts follows the
+/// manager's active session: bob-the-companion gets the whole familiar face
+/// (greeting, voice, lenses, palette — the path below is byte-identical to
+/// before tabs existed), while an active work session gets WorkStage — same
+/// thread visuals, none of the persona. The tabs in the band switch between
+/// them.
 struct CenterStage: View {
     @ObservedObject var bridge: ClaudeBridge
     @ObservedObject var voiceIn: VoiceInput
@@ -12,6 +15,12 @@ struct CenterStage: View {
     /// First-name initial used in the greeting. Single letter, not identifying.
     var initialName: String = "p"
 
+    /// One extra esc layer owned by the container: ContentView closes its
+    /// project picker here. Runs after interrupt, before NSApp.hide — so esc
+    /// can never hide bob while the picker is still up.
+    var interceptHide: () -> Bool = { false }
+
+    @ObservedObject private var manager = SessionManager.shared
     @ObservedObject private var pulse = BobPulse.shared
     @ObservedObject private var minions = MinionService.shared
     @ObservedObject private var openLine = OpenLine.shared
@@ -22,6 +31,28 @@ struct CenterStage: View {
     @State private var slashSelection = 0
     @State private var slashDismissed = false
     @FocusState private var inputFocused: Bool
+
+    /// The work session on stage, if any. The companion (and the legacy
+    /// no-manager path, where active is nil) renders the classic face; the
+    /// switch itself only needs the manager's activeID — WorkStage observes
+    /// the session object directly for entries and state.
+    private var activeWork: ClaudeSession? {
+        guard let active = manager.active, active.id != manager.companionID else { return nil }
+        return active
+    }
+
+    var body: some View {
+        if let work = activeWork {
+            WorkStage(session: work, interceptHide: interceptHide)
+                // fresh field/scroll state per tab, so drafts never leak
+                // between sessions
+                .id(work.id)
+        } else {
+            companion
+        }
+    }
+
+    // MARK: - the companion face (unchanged behavior)
 
     /// The resting screen, or the thread. Notices don't count as conversation:
     /// a system whisper ("running in compatibility mode") shouldn't take over
@@ -36,7 +67,7 @@ struct CenterStage: View {
         bridge.turns.filter { $0.kind == .notice }.map(\.id)
     }
 
-    var body: some View {
+    private var companion: some View {
         VStack(spacing: 24) {
             stage
             inputBar
@@ -131,7 +162,13 @@ struct CenterStage: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         ForEach(bridge.turns) { turn in
-                            turnRow(turn)
+                            TurnRowView(
+                                kind: turn.kind,
+                                text: turn.text,
+                                activity: turn.activity,
+                                streaming: bridge.isStreaming,
+                                inFlight: isInFlight(turn)
+                            )
                         }
                         Color.clear.frame(height: 1).id("end")
                     }
@@ -156,79 +193,6 @@ struct CenterStage: View {
                 }
             }
             .transition(.opacity)
-        }
-    }
-
-    /// One turn in the running conversation. Your turns sit right-aligned and
-    /// muted (an echo of what you said); bob's replies are left, full reading
-    /// weight; notices are a whisper the conversation flows around. Minimal —
-    /// a thread, not chat bubbles.
-    @ViewBuilder
-    private func turnRow(_ turn: ClaudeBridge.Turn) -> some View {
-        switch turn.kind {
-        case .you:
-            HStack {
-                Spacer(minLength: 48)
-                Text(turn.text)
-                    .font(.system(size: 14, weight: .regular, design: .rounded))
-                    .foregroundStyle(.secondary.opacity(0.7))
-                    .multilineTextAlignment(.trailing)
-                    .textSelection(.enabled)
-            }
-        case .bob:
-            VStack(alignment: .leading, spacing: 5) {
-                if turn.text.isEmpty && bridge.isStreaming {
-                    // a quiet breathing dot where the reply will appear
-                    ThinkingOrb()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .transition(.opacity)
-                } else {
-                    Text(turn.text)
-                        .font(.system(size: 16, weight: .regular, design: .rounded))
-                        .foregroundStyle(.primary.opacity(0.92))
-                        .lineSpacing(4)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .transition(.opacity)
-                }
-                activityLine(turn)
-            }
-        case .notice:
-            // system aside — a background task landing, a session reconnecting,
-            // the compatibility-mode fallback. Dim, small, out of the way; it
-            // reads as the room talking, not as bob.
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("⏺")
-                    .font(.system(size: 8))
-                    .foregroundStyle(.secondary.opacity(0.4))
-                Text(turn.text)
-                    .font(.system(size: 11, weight: .regular, design: .rounded))
-                    .foregroundStyle(.secondary.opacity(0.55))
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .textSelection(.enabled)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .transition(.opacity)
-        }
-    }
-
-    /// What bob's hands are doing right now — "reading Foo.swift" — under the
-    /// streaming reply. Only the in-flight turn carries one. The slot keeps its
-    /// height for as long as that turn is live, so a tool starting and ending
-    /// mid-reply fades in and out instead of shoving the text around; it
-    /// collapses once, when the reply lands.
-    @ViewBuilder
-    private func activityLine(_ turn: ClaudeBridge.Turn) -> some View {
-        if turn.activity != nil || isInFlight(turn) {
-            Text(turn.activity ?? " ")
-                .font(.system(size: 11, weight: .regular, design: .rounded))
-                .foregroundStyle(.secondary.opacity(0.5))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .opacity(turn.activity == nil ? 0 : 1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .animation(.easeInOut(duration: 0.18), value: turn.activity)
         }
     }
 
@@ -272,8 +236,9 @@ struct CenterStage: View {
                 .onSubmit(send)
                 .submitLabel(.send)
                 .onKeyPress(.escape) {
-                    // esc peels exactly one layer per press:
-                    // palette → text in the box → bob mid-reply → the whole app.
+                    // esc peels exactly one layer per press: palette → text in
+                    // the box → bob mid-reply → the container's layer (project
+                    // picker) → the whole app.
                     if !slashMatches.isEmpty {
                         slashDismissed = true
                     } else if !input.isEmpty {
@@ -285,6 +250,8 @@ struct CenterStage: View {
                         // the voice stops with the text.
                         bridge.cancel()
                         voiceOut.stop()
+                    } else if interceptHide() {
+                        // the picker was up — it ate this press and closed
                     } else {
                         NSApp.hide(nil)
                     }
@@ -517,5 +484,285 @@ struct CenterStage: View {
             input = ""
             voiceIn.start()
         }
+    }
+}
+
+// MARK: - one turn, either stage
+
+/// One turn in a running conversation. Your turns sit right-aligned and muted
+/// (an echo of what you said); the reply is left, full reading weight; notices
+/// are a whisper the conversation flows around. Minimal — a thread, not chat
+/// bubbles. Shared verbatim by the companion thread and WorkStage, so the two
+/// stages can never drift apart visually.
+private struct TurnRowView: View {
+    let kind: ClaudeBridge.Turn.Kind
+    let text: String
+    let activity: String?
+    /// The session is streaming — an empty reply shows the thinking orb.
+    let streaming: Bool
+    /// This is the turn being spoken into right now (holds the activity slot).
+    let inFlight: Bool
+
+    var body: some View {
+        switch kind {
+        case .you:
+            HStack {
+                Spacer(minLength: 48)
+                Text(text)
+                    .font(.system(size: 14, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.7))
+                    .multilineTextAlignment(.trailing)
+                    .textSelection(.enabled)
+            }
+        case .bob:
+            VStack(alignment: .leading, spacing: 5) {
+                if text.isEmpty && streaming {
+                    // a quiet breathing dot where the reply will appear
+                    ThinkingOrb()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(.opacity)
+                } else {
+                    Text(text)
+                        .font(.system(size: 16, weight: .regular, design: .rounded))
+                        .foregroundStyle(.primary.opacity(0.92))
+                        .lineSpacing(4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .transition(.opacity)
+                }
+                activityLine
+            }
+        case .notice:
+            // system aside — a background task landing, a session reconnecting,
+            // the compatibility-mode fallback. Dim, small, out of the way; it
+            // reads as the room talking, not as bob.
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("⏺")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.secondary.opacity(0.4))
+                Text(text)
+                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.55))
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .transition(.opacity)
+        }
+    }
+
+    /// What the session's hands are doing right now — "reading Foo.swift" —
+    /// under the streaming reply. Only the in-flight turn carries one. The
+    /// slot keeps its height for as long as that turn is live, so a tool
+    /// starting and ending mid-reply fades in and out instead of shoving the
+    /// text around; it collapses once, when the reply lands.
+    @ViewBuilder
+    private var activityLine: some View {
+        if activity != nil || inFlight {
+            Text(activity ?? " ")
+                .font(.system(size: 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.5))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .opacity(activity == nil ? 0 : 1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .animation(.easeInOut(duration: 0.18), value: activity)
+        }
+    }
+}
+
+// MARK: - the work stage
+
+/// Center stage for a WORK session — a raw claude living in a project
+/// directory. Same thread visuals as the companion (TurnRowView), none of the
+/// persona: no greeting face, no voice, no lens chip, no @lens parsing, no
+/// slash palette — everything in the box goes to the session verbatim (slash
+/// commands included; the CLI expands them in-session). Input routes through
+/// the manager so a cold restored tab spawns on first send.
+private struct WorkStage: View {
+    @ObservedObject var session: ClaudeSession
+    var interceptHide: () -> Bool = { false }
+
+    @State private var input = ""
+    @FocusState private var inputFocused: Bool
+
+    /// Nothing is hidden in a work session today, but the filter keeps parity
+    /// with the bridge's projection if P3 ever injects into one.
+    private var entries: [ClaudeSession.Entry] { session.entries.filter { !$0.hidden } }
+
+    var body: some View {
+        VStack(spacing: 24) {
+            stage
+            inputBar
+        }
+        .onAppear { inputFocused = true }
+        .onReceive(NotificationCenter.default.publisher(for: HotKeyManager.didSummon)) { _ in
+            inputFocused = true
+        }
+        .animation(.easeInOut(duration: 0.35), value: entries.isEmpty)
+    }
+
+    // MARK: stage
+
+    @ViewBuilder
+    private var stage: some View {
+        if entries.isEmpty {
+            // no greeting here — that face is the companion's. Just where you
+            // are and whether it's awake yet.
+            VStack(spacing: 8) {
+                Text(session.config.name)
+                    .font(.system(size: 30, weight: .light, design: .rounded))
+                    .foregroundStyle(.primary.opacity(0.85))
+                Text(idleHint)
+                    .font(.system(size: 12, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.55))
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity)
+            .transition(.opacity.combined(with: .scale(scale: 0.98)))
+        } else {
+            let rows = entries   // filter once, not once per row
+            VStack(alignment: .leading, spacing: 8) {
+                header
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 18) {
+                            ForEach(rows) { entry in
+                                TurnRowView(
+                                    kind: kind(of: entry),
+                                    text: entry.text,
+                                    activity: entry.activity,
+                                    streaming: session.isStreaming,
+                                    inFlight: session.isStreaming && rows.last?.id == entry.id
+                                )
+                            }
+                            Color.clear.frame(height: 1).id("end")
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .frame(maxHeight: 500)
+                    .defaultScrollAnchor(.bottom)
+                    .scrollIndicators(.never)
+                    .onChange(of: rows) { _, _ in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo("end", anchor: .bottom)
+                        }
+                    }
+                }
+            }
+            .transition(.opacity)
+        }
+    }
+
+    /// A slim breadcrumb over the thread — whose conversation you're reading.
+    private var header: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.secondary.opacity(0.45))
+            Text(session.config.name)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.7))
+            Text(cwdTail)
+                .font(.system(size: 10, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.45))
+                .lineLimit(1)
+                .truncationMode(.head)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var idleHint: String {
+        switch session.state {
+        case .unspawned:
+            return "cold — say something and it wakes"
+        case .spawning:
+            return "waking up in \(cwdTail)…"
+        case .failed(let reason):
+            return "session is down (\(reason)) — click its tab to retry"
+        default:
+            return "a raw claude in \(cwdTail) — no lens, no voice, just the project"
+        }
+    }
+
+    private var cwdTail: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = session.config.cwd.path
+        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+    }
+
+    private func kind(of entry: ClaudeSession.Entry) -> ClaudeBridge.Turn.Kind {
+        switch entry.role {
+        case .you: return .you
+        case .bob: return .bob
+        case .notice: return .notice
+        }
+    }
+
+    // MARK: input
+
+    private var inputBar: some View {
+        HStack(spacing: 12) {
+            TextField(
+                "",
+                text: $input,
+                prompt: Text(placeholder).foregroundStyle(.secondary.opacity(0.6)),
+                axis: .vertical
+            )
+            .textFieldStyle(.plain)
+            .font(.system(size: 16, weight: .regular, design: .rounded))
+            .focused($inputFocused)
+            .lineLimit(1...4)
+            .onSubmit(send)
+            .submitLabel(.send)
+            .onKeyPress(.escape) {
+                // same layer-peel as the companion, minus palette and voice:
+                // text in the box → the session mid-reply → the container's
+                // picker → the whole app. Interrupt goes to THIS session.
+                if !input.isEmpty {
+                    input = ""
+                } else if session.isStreaming {
+                    session.interrupt()
+                } else if interceptHide() {
+                    // the picker was up — it ate this press and closed
+                } else {
+                    NSApp.hide(nil)
+                }
+                return .handled
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 13)
+        .background {
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(.ultraThinMaterial)
+        }
+        .overlay {
+            AnimatedBorder(
+                cornerRadius: 26,
+                voiceLevel: 0,
+                energy: session.isStreaming ? 0.7 : 0.2
+            )
+        }
+    }
+
+    private var placeholder: String {
+        switch session.state {
+        case .spawning: return "waking up…"
+        case .turnActive, .interrupting: return "..."
+        case .failed: return "session is down"
+        default: return "message \(session.config.name)"
+        }
+    }
+
+    private func send() {
+        let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        input = ""
+        // verbatim — no @lens parsing, no palette. A `/command` rides as a
+        // plain message and the CLI expands it in-session. Routed through the
+        // manager so a cold tab spawns before the text would be lost.
+        SessionManager.shared.send(prompt, to: session.id)
     }
 }
