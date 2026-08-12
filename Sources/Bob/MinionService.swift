@@ -165,6 +165,12 @@ final class MinionService: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: Self.pythonPath)
         process.arguments = args
+        // the wrapper's `env = dict(os.environ)` inherits whatever we give it
+        // here, so fixing PATH on this process fixes it for the claude child
+        // the wrapper spawns too — no need to touch the wrapper script itself.
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = ClaudeBridge.spawnPATH
+        process.environment = env
         do {
             try process.run()
         } catch {

@@ -113,6 +113,7 @@ final class OpenLine: ObservableObject {
                     "CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR"] {
             env.removeValue(forKey: key)
         }
+        env["PATH"] = ClaudeBridge.spawnPATH
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ClaudeBridge.claudePath)
         var args = ["-p", "--permission-mode", "auto"]

@@ -362,6 +362,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
         var env = ProcessInfo.processInfo.environment
         for key in Self.scrubbedEnv { env.removeValue(forKey: key) }
+        // launchd's bare PATH breaks plugin hooks that shell out to homebrew
+        // tools (e.g. node) — give the child a real one (bl-0007).
+        env["PATH"] = ClaudeBridge.spawnPATH
         proc.environment = env
 
         let stdin = Pipe()
