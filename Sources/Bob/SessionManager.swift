@@ -249,9 +249,10 @@ final class SessionManager: ObservableObject {
 
     // MARK: - status derivation (D9)
 
-    /// Pure function of what the session already publishes — no clocks, no side
-    /// effects, same answer every call. Branch order *is* the precedence: what
-    /// is true now beats what was true last turn.
+    /// A function of what the session (and the permission broker) already
+    /// publish — no clocks, no side effects, same answer every call. Branch
+    /// order *is* the precedence: what is true now beats what was true last
+    /// turn.
     static func status(of session: ClaudeSession) -> SessionStatus {
         // 1. the session itself is down: spawn threw, handshake timed out, or it
         //    died twice in a minute.
@@ -263,24 +264,29 @@ final class SessionManager: ObservableObject {
         if let last = session.entries.last, last.role == .notice, last.taskId == nil {
             return .needsAttention
         }
-        // 3. something is in flight — a turn, or a process coming up for one.
+        // 3. an ask-first tool call is holding for the owner. Checked before
+        //    the in-flight branch on purpose: the turn is technically active,
+        //    but nothing moves until someone answers — that's awaiting, not
+        //    working (P3a).
+        if UIPermissionBroker.shared.count(for: session.id) > 0 { return .awaitingInput }
+        // 4. something is in flight — a turn, or a process coming up for one.
         switch session.state {
         case .turnActive, .interrupting, .spawning, .draining: return .working
         default: break
         }
-        // 4. the last turn ended badly. An interrupt reports is_error too
+        // 5. the last turn ended badly. An interrupt reports is_error too
         //    (terminal_reason aborted_streaming) and is NOT attention — the
         //    owner asked for it (edge 4).
         if let result = session.lastResult, result.isError,
            result.terminalReason != "aborted_streaming" {
             return .needsAttention
         }
-        // 5. it wants the owner: tools were denied, or the reply ends in a question.
+        // 6. it wants the owner: tools were denied, or the reply ends in a question.
         if let result = session.lastResult, !result.deniedTools.isEmpty { return .awaitingInput }
         if endsInQuestion(session.entries.last(where: { $0.role == .bob && !$0.hidden })?.text) {
             return .awaitingInput
         }
-        // 6. idle — or never spawned — with a clean last turn.
+        // 7. idle — or never spawned — with a clean last turn.
         return .done
     }
 

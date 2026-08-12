@@ -24,6 +24,11 @@ struct MinionStrip: View {
         GeometryReader { geo in
             ScrollView(.horizontal) {
                 HStack(spacing: 10) {
+                    // the two always-present surfaces — notes and canvas — at
+                    // the leading edge, before anything that comes and goes
+                    ForEach(AppSurface.allCases) { surface in
+                        SurfaceChip(surface: surface)
+                    }
                     ForEach(workSessions) { session in
                         SessionTab(session: session, isActive: session.id == activeID)
                     }
@@ -46,6 +51,47 @@ struct MinionStrip: View {
             }
             .scrollIndicators(.never)
         }
+    }
+}
+
+// MARK: - surface chips
+
+/// One of the two fixed chips at the band's leading edge — notes and canvas,
+/// always present, never scrolling away behind session cards. Click puts that
+/// surface on the center stage; click again drops back to the conversation.
+/// Active styling mirrors an active session tab (accent wash + stroke), so
+/// "what's on stage" reads the same across chips and tabs.
+struct SurfaceChip: View {
+    let surface: AppSurface
+    @ObservedObject private var router = SurfaceRouter.shared
+    @State private var hover = false
+
+    private var isActive: Bool { router.active == surface }
+
+    var body: some View {
+        Button { router.toggle(surface) } label: {
+            Image(systemName: surface.symbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(isActive ? Color.accentColor.opacity(0.9)
+                                          : .secondary.opacity(hover ? 0.9 : 0.55))
+                .frame(width: 30, height: 30)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .background {
+            Circle().fill(.ultraThinMaterial)
+                .overlay { if isActive { Circle().fill(Color.accentColor.opacity(0.10)) } }
+        }
+        .overlay {
+            Circle().stroke(
+                isActive ? Color.accentColor.opacity(0.45) : .white.opacity(hover ? 0.18 : 0.06),
+                lineWidth: isActive ? 1 : 0.5)
+        }
+        .scaleEffect(hover ? 1.06 : 1)
+        .onHover { isHover in
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) { hover = isHover }
+        }
+        .help(isActive ? "back to the conversation" : "open \(surface.label)")
     }
 }
 
@@ -121,6 +167,9 @@ struct SessionTab: View {
         }
         .contentShape(shape)
         .onTapGesture {
+            // clicking a tab means "put this session on stage" — a surface
+            // sitting over the stage would otherwise swallow the click silently
+            SurfaceRouter.shared.close()
             // activate, never activeID directly — a cold restored tab only
             // spawns through this door
             SessionManager.shared.activate(session.id)
@@ -335,7 +384,9 @@ struct PermissionAskCard: View {
 /// (wired by ContentView) still closes the picker before any app-hide.
 struct ProjectPicker: View {
     var currentRepo: URL? = nil
-    let onPick: (URL) -> Void
+    /// The policy rides with the pick: `.askFirst` when the little hand is up,
+    /// `.auto` otherwise — spawnWorkSession takes it from there.
+    let onPick: (URL, PermissionPolicy) -> Void
     let onClose: () -> Void
 
     struct Row: Identifiable {
@@ -348,7 +399,12 @@ struct ProjectPicker: View {
     @State private var query = ""
     @State private var projects: [Row] = []
     @State private var loaded = false
+    /// Spawn the session with tool calls held for approval (P3a). Off by
+    /// default — ask-first is a choice, not a toll.
+    @State private var askFirst = false
     @FocusState private var focused: Bool
+
+    private var policy: PermissionPolicy { askFirst ? .askFirst : .auto }
 
     private var matches: [Row] {
         let q = query.trimmingCharacters(in: .whitespaces)
@@ -368,18 +424,21 @@ struct ProjectPicker: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TextField(
-                "",
-                text: $query,
-                prompt: Text("open a project…").foregroundStyle(.secondary.opacity(0.55))
-            )
-            .textFieldStyle(.plain)
-            .font(.system(size: 13, weight: .regular, design: .rounded))
-            .focused($focused)
-            .onSubmit { if let first = matches.first { onPick(first.url) } }
-            .onKeyPress(.escape) {
-                onClose()
-                return .handled
+            HStack(spacing: 8) {
+                TextField(
+                    "",
+                    text: $query,
+                    prompt: Text("open a project…").foregroundStyle(.secondary.opacity(0.55))
+                )
+                .textFieldStyle(.plain)
+                .font(.system(size: 13, weight: .regular, design: .rounded))
+                .focused($focused)
+                .onSubmit { if let first = matches.first { onPick(first.url, policy) } }
+                .onKeyPress(.escape) {
+                    onClose()
+                    return .handled
+                }
+                askFirstToggle
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 11)
@@ -394,7 +453,7 @@ struct ProjectPicker: View {
                         hint("nothing matches")
                     }
                     ForEach(matches) { row in
-                        PickerRow(row: row) { onPick(row.url) }
+                        PickerRow(row: row) { onPick(row.url, policy) }
                     }
                 }
                 .padding(6)
@@ -425,6 +484,28 @@ struct ProjectPicker: View {
             .foregroundStyle(.secondary.opacity(0.5))
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
+    }
+
+    /// The small hand beside the field — same amber language as the approval
+    /// cards, because it's the same idea a step earlier: this session's tools
+    /// will wait on you.
+    private var askFirstToggle: some View {
+        Button { askFirst.toggle() } label: {
+            HStack(spacing: 4) {
+                Image(systemName: askFirst ? "hand.raised.fill" : "hand.raised")
+                    .font(.system(size: 9, weight: .medium))
+                Text("ask first")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+            }
+            .foregroundStyle(askFirst ? Color.orange.opacity(0.95) : .secondary.opacity(0.55))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background { Capsule().fill(askFirst ? Color.orange.opacity(0.16) : .white.opacity(0.06)) }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(askFirst ? "the session will hold every tool call for your approval"
+                       : "spawn holding tool calls for approval")
     }
 }
 

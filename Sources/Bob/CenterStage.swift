@@ -25,6 +25,7 @@ struct CenterStage: View {
     @ObservedObject private var minions = MinionService.shared
     @ObservedObject private var openLine = OpenLine.shared
     @ObservedObject private var slash = SlashCommandService.shared
+    @ObservedObject private var router = SurfaceRouter.shared
 
     @State private var input: String = ""
     @State private var breath = PhaseClock(period: 5.2)
@@ -46,7 +47,10 @@ struct CenterStage: View {
     }
 
     var body: some View {
-        if let work = activeWork {
+        // A surface (notes, canvas) takes the whole stage — even over an active
+        // work tab, which keeps running behind its band chip. The companion
+        // face hosts it: the input bar underneath always talks to bob.
+        if router.active == nil, let work = activeWork {
             WorkStage(session: work, interceptHide: interceptHide)
                 // fresh field/scroll state per tab, so drafts never leak
                 // between sessions
@@ -73,14 +77,32 @@ struct CenterStage: View {
 
     private var companion: some View {
         VStack(spacing: 24) {
-            stage
+            if let surface = router.active {
+                surfaceStage(surface)
+            } else {
+                stage
+            }
             VStack(alignment: .leading, spacing: 8) {
+                // two whispers, stacked when they overlap: bob's clamped reply
+                // (his voice — click to rejoin the thread) above the dispatch
+                // ack (the room's voice, gone in a beat).
+                if router.active != nil, let reply = surfaceReply {
+                    SurfaceReplyStrip(text: reply, streaming: bridge.isStreaming) {
+                        router.close()
+                        // the strip is the companion's reply — clicking it means
+                        // "show me the conversation", not whichever work tab
+                        // happened to be on stage before the surface went up.
+                        if let cid = manager.companionID { manager.activate(cid) }
+                    }
+                }
                 if let whisper { DispatchWhisper(text: whisper) }
                 inputBar
                     .overlay(alignment: .top) { slashPalette }
             }
             .animation(.easeInOut(duration: 0.25), value: whisper)
+            .animation(.easeInOut(duration: 0.25), value: surfaceReply == nil)
         }
+        .animation(.easeInOut(duration: 0.3), value: router.active)
         .onAppear {
             inputFocused = true
             refreshPulse()
@@ -209,6 +231,33 @@ struct CenterStage: View {
         bridge.isStreaming && bridge.turns.last?.id == turn.id
     }
 
+    // MARK: surfaces (notes, canvas)
+
+    /// The mounted surface, in the slot the thread normally holds. Esc from
+    /// inside it (the notes editor, the empty plane) closes the surface via
+    /// onExitCommand — but a canvas card mid-edit sits closer in the responder
+    /// chain, so its own commit-on-Esc still wins.
+    @ViewBuilder
+    private func surfaceStage(_ surface: AppSurface) -> some View {
+        Group {
+            switch surface {
+            case .notes:  NotesSurface()
+            case .canvas: CanvasSurface()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onExitCommand { router.close() }
+        .transition(.opacity)
+    }
+
+    /// What the strip whispers: bob's latest reply, or the one landing right
+    /// now (empty while he's still thinking — the strip shows a beat of "…").
+    /// Nil when there's no conversation to keep audible.
+    private var surfaceReply: String? {
+        if let last = bridge.turns.last(where: { $0.kind == .bob }) { return last.text }
+        return bridge.isStreaming ? "" : nil
+    }
+
     // MARK: input
 
     private var inputBar: some View {
@@ -246,7 +295,7 @@ struct CenterStage: View {
                 .onKeyPress(.escape) {
                     // esc peels exactly one layer per press: palette → text in
                     // the box → bob mid-reply → the container's layer (project
-                    // picker) → the whole app.
+                    // picker) → an open surface → the whole app.
                     if !slashMatches.isEmpty {
                         slashDismissed = true
                     } else if !input.isEmpty {
@@ -260,6 +309,8 @@ struct CenterStage: View {
                         voiceOut.stop()
                     } else if interceptHide() {
                         // the picker was up — it ate this press and closed
+                    } else if router.close() {
+                        // a surface was up — back to whatever held the stage
                     } else {
                         NSApp.hide(nil)
                     }
@@ -837,6 +888,37 @@ private func routeDispatch(_ raw: String, via manager: SessionManager) -> String
         manager.inject(text, into: target.id)
     }
     return "→ \(name)\(bang ? " (stopped)" : ""): \(text)"
+}
+
+/// The whisper strip — while a surface holds the stage, bob's reply stays
+/// audible here: dim, two lines, notice-styled, right above the input bar.
+/// The dot warms to accent while he's still talking. Click it to put the
+/// conversation back on stage.
+private struct SurfaceReplyStrip: View {
+    let text: String
+    let streaming: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("⏺")
+                    .font(.system(size: 8))
+                    .foregroundStyle(streaming ? Color.accentColor.opacity(0.6) : .secondary.opacity(0.4))
+                Text(text.isEmpty ? "…" : text)
+                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.55))
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .multilineTextAlignment(.leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("back to the conversation")
+        .transition(.opacity)
+    }
 }
 
 /// The dispatch acknowledgment — styled exactly like a notice row (the room
