@@ -91,10 +91,11 @@ final class SessionManager: ObservableObject {
     }
 
     /// Last launch's work sessions come back as cold tabs: config only, no
-    /// process. Each live claude is a 150–300MB node process (risk #6), so
-    /// nothing spawns until `activate`/`send` asks. Sessions whose project has
-    /// been moved or deleted are dropped from the file with a note in the
-    /// stderr log. Idempotent.
+    /// process — and the same conversation, resumed (see SessionRecord). Each
+    /// live claude is a 150–300MB node process (risk #6), so nothing spawns
+    /// until `activate`/`send` asks. Sessions whose project has been moved or
+    /// deleted are dropped from the file with a note in the stderr log.
+    /// Idempotent.
     func restoreWorkSessions() {
         guard Self.streamingEnabled, !restoredFromDisk else { return }
         restoredFromDisk = true
@@ -253,12 +254,12 @@ final class SessionManager: ObservableObject {
     /// One work session as it survives a relaunch. The companion is absent by
     /// design — it's bridge-managed and spawned fresh every launch.
     ///
-    /// `id` is the CLI conversation this tab last ran. It is *not* reused on
-    /// restore: ClaudeSession's first spawn of a config always passes
-    /// `--session-id`, and the CLI hard-errors on an id it already owns
-    /// ("Session ID … is already in use", rc=1, probed on 2.1.228). It's kept
-    /// because the transcript under ~/.claude/projects is named after it — and
-    /// the day SessionConfig can say "resume this one", restore starts here.
+    /// `id` is the CLI conversation this tab last ran, and restore hands it
+    /// straight back — with `resumed: true`, so the first spawn says `--resume`
+    /// rather than `--session-id` (the CLI hard-errors on an id it already owns:
+    /// "Session ID … is already in use", rc=1, probed on 2.1.228). That is what
+    /// makes a restored tab the *same* conversation, history and all, and keeps
+    /// its transcript under ~/.claude/projects named the same forever.
     struct SessionRecord: Codable, Equatable {
         var id: UUID
         var cwd: String                     // absolute path, plain string so the file reads
@@ -268,12 +269,14 @@ final class SessionManager: ObservableObject {
 
         var config: SessionConfig {
             SessionConfig(
+                sessionId: id,
                 cwd: URL(fileURLWithPath: cwd),
                 appendSystemPrompt: nil,
                 permissions: permissions ?? .auto,
                 model: model,
                 name: name,
-                voiced: false
+                voiced: false,
+                resumed: true
             )
         }
     }
