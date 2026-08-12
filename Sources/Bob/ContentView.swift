@@ -7,8 +7,11 @@ struct ContentView: View {
     @ObservedObject private var home = BobHome.shared
 
     @ObservedObject private var minions = MinionService.shared
+    @ObservedObject private var sessions = SessionWatcher.shared
     @ObservedObject private var music = MusicService.shared
+    @ObservedObject private var sessionManager = SessionManager.shared
     @State private var showMemory = false
+    @State private var showProjectPicker = false
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -34,20 +37,23 @@ struct ContentView: View {
                     .frame(height: 110, alignment: .top)
                     .zIndex(2)
 
-                    Spacer(minLength: 0)
+                    // bob — the conductor, centered in everything the tiles and
+                    // the minion band leave behind. The greedy frame is what
+                    // pins the band to the window's bottom edge.
+                    CenterStage(
+                        bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home,
+                        interceptHide: {
+                            // the picker is one more esc layer, peeled before
+                            // app-hide — esc can never hide bob while it's up
+                            guard showProjectPicker else { return false }
+                            closeProjectPicker()
+                            return true
+                        }
+                    )
+                    .frame(maxWidth: 640)
+                    .frame(maxHeight: .infinity)
 
-                    // bob — the conductor, centered
-                    CenterStage(bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home)
-                        .frame(maxWidth: 640)
-
-                    // minions bob has delegated tasks to
-                    if !minions.active.isEmpty {
-                        MinionStrip(minions: minions.active)
-                            .frame(maxWidth: 640)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
-
-                    Spacer(minLength: 0)
+                    minionBand
                 }
                 .frame(maxWidth: .infinity)
 
@@ -59,12 +65,100 @@ struct ContentView: View {
             }
             .padding(20)
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: minions.active)
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.live)
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.parked)
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessionManager.workSessions.map(\.id))
+            .animation(.easeInOut(duration: 0.2), value: sessionManager.activeID)
 
             memoryToggle
+            projectPickerOverlay
         }
         .task {
             await home.bootstrapIfNeeded()
         }
+        .onReceive(NotificationCenter.default.publisher(for: MinionService.minionFinished)) { note in
+            // a hand reported back — let bob relay it in his own voice
+            guard let info = note.userInfo,
+                  let task = info["task"] as? String else { return }
+            let detail = info["detail"] as? String ?? ""
+            let ok = info["ok"] as? Bool ?? true
+            bridge.enqueueDebrief(task: task, detail: detail, ok: ok)
+        }
+    }
+
+    /// The bottom band: bob's own work-session tabs (click to take the stage),
+    /// the "+" that opens more, minions he's delegated to, and live claude
+    /// code sessions running in terminal tabs — click any card to float its
+    /// live panel; idle terminals fold behind a count. Its height is held
+    /// whether or not anything is running, so a hand arriving never shoves the
+    /// input bar upward. Always rendered now: the "+" is how the first work
+    /// session is born.
+    private var minionBand: some View {
+        MinionStrip(
+            minions: minions.active,
+            sessions: sessions.live,
+            parked: sessions.parked,
+            workSessions: sessionManager.workSessions,
+            activeID: sessionManager.activeID,
+            onNewSession: {
+                withAnimation(.easeOut(duration: 0.18)) { showProjectPicker.toggle() }
+            }
+        )
+        .frame(height: 62)
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: the "+" project picker
+
+    /// Floats just above the band (it lives at this level, not in CenterStage,
+    /// so tabs and picker share one owner). A whisper-thin scrim makes any
+    /// outside click a dismissal; esc closes it from inside (the picker's own
+    /// field holds focus) or via CenterStage's interceptHide when the main
+    /// input has focus instead.
+    @ViewBuilder
+    private var projectPickerOverlay: some View {
+        if showProjectPicker {
+            Color.black.opacity(0.001)
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+                .onTapGesture { closeProjectPicker() }
+                .zIndex(3)
+            ProjectPicker(
+                currentRepo: currentRepo,
+                onPick: { url, permissions, model in
+                    withAnimation(.easeOut(duration: 0.18)) { showProjectPicker = false }
+                    // spawn (idempotent per cwd — a cold restored tab wakes
+                    // instead of forking), then activate: spawnWorkSession
+                    // deliberately doesn't touch activeID itself. The picker's
+                    // ask-first hand and model dial ride along.
+                    let session = sessionManager.spawnWorkSession(cwd: url, model: model, permissions: permissions)
+                    SurfaceRouter.shared.close()   // picking = "put it on stage"
+                    sessionManager.activate(session.id)
+                },
+                onClose: { closeProjectPicker() }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .padding(.bottom, 88)
+            .zIndex(4)
+            .transition(.opacity.combined(with: .move(edge: .bottom)))
+        }
+    }
+
+    private func closeProjectPicker() {
+        withAnimation(.easeOut(duration: 0.18)) { showProjectPicker = false }
+        // hand the cursor back to the stage's input box — same signal ⌥Space
+        // sends, same listener catches it
+        NotificationCenter.default.post(name: HotKeyManager.didSummon, object: nil)
+    }
+
+    /// The repo the owner is most likely "in" right now — the busiest external
+    /// terminal session's cwd, for the picker's pinned shortcut. Absent when
+    /// nothing external is running.
+    private var currentRepo: URL? {
+        let ranked = sessions.live.sorted { $0.status > $1.status }
+        guard let cwd = ranked.first(where: { $0.status >= .waiting })?.cwd ?? ranked.first?.cwd
+        else { return nil }
+        return URL(fileURLWithPath: cwd)
     }
 
     private var memoryToggle: some View {
@@ -81,102 +175,6 @@ struct ContentView: View {
         .help(showMemory ? "hide memory" : "show memory")
         .padding(.top, 12)
         .padding(.trailing, 14)
-    }
-}
-
-// MARK: minions
-
-/// A row of the little agent cards bob has delegated tasks to.
-private struct MinionStrip: View {
-    let minions: [MinionService.Minion]
-
-    var body: some View {
-        HStack(spacing: 10) {
-            ForEach(minions) { minion in
-                MinionCard(minion: minion)
-            }
-            Spacer(minLength: 0)
-        }
-    }
-}
-
-private struct MinionCard: View {
-    let minion: MinionService.Minion
-    @State private var pulse = false
-
-    var body: some View {
-        HStack(spacing: 8) {
-            statusDot
-            VStack(alignment: .leading, spacing: 1) {
-                Text(minion.task)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(.primary.opacity(0.85))
-                    .lineLimit(1)
-                subtitle
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background {
-            Capsule(style: .continuous).fill(.ultraThinMaterial)
-        }
-        .overlay {
-            Capsule(style: .continuous)
-                .strokeBorder(.white.opacity(0.06), lineWidth: 0.5)
-        }
-    }
-
-    @ViewBuilder
-    private var subtitle: some View {
-        if minion.status == "working", let start = minion.startedAt {
-            // live elapsed timer while the minion grinds in the background
-            TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                Text("working · \(elapsed(from: start, to: ctx.date))")
-                    .font(.system(size: 9, weight: .regular, design: .rounded))
-                    .foregroundStyle(.secondary.opacity(0.6))
-                    .lineLimit(1)
-            }
-        } else if let detail = minion.detail, !detail.isEmpty {
-            Text(detail)
-                .font(.system(size: 9, weight: .regular, design: .rounded))
-                .foregroundStyle(.secondary.opacity(0.6))
-                .lineLimit(1)
-        }
-    }
-
-    private func elapsed(from start: Date, to now: Date) -> String {
-        let s = max(0, Int(now.timeIntervalSince(start)))
-        if s < 60 { return "\(s)s" }
-        return "\(s / 60)m \(s % 60)s"
-    }
-
-    @ViewBuilder
-    private var statusDot: some View {
-        switch minion.status {
-        case "done":
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 12))
-                .foregroundStyle(.green.opacity(0.85))
-        case "failed":
-            Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 12))
-                .foregroundStyle(.red.opacity(0.8))
-        case "queued":
-            Circle()
-                .strokeBorder(.secondary.opacity(0.5), lineWidth: 1.4)
-                .frame(width: 7, height: 7)
-        default: // working
-            Circle()
-                .fill(Color.accentColor.opacity(0.9))
-                .frame(width: 7, height: 7)
-                .scaleEffect(pulse ? 1.0 : 0.5)
-                .opacity(pulse ? 1.0 : 0.4)
-                .onAppear {
-                    withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
-                        pulse = true
-                    }
-                }
-        }
     }
 }
 
