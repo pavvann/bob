@@ -95,7 +95,15 @@ final class SessionFeedModel: ObservableObject {
         if cwd == nil, let c = out.update.cwd { cwd = c }
         if let b = out.update.gitBranch { gitBranch = b }
         if let m = out.update.model { model = m }
-        if let mt = out.mtime { lastActivity = mt }
+        switch flavor {
+        case .cliTranscript:
+            // mtime moves when claude rewrites an idle transcript's metadata —
+            // the green dot would flash on a session that said nothing. Only a
+            // real event advances the clock; silence leaves it where it was.
+            if let at = out.update.lastEventAt, at > (lastActivity ?? .distantPast) { lastActivity = at }
+        case .minionStream:
+            if let mt = out.mtime { lastActivity = mt }
+        }
     }
 
     // MARK: off-main file work

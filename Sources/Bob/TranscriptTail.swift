@@ -57,6 +57,31 @@ struct TranscriptTailer: Sendable {
     }
 }
 
+/// The honest clock on a transcript. Real conversation events carry an
+/// ISO-8601 `timestamp`; the heartbeat lines claude upserts in place
+/// (`bridge-session`, `mode`, `last-prompt`, `ai-title`, `file-history-snapshot`)
+/// carry none. So a fleet-wide config sync can touch an idle transcript's mtime
+/// without moving this — which is the whole point: mtime lies, this doesn't.
+enum EventClock {
+    nonisolated(unsafe) private static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) private static let whole = ISO8601DateFormatter()
+
+    /// The line's own event time, or nil for the untimestamped heartbeat lines.
+    static func stamp(_ obj: [String: Any]) -> Date? {
+        guard let s = obj["timestamp"] as? String, !s.isEmpty else { return nil }
+        return fractional.date(from: s) ?? whole.date(from: s)
+    }
+
+    static func advance(_ latest: inout Date?, with obj: [String: Any]) {
+        guard let at = stamp(obj) else { return }
+        if latest == nil || at > latest! { latest = at }
+    }
+}
+
 /// Turns raw jsonl lines into feed events. Two dialects share one parser:
 /// minion stream-json (`claude -p --output-format stream-json`) and the
 /// transcripts claude code writes under `~/.claude/projects/`. Every branch
@@ -71,6 +96,8 @@ enum TranscriptParser {
         var gitBranch: String?
         var model: String?
         var final: FeedFinal?
+        /// Newest real event time seen in these lines — the liveness clock.
+        var lastEventAt: Date?
     }
 
     static func parse(lines: [String], flavor: Flavor) -> Update {
@@ -85,6 +112,7 @@ enum TranscriptParser {
     }
 
     static func ingest(_ obj: [String: Any], flavor: Flavor, into u: inout Update) {
+        EventClock.advance(&u.lastEventAt, with: obj)
         if let c = obj["cwd"] as? String, !c.isEmpty { u.cwd = c }
         if let b = obj["gitBranch"] as? String, !b.isEmpty { u.gitBranch = b }
         guard let type = obj["type"] as? String else { return }
@@ -229,6 +257,9 @@ struct SessionProbe: Sendable {
     var title: String?
     var fallbackTitle: String?
     var hasConversation = false
+    /// Newest real event time in the file — fresh only if the session actually
+    /// spoke, not merely if claude rewrote the file's metadata underneath it.
+    var lastEventAt: Date?
 
     static func probe(_ url: URL, headBytes: Int = 49_152, tailBytes: UInt64 = 65_536) -> SessionProbe? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
@@ -266,6 +297,7 @@ struct SessionProbe: Sendable {
     }
 
     private mutating func ingest(line obj: [String: Any]) {
+        EventClock.advance(&lastEventAt, with: obj)
         if entrypoint == nil, let ep = obj["entrypoint"] as? String { entrypoint = ep }
         if let c = obj["cwd"] as? String, !c.isEmpty { cwd = c }
         if let b = obj["gitBranch"] as? String, !b.isEmpty { gitBranch = b }

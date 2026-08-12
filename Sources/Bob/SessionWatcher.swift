@@ -2,10 +2,12 @@ import Foundation
 
 /// Watches `~/.claude/projects/` for the OTHER claude code sessions — the ones
 /// pawan runs in terminal tabs — and surfaces recently-active ones as cards
-/// beside bob's own minions. A session is "live" while its transcript's mtime
-/// is fresh. Bob's own spawned runs (chat, minions, open-line) stamp their
-/// transcripts `entrypoint: "sdk-cli"` and are filtered out; terminal sessions
-/// stamp `"cli"`. All file IO runs off the main actor.
+/// beside bob's own minions. A session is "live" while its transcript's newest
+/// real event is fresh — mtime alone isn't enough, since claude rewrites the
+/// metadata of long-idle transcripts in place. Bob's own spawned runs (chat,
+/// minions, open-line) stamp their transcripts `entrypoint: "sdk-cli"` and are
+/// filtered out; terminal sessions stamp `"cli"`. All file IO runs off the
+/// main actor.
 @MainActor
 final class SessionWatcher: ObservableObject {
     static let shared = SessionWatcher()
@@ -49,11 +51,18 @@ final class SessionWatcher: ObservableObject {
         for dir in dirs {
             guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
             for file in files where file.pathExtension == "jsonl" {
+                // mtime is the cheap gate — it keeps us from probing ~68 dirs of
+                // history. But it's a liar on its own: claude upserts metadata
+                // into live-but-idle transcripts during config syncs, no content
+                // appended, size unchanged. So the newest real event decides.
+                // No stamp at all → fall open on mtime rather than vanish.
                 guard let mtime = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
                       mtime > cutoff,
                       let probe = SessionProbe.probe(file),
                       let entrypoint = probe.entrypoint, entrypoint != "sdk-cli"
                 else { continue }
+                let spoke = probe.lastEventAt ?? mtime
+                guard spoke > cutoff else { continue }
                 let name = probe.cwd.map { ($0 as NSString).lastPathComponent } ?? fallbackName(for: dir)
                 out.append(Session(
                     id: file.deletingPathExtension().lastPathComponent,
@@ -62,7 +71,7 @@ final class SessionWatcher: ObservableObject {
                     cwd: probe.cwd,
                     title: probe.title ?? probe.fallbackTitle,
                     gitBranch: probe.gitBranch,
-                    lastActivity: mtime
+                    lastActivity: spoke
                 ))
             }
         }
