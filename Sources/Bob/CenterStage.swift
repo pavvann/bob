@@ -859,13 +859,18 @@ private struct WorkStage: View {
             .onKeyPress(.escape) {
                 // same layer-peel as the companion, minus palette and voice:
                 // text in the box → the session mid-reply → the container's
-                // picker → the whole app. Interrupt goes to THIS session.
+                // picker → back to bob → the whole app. Interrupt goes to THIS
+                // session. A work tab gets that one extra layer the companion
+                // doesn't need: esc steps off this session before it means
+                // "hide bob", so leaving a tab never costs you the window.
                 if !input.isEmpty {
                     input = ""
                 } else if session.isStreaming {
                     session.interrupt()
                 } else if interceptHide() {
                     // the picker was up — it ate this press and closed
+                } else if SessionManager.shared.companionID != nil {
+                    SessionManager.shared.goHome()
                 } else {
                     NSApp.hide(nil)
                 }

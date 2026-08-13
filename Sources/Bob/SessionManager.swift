@@ -189,6 +189,25 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// Back to bob: his thread on stage, any surface put away. Every way home
+    /// — the chip, ⌘0, the esc layer — routes through here, so they can't
+    /// drift apart. A no-op in compatibility mode, where there's no companion
+    /// session to return to.
+    func goHome() {
+        SurfaceRouter.shared.close()
+        if let id = companionID { activate(id) }
+    }
+
+    /// ⌘1…⌘9 — the nth work session. Out of range does nothing rather than
+    /// clamping to the last tab: a shortcut that lands somewhere you didn't
+    /// ask for is worse than one that quietly declines.
+    func jumpToWorkSession(_ index: Int) {
+        let tabs = workSessions
+        guard index >= 0, index < tabs.count else { return }
+        SurfaceRouter.shared.close()
+        activate(tabs[index].id)
+    }
+
     /// Make a session the one CenterStage renders — and light it up if it's
     /// still cold. A `.failed` tab stays failed; retrying is `session.spawn()`,
     /// an explicit second click, not a side effect of looking at it.
