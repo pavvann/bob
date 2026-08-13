@@ -23,6 +23,23 @@ struct BobApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1120, height: 680)
+        // Real menu commands, not invisible buttons: bob runs with a regular
+        // activation policy, so this is the reliable way to own ⌘-keys — and the
+        // menu is where a shortcut goes to be discovered.
+        .commands {
+            CommandMenu("Stage") {
+                // ⌘B — b for bob, and reachable without leaving the home row's
+                // neighbourhood the way ⌘0 wasn't. Safe to claim: bob's inputs
+                // are plain text fields, so nothing here means "bold".
+                Button("Back to bob") { SessionManager.shared.goHome() }
+                    .keyboardShortcut("b", modifiers: .command)
+                Divider()
+                ForEach(1...9, id: \.self) { n in
+                    Button("Session \(n)") { SessionManager.shared.jumpToWorkSession(n - 1) }
+                        .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
+                }
+            }
+        }
     }
 
     static func style(_ window: NSWindow) {

@@ -24,8 +24,10 @@ struct MinionStrip: View {
         GeometryReader { geo in
             ScrollView(.horizontal) {
                 HStack(spacing: 10) {
-                    // the two always-present surfaces — notes and canvas — at
-                    // the leading edge, before anything that comes and goes
+                    // the way home sits first, then the two always-present
+                    // surfaces — notes and canvas — before anything that comes
+                    // and goes
+                    HomeChip()
                     ForEach(AppSurface.allCases) { surface in
                         SurfaceChip(surface: surface)
                     }
@@ -50,6 +52,50 @@ struct MinionStrip: View {
                 .animation(.spring(response: 0.32, dampingFraction: 0.82), value: showParked)
             }
             .scrollIndicators(.never)
+        }
+    }
+}
+
+// MARK: - the way home
+
+/// Bob has no tab of his own — the strip renders `workSessions`, which filters
+/// him out — so before this chip existed there was nothing to click to get back
+/// to the conversation from a session or a surface. It leads the band, lights up
+/// when bob already holds the stage, and is the same gesture as ⌘0 and the last
+/// esc layer.
+struct HomeChip: View {
+    @ObservedObject private var manager = SessionManager.shared
+    @ObservedObject private var router = SurfaceRouter.shared
+    @State private var hover = false
+
+    private var isHome: Bool { router.active == nil && manager.activeID == manager.companionID }
+
+    var body: some View {
+        // nothing to go home to in compatibility mode (no companion session)
+        if manager.companionID != nil {
+            Button { manager.goHome() } label: {
+                Image(systemName: "house")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(isHome ? Color.accentColor.opacity(0.9)
+                                            : .secondary.opacity(hover ? 0.9 : 0.55))
+                    .frame(width: 30, height: 30)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .background {
+                Circle().fill(.ultraThinMaterial)
+                    .overlay { if isHome { Circle().fill(Color.accentColor.opacity(0.10)) } }
+            }
+            .overlay {
+                Circle().stroke(
+                    isHome ? Color.accentColor.opacity(0.45) : .white.opacity(hover ? 0.18 : 0.06),
+                    lineWidth: isHome ? 1 : 0.5)
+            }
+            .scaleEffect(hover ? 1.06 : 1)
+            .onHover { isHover in
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) { hover = isHover }
+            }
+            .help(isHome ? "bob's already on stage" : "back to bob (⌘B)")
         }
     }
 }
