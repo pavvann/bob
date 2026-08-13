@@ -513,6 +513,16 @@ struct CenterStage: View {
             showWhisper(ack)
             return
         }
+
+        // `/resume` raises this project's own history — the CLI's gesture,
+        // pointed at bob's thread. Intercepted locally for the same reason
+        // `/model` is: sent verbatim it would just be words to the model.
+        if Self.isResumeCommand(raw), let companion = manager.companion {
+            input = ""
+            home.welcomeNote = nil
+            ResumeStore.shared.open(for: companion)
+            return
+        }
         input = ""
         home.welcomeNote = nil
 
@@ -556,6 +566,13 @@ struct CenterStage: View {
 
     /// Splits a leading `@<token>` off a message: `("music", "play something")`.
     /// Nil when the message doesn't start with one.
+    /// `/resume` (bare, or with trailing spaces) opens the conversation picker
+    /// for whichever session is asking. Arguments are ignored rather than
+    /// guessed at — the list is the interface.
+    static func isResumeCommand(_ raw: String) -> Bool {
+        raw.trimmingCharacters(in: .whitespaces).lowercased() == "/resume"
+    }
+
     /// `/model` → whisper the current model; `/model opus|sonnet|haiku|fable`
     /// → switch the companion in place; `/model default` → back to the CLI's
     /// own choice. Returns the whisper ack, or nil when the text isn't a model
@@ -893,6 +910,13 @@ private struct WorkStage: View {
                 guard !Task.isCancelled else { return }
                 whisper = nil
             }
+            return
+        }
+        // this tab's own history — the picker resumes into this session, not
+        // into bob's thread (same command, whichever stage you're standing on)
+        if CenterStage.isResumeCommand(prompt) {
+            input = ""
+            ResumeStore.shared.open(for: session)
             return
         }
         input = ""

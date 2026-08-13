@@ -313,6 +313,48 @@ final class ClaudeSession: ObservableObject, Identifiable {
         }
     }
 
+    /// Pick up a conversation this project already has on disk (`/resume`):
+    /// same tab, different thread. The process goes down and comes back with
+    /// `--resume <id>`, and the transcript on screen is replaced by that
+    /// conversation's own history so what you read matches what the model
+    /// remembers. The lens stays — resuming changes which conversation you're
+    /// in, not who bob is.
+    ///
+    /// The seam is announced (a notice row), because a switch nobody can see is
+    /// a switch that gets narrated wrong later.
+    func resume(conversationId: UUID, history: [Entry]) {
+        guard conversationId != config.sessionId else { return }
+        config.sessionId = conversationId
+        sessionOnDisk = true            // it exists: --resume, not --session-id
+        confirmedOnDisk = false         // this process hasn't confirmed it yet
+        resumeFallbackUsed = false      // a new id earns its own single retry
+        entries = history
+        entries.append(Entry(role: .notice, text: history.isEmpty
+            ? "resumed this conversation — nothing readable on disk, but the model has it"
+            : "resumed this conversation — the last \(history.count) turns, read from disk"))
+        lastError = nil
+        lastResult = nil
+        clientQueue.removeAll()
+        cliQueuedSends = 0
+        currentBobIndex = nil
+        spokenIndex = nil
+        pendingPromptChange = nil
+        pendingModelDrain = false
+        recentDeaths.removeAll()
+        cancelSweeps()
+        switch state {
+        case .unspawned:
+            break                       // the next spawn reads the new id
+        case .failed:
+            state = .unspawned
+            launchProcess()
+        default:
+            // you asked to be somewhere else — don't wait out the turn
+            state = .draining
+            process?.terminate()
+        }
+    }
+
     /// Graceful goodbye: close stdin, the process exits on its own (probe
     /// 1.1). The manager terminates stragglers after a grace period (D1).
     func close() {
