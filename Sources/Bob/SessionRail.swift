@@ -14,43 +14,51 @@ import SwiftUI
 struct SessionRail: View {
     @ObservedObject var session: ClaudeSession
     @ObservedObject private var git = GitStatus.shared
+    @ObservedObject private var watcher = AgentWatcher.shared
 
     static let width: CGFloat = 196
 
+    /// Disk knows about every agent in this conversation, whoever spawned them —
+    /// including a session bob resumed, or one a terminal is driving. The live
+    /// stream can still be ahead of the first poll, so anything bob watched start
+    /// and disk hasn't caught up on is folded in.
+    private var agents: [SessionAgent] {
+        var rows = watcher.agents
+        let known = Set(rows.map(\.id))
+        rows.append(contentsOf: session.agents.filter { !known.contains($0.id) })
+        return rows
+    }
+
     var body: some View {
-        // Tile fills its cell by design — in a stacked rail that makes the top
-        // card swallow the slack, so every card here is pinned to its content.
-        VStack(alignment: .leading, spacing: 12) {
+        // centred in the gutter rather than pinned to the top: it's standing
+        // context, not a header, and it reads better beside the conversation
+        VStack(alignment: .leading, spacing: 10) {
             if let branch = git.branch(for: session.config.cwd) {
-                Tile(title: "branch", cornerRadius: 16) {
-                    BranchCard(branch: branch, path: tidyPath)
-                }
-                .fixedSize(horizontal: false, vertical: true)
+                BranchChip(branch: branch, path: tidyPath)
             }
             if let asked = session.question {
-                Tile(title: "claude asks", cornerRadius: 16) {
-                    QuestionChooser(asked: asked,
-                                    onAnswer: { session.answerQuestion($0) },
-                                    onDecline: { session.declineQuestion() })
-                }
-                .fixedSize(horizontal: false, vertical: true)
-                .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
+                QuestionChooser(asked: asked,
+                                onAnswer: { session.answerQuestion($0) },
+                                onDecline: { session.declineQuestion() })
+                    .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
             }
-            if !session.agents.isEmpty {
-                Tile(title: "agents", cornerRadius: 16) {
-                    AgentRows(agents: session.agents)
-                }
-                .fixedSize(horizontal: false, vertical: true)
-                .transition(.opacity)
+            if !agents.isEmpty {
+                AgentRows(agents: agents)
+                    .transition(.opacity)
             }
-            Spacer(minLength: 0)
         }
-        .frame(width: Self.width, alignment: .top)
+        .frame(width: Self.width, alignment: .leading)
+        .frame(maxHeight: .infinity, alignment: .center)
         .animation(.spring(response: 0.32, dampingFraction: 0.84), value: session.question?.id)
-        .animation(.easeInOut(duration: 0.18), value: session.agents)
+        .animation(.easeInOut(duration: 0.18), value: agents)
         .task(id: session.id) {
-            // one poll, following whichever session is on stage
+            // one poll each, following whichever session is on stage
             GitStatus.shared.watch(session.config.cwd)
+            AgentWatcher.shared.watch(conversation: session.config.sessionId, cwd: session.config.cwd)
+        }
+        .onChange(of: session.config.sessionId) { _, id in
+            // /resume points the tab at a different conversation — different agents
+            AgentWatcher.shared.watch(conversation: id, cwd: session.config.cwd)
         }
     }
 
@@ -61,29 +69,41 @@ struct SessionRail: View {
     }
 }
 
-/// Where this session is standing.
-struct BranchCard: View {
+/// Where this session is standing — shaped like the session tabs along the
+/// bottom, because it belongs to the same family of "what am I looking at"
+/// furniture. No label: a branch icon and a branch name need no caption.
+struct BranchChip: View {
     let branch: String
     let path: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.triangle.branch")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.secondary.opacity(0.5))
+        HStack(spacing: 7) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary.opacity(0.55))
+            VStack(alignment: .leading, spacing: 1) {
                 Text(branch)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(.primary.opacity(0.88))
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.primary.opacity(0.9))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
+                Text(path)
+                    .font(.system(size: 9, weight: .regular, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.55))
+                    .lineLimit(1)
+                    .truncationMode(.head)
             }
-            Text(path)
-                .font(.system(size: 9, weight: .regular, design: .rounded))
-                .foregroundStyle(.secondary.opacity(0.45))
-                .lineLimit(1)
-                .truncationMode(.head)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.ultraThinMaterial)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.white.opacity(0.06), lineWidth: 0.5)
         }
     }
 }
@@ -93,8 +113,13 @@ struct BranchCard: View {
 struct AgentRows: View {
     let agents: [SessionAgent]
 
+    private var running: Int { agents.filter { $0.status == .running }.count }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
+            Text(running > 0 ? "\(running) working" : "\(agents.count) agent\(agents.count == 1 ? "" : "s")")
+                .font(.system(size: 9, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.5))
             ForEach(agents) { agent in
                 HStack(alignment: .top, spacing: 6) {
                     Circle()
@@ -123,6 +148,16 @@ struct AgentRows: View {
                 }
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.ultraThinMaterial)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.white.opacity(0.06), lineWidth: 0.5)
+        }
     }
 }
 
@@ -139,6 +174,9 @@ struct QuestionChooser: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Text("claude asks")
+                .font(.system(size: 9, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.orange.opacity(0.7))
             ForEach(asked.questions) { ask in
                 VStack(alignment: .leading, spacing: 5) {
                     Text(ask.question)
@@ -175,6 +213,21 @@ struct QuestionChooser: View {
             } else {
                 declineButton
             }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color.orange.opacity(0.08))
+                }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.orange.opacity(0.28), lineWidth: 1)
         }
     }
 
