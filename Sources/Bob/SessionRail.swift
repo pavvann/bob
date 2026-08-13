@@ -113,38 +113,40 @@ struct BranchChip: View {
 struct AgentRows: View {
     let agents: [SessionAgent]
 
-    private var running: Int { agents.filter { $0.status == .running }.count }
+    @State private var showFinished = false
+
+    private var working: [SessionAgent] { agents.filter { $0.status == .running } }
+    private var finished: [SessionAgent] { agents.filter { $0.status != .running } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text(running > 0 ? "\(running) working" : "\(agents.count) agent\(agents.count == 1 ? "" : "s")")
+            Text(working.isEmpty ? "nothing running" : "\(working.count) working")
                 .font(.system(size: 9, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary.opacity(0.5))
-            ForEach(agents) { agent in
-                HStack(alignment: .top, spacing: 6) {
-                    Circle()
-                        .fill(agent.status == .running ? Color.accentColor.opacity(0.75)
-                              : agent.status == .failed ? Color.orange.opacity(0.8)
-                              : Color.secondary.opacity(0.4))
-                        .frame(width: 5, height: 5)
-                        .padding(.top, 4)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(agent.description)
-                            .font(.system(size: 11, weight: .medium, design: .rounded))
-                            .foregroundStyle(.primary.opacity(agent.status == .running ? 0.85 : 0.6))
-                            .lineLimit(2)
-                        if let summary = agent.summary, agent.status.isFinished {
-                            Text(summary)
-                                .font(.system(size: 9, weight: .regular, design: .rounded))
-                                .foregroundStyle(.secondary.opacity(0.5))
-                                .lineLimit(2)
-                        } else if let kind = agent.kind {
-                            Text(kind)
-                                .font(.system(size: 9, weight: .regular, design: .rounded))
-                                .foregroundStyle(.secondary.opacity(0.45))
-                                .lineLimit(1)
-                        }
+
+            ForEach(working) { row($0) }
+
+            // Everything that has stopped folds away: what's running is the
+            // answer to "what's happening now", and eight finished rows bury it.
+            if !finished.isEmpty {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) { showFinished.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: showFinished ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 7, weight: .semibold))
+                        Text("\(finished.count) done")
+                            .font(.system(size: 9, weight: .medium, design: .rounded))
+                        Spacer(minLength: 0)
                     }
+                    .foregroundStyle(.secondary.opacity(0.45))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.top, working.isEmpty ? 0 : 2)
+
+                if showFinished {
+                    ForEach(finished) { row($0) }
                 }
             }
         }
@@ -157,6 +159,34 @@ struct AgentRows: View {
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(.white.opacity(0.06), lineWidth: 0.5)
+        }
+    }
+
+    private func row(_ agent: SessionAgent) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Circle()
+                .fill(agent.status == .running ? Color.accentColor.opacity(0.75)
+                      : agent.status == .failed ? Color.orange.opacity(0.8)
+                      : Color.secondary.opacity(0.4))
+                .frame(width: 5, height: 5)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(agent.description)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.primary.opacity(agent.status == .running ? 0.85 : 0.6))
+                    .lineLimit(2)
+                if let summary = agent.summary, agent.status.isFinished {
+                    Text(summary)
+                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.5))
+                        .lineLimit(2)
+                } else if let kind = agent.kind, agent.status == .running {
+                    Text(kind)
+                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .foregroundStyle(.secondary.opacity(0.45))
+                        .lineLimit(1)
+                }
+            }
         }
     }
 }

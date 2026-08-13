@@ -180,9 +180,19 @@ struct ContentView: View {
     /// is on stage. `minWidth` is what makes ViewThatFits able to say no.
     @ViewBuilder
     private func stageRow(withGutters: Bool) -> some View {
-        HStack(alignment: .top, spacing: withGutters ? 14 : 0) {
+        // Flexible spacers rather than fixed padding: the stage stays centred
+        // while the tree and the rail sit out at the window's edges, so neither
+        // reads as glued to the conversation.
+        HStack(alignment: .top, spacing: 0) {
             if withGutters {
-                Color.clear.frame(width: SessionRail.width, height: 1)
+                if let staged = activeSession, staged.id != sessionManager.companionID {
+                    FileTree(root: staged.config.cwd)
+                        .frame(maxHeight: .infinity)
+                        .transition(.opacity)
+                } else {
+                    Color.clear.frame(width: FileTree.width, height: 1)
+                }
+                Spacer(minLength: 18)
             }
             CenterStage(
                 bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home,
@@ -201,6 +211,7 @@ struct ContentView: View {
             .frame(minWidth: withGutters ? 560 : nil, maxWidth: 640)
             .frame(maxHeight: .infinity)
             if withGutters {
+                Spacer(minLength: 18)
                 if let staged = activeSession {
                     SessionRail(session: staged)
                         .transition(.opacity.combined(with: .move(edge: .trailing)))
