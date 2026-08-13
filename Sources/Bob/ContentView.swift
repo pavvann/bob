@@ -12,6 +12,7 @@ struct ContentView: View {
     @ObservedObject private var sessionManager = SessionManager.shared
     @State private var showMemory = false
     @State private var showProjectPicker = false
+    @ObservedObject private var resume = ResumeStore.shared
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -43,8 +44,12 @@ struct ContentView: View {
                     CenterStage(
                         bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home,
                         interceptHide: {
-                            // the picker is one more esc layer, peeled before
-                            // app-hide — esc can never hide bob while it's up
+                            // each picker is one more esc layer, peeled before
+                            // app-hide — esc can never hide bob while one is up
+                            if resume.isOpen {
+                                closeResumePicker()
+                                return true
+                            }
                             guard showProjectPicker else { return false }
                             closeProjectPicker()
                             return true
@@ -72,6 +77,7 @@ struct ContentView: View {
 
             memoryToggle
             projectPickerOverlay
+            resumePickerOverlay
         }
         .task {
             await home.bootstrapIfNeeded()
@@ -142,6 +148,30 @@ struct ContentView: View {
             .zIndex(4)
             .transition(.opacity.combined(with: .move(edge: .bottom)))
         }
+    }
+
+    /// `/resume`'s list, floating in the same place the project picker does —
+    /// they're the same gesture (pick a thing, put it on stage), so they get the
+    /// same geometry, scrim, and dismissal.
+    @ViewBuilder
+    private var resumePickerOverlay: some View {
+        if resume.isOpen {
+            Color.black.opacity(0.001)
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+                .onTapGesture { closeResumePicker() }
+                .zIndex(3)
+            ResumePicker()
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 88)
+                .zIndex(4)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+        }
+    }
+
+    private func closeResumePicker() {
+        withAnimation(.easeOut(duration: 0.18)) { resume.close() }
+        NotificationCenter.default.post(name: HotKeyManager.didSummon, object: nil)
     }
 
     private func closeProjectPicker() {
