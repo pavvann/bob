@@ -41,22 +41,23 @@ struct ContentView: View {
                     // bob — the conductor, centered in everything the tiles and
                     // the minion band leave behind. The greedy frame is what
                     // pins the band to the window's bottom edge.
-                    CenterStage(
-                        bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home,
-                        interceptHide: {
-                            // each picker is one more esc layer, peeled before
-                            // app-hide — esc can never hide bob while one is up
-                            if resume.isOpen {
-                                closeResumePicker()
-                                return true
-                            }
-                            guard showProjectPicker else { return false }
-                            closeProjectPicker()
-                            return true
-                        }
-                    )
-                    .frame(maxWidth: 640)
+                    // The stage keeps the middle; the rail takes the right
+                    // gutter when a work session is on it. A ghost of the same
+                    // width holds the left gutter, so the conversation stays
+                    // centred whether or not the rail is there — a stage that
+                    // slid sideways every time you changed tabs would be worse
+                    // than no rail at all.
+                    // Gutters only when the window can spare them: the first
+                    // arrangement declares a minimum for the stage, so a narrow
+                    // window falls through to the second and the conversation
+                    // keeps its full column instead of being squeezed to make
+                    // room for chrome.
+                    ViewThatFits(in: .horizontal) {
+                        stageRow(withGutters: true)
+                        stageRow(withGutters: false)
+                    }
                     .frame(maxHeight: .infinity)
+                    .animation(.easeInOut(duration: 0.2), value: activeWorkSession?.id)
 
                     minionBand
                 }
@@ -172,6 +173,51 @@ struct ContentView: View {
     private func closeResumePicker() {
         withAnimation(.easeOut(duration: 0.18)) { resume.close() }
         NotificationCenter.default.post(name: HotKeyManager.didSummon, object: nil)
+    }
+
+    /// The stage, optionally flanked: a ghost holding the left gutter so the
+    /// conversation stays centred, and the rail on the right when a work session
+    /// is on stage. `minWidth` is what makes ViewThatFits able to say no.
+    @ViewBuilder
+    private func stageRow(withGutters: Bool) -> some View {
+        HStack(alignment: .top, spacing: withGutters ? 14 : 0) {
+            if withGutters {
+                Color.clear.frame(width: SessionRail.width, height: 1)
+            }
+            CenterStage(
+                bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home,
+                interceptHide: {
+                    // each picker is one more esc layer, peeled before
+                    // app-hide — esc can never hide bob while one is up
+                    if resume.isOpen {
+                        closeResumePicker()
+                        return true
+                    }
+                    guard showProjectPicker else { return false }
+                    closeProjectPicker()
+                    return true
+                }
+            )
+            .frame(minWidth: withGutters ? 560 : nil, maxWidth: 640)
+            .frame(maxHeight: .infinity)
+            if withGutters {
+                if let work = activeWorkSession {
+                    SessionRail(session: work)
+                        .transition(.opacity.combined(with: .move(edge: .trailing)))
+                } else {
+                    Color.clear.frame(width: SessionRail.width, height: 1)
+                }
+            }
+        }
+    }
+
+    /// The work session on stage, if it's a work session at all — bob's own
+    /// thread has no branch, no permissions and no agents of its own to show.
+    private var activeWorkSession: ClaudeSession? {
+        guard SurfaceRouter.shared.active == nil,
+              let id = sessionManager.activeID, id != sessionManager.companionID
+        else { return nil }
+        return sessionManager.workSessions.first { $0.id == id }
     }
 
     private func closeProjectPicker() {
