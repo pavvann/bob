@@ -57,7 +57,7 @@ struct ContentView: View {
                         stageRow(withGutters: false)
                     }
                     .frame(maxHeight: .infinity)
-                    .animation(.easeInOut(duration: 0.2), value: activeWorkSession?.id)
+                    .animation(.easeInOut(duration: 0.2), value: activeSession?.id)
 
                     minionBand
                 }
@@ -201,8 +201,8 @@ struct ContentView: View {
             .frame(minWidth: withGutters ? 560 : nil, maxWidth: 640)
             .frame(maxHeight: .infinity)
             if withGutters {
-                if let work = activeWorkSession {
-                    SessionRail(session: work)
+                if let staged = activeSession {
+                    SessionRail(session: staged)
                         .transition(.opacity.combined(with: .move(edge: .trailing)))
                 } else {
                     Color.clear.frame(width: SessionRail.width, height: 1)
@@ -211,13 +211,14 @@ struct ContentView: View {
         }
     }
 
-    /// The work session on stage, if it's a work session at all — bob's own
-    /// thread has no branch, no permissions and no agents of its own to show.
-    private var activeWorkSession: ClaudeSession? {
-        guard SurfaceRouter.shared.active == nil,
-              let id = sessionManager.activeID, id != sessionManager.companionID
-        else { return nil }
-        return sessionManager.workSessions.first { $0.id == id }
+    /// Whichever session is on stage — bob's own thread included. Bob can be
+    /// asked a question too, and now that every session spawns able to relay one,
+    /// a companion question with nowhere to appear would hang the turn forever.
+    /// The rail's cards are individually conditional, so bob simply shows fewer
+    /// of them (no branch: ~/bob keeps no git).
+    private var activeSession: ClaudeSession? {
+        guard SurfaceRouter.shared.active == nil, let id = sessionManager.activeID else { return nil }
+        return sessionManager.sessions.first { $0.id == id }
     }
 
     private func closeProjectPicker() {

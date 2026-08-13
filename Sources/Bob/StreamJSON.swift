@@ -60,7 +60,7 @@ enum StreamEvent: Equatable, Sendable {
     case assistant([AssistantBlock])
     /// `user` carrying tool_result blocks — a tool finished.
     case toolResult(isError: Bool)
-    case taskStarted(id: String, description: String?)
+    case taskStarted(id: String, description: String?, subagentType: String?)
     case taskUpdated(id: String, status: String?)
     /// the between-turn doorbell (probe 1.2): a background task finished and
     /// a spontaneous model turn follows with no stdin input.
@@ -69,7 +69,12 @@ enum StreamEvent: Equatable, Sendable {
     case permissionDenied(tool: String, message: String?)
     case result(TurnResult)
     /// CLI → bob (can_use_tool in ask-first mode). Raw line kept for the broker.
-    case controlRequest(id: String, subtype: String, toolName: String?, rawJSON: String)
+    /// `requiresUserInteraction` is the CLI's own flag for a tool that can only
+    /// be answered by a person — AskUserQuestion. It arrives on the same
+    /// can_use_tool channel as a permission ask, but it's a question, not a
+    /// permission, and bob shows it as one (probe 2026-08-13).
+    case controlRequest(id: String, subtype: String, toolName: String?,
+                        requiresUserInteraction: Bool, rawJSON: String)
     /// ack for a control_request bob sent (interrupt).
     case controlResponse(id: String?, ok: Bool)
     /// hooks, rate limits, thinking meters, unknown shapes. `forensic` is
@@ -133,6 +138,7 @@ enum StreamJSON {
                 id: (obj["request_id"] as? String) ?? "",
                 subtype: (request?["subtype"] as? String) ?? "?",
                 toolName: request?["tool_name"] as? String,
+                requiresUserInteraction: (request?["requires_user_interaction"] as? Bool) ?? false,
                 rawJSON: line
             )
         case "control_response":
@@ -161,7 +167,8 @@ enum StreamJSON {
         case "task_started":
             return .taskStarted(
                 id: (obj["task_id"] as? String) ?? "",
-                description: obj["description"] as? String
+                description: obj["description"] as? String,
+                subagentType: obj["subagent_type"] as? String
             )
         case "task_updated":
             return .taskUpdated(
