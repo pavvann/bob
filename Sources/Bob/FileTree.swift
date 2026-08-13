@@ -100,22 +100,22 @@ struct FileTree: View {
     @ObservedObject private var store = FileTreeStore.shared
     let root: URL
 
-    static let width: CGFloat = 196
+    static let width: CGFloat = 218
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 5) {
                 Image(systemName: "folder")
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary.opacity(0.5))
                 Text(root.lastPathComponent)
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded))
                     .foregroundStyle(.secondary.opacity(0.7))
                     .lineLimit(1)
                 Spacer(minLength: 0)
                 Button { store.refresh() } label: {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 8, weight: .medium))
+                        .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(.secondary.opacity(0.4))
                 }
                 .buttonStyle(.plain)
@@ -193,19 +193,19 @@ private struct FileRow: View {
                 Image(systemName: node.isDirectory
                       ? (isExpanded ? "chevron.down" : "chevron.right")
                       : icon(for: node.name))
-                    .font(.system(size: node.isDirectory ? 7 : 8, weight: .medium))
+                    .font(.system(size: node.isDirectory ? 8.5 : 9.5, weight: .medium))
                     .foregroundStyle(.secondary.opacity(node.isDirectory ? 0.55 : 0.4))
-                    .frame(width: 10)
+                    .frame(width: 12)
                 Text(node.name)
-                    .font(.system(size: 10.5, weight: node.isDirectory ? .medium : .regular, design: .rounded))
+                    .font(.system(size: 12, weight: node.isDirectory ? .medium : .regular, design: .rounded))
                     .foregroundStyle(isSelected ? Color.accentColor : .primary.opacity(node.isDirectory ? 0.82 : 0.7))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 0)
             }
-            .padding(.leading, CGFloat(depth) * 10)
+            .padding(.leading, CGFloat(depth) * 11)
             .padding(.horizontal, 4)
-            .padding(.vertical, 2.5)
+            .padding(.vertical, 3.5)
             .background {
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
                     .fill(isSelected ? Color.accentColor.opacity(0.14)

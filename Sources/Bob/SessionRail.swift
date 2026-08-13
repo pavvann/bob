@@ -16,7 +16,7 @@ struct SessionRail: View {
     @ObservedObject private var git = GitStatus.shared
     @ObservedObject private var watcher = AgentWatcher.shared
 
-    static let width: CGFloat = 196
+    static let width: CGFloat = 218
 
     /// Disk knows about every agent in this conversation, whoever spawned them —
     /// including a session bob resumed, or one a terminal is driving. The live
@@ -79,17 +79,17 @@ struct BranchChip: View {
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: "arrow.triangle.branch")
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary.opacity(0.55))
             VStack(alignment: .leading, spacing: 1) {
                 Text(branch)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .font(.system(size: 12.5, weight: .medium, design: .rounded))
                     .foregroundStyle(.primary.opacity(0.9))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
                 Text(path)
-                    .font(.system(size: 9, weight: .regular, design: .rounded))
+                    .font(.system(size: 10.5, weight: .regular, design: .rounded))
                     .foregroundStyle(.secondary.opacity(0.55))
                     .lineLimit(1)
                     .truncationMode(.head)
@@ -121,7 +121,7 @@ struct AgentRows: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(working.isEmpty ? "nothing running" : "\(working.count) working")
-                .font(.system(size: 9, weight: .medium, design: .rounded))
+                .font(.system(size: 10.5, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary.opacity(0.5))
 
             ForEach(working) { row($0) }
@@ -134,9 +134,9 @@ struct AgentRows: View {
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: showFinished ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 7, weight: .semibold))
+                            .font(.system(size: 8, weight: .semibold))
                         Text("\(finished.count) done")
-                            .font(.system(size: 9, weight: .medium, design: .rounded))
+                            .font(.system(size: 10.5, weight: .medium, design: .rounded))
                         Spacer(minLength: 0)
                     }
                     .foregroundStyle(.secondary.opacity(0.45))
@@ -168,21 +168,21 @@ struct AgentRows: View {
                 .fill(agent.status == .running ? Color.accentColor.opacity(0.75)
                       : agent.status == .failed ? Color.orange.opacity(0.8)
                       : Color.secondary.opacity(0.4))
-                .frame(width: 5, height: 5)
+                .frame(width: 6, height: 6)
                 .padding(.top, 4)
             VStack(alignment: .leading, spacing: 1) {
                 Text(agent.description)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .font(.system(size: 12.5, weight: .medium, design: .rounded))
                     .foregroundStyle(.primary.opacity(agent.status == .running ? 0.85 : 0.6))
                     .lineLimit(2)
                 if let summary = agent.summary, agent.status.isFinished {
                     Text(summary)
-                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .font(.system(size: 10.5, weight: .regular, design: .rounded))
                         .foregroundStyle(.secondary.opacity(0.5))
                         .lineLimit(2)
                 } else if let kind = agent.kind, agent.status == .running {
                     Text(kind)
-                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .font(.system(size: 10.5, weight: .regular, design: .rounded))
                         .foregroundStyle(.secondary.opacity(0.45))
                         .lineLimit(1)
                 }
@@ -205,12 +205,12 @@ struct QuestionChooser: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("claude asks")
-                .font(.system(size: 9, weight: .medium, design: .rounded))
+                .font(.system(size: 10.5, weight: .medium, design: .rounded))
                 .foregroundStyle(Color.orange.opacity(0.7))
             ForEach(asked.questions) { ask in
                 VStack(alignment: .leading, spacing: 5) {
                     Text(ask.question)
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .font(.system(size: 12.5, weight: .medium, design: .rounded))
                         .foregroundStyle(.primary.opacity(0.9))
                         .fixedSize(horizontal: false, vertical: true)
                     ForEach(ask.options) { option in
@@ -218,7 +218,7 @@ struct QuestionChooser: View {
                     }
                     if ask.multiSelect {
                         Text("pick any")
-                            .font(.system(size: 8.5, weight: .regular, design: .rounded))
+                            .font(.system(size: 10, weight: .regular, design: .rounded))
                             .foregroundStyle(.secondary.opacity(0.4))
                     }
                 }
@@ -230,7 +230,7 @@ struct QuestionChooser: View {
                 HStack(spacing: 6) {
                     Button { onAnswer(picked) } label: {
                         Text("send")
-                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .font(.system(size: 11.5, weight: .semibold, design: .rounded))
                             .foregroundStyle(ready ? Color.accentColor : .secondary.opacity(0.4))
                             .padding(.horizontal, 9)
                             .padding(.vertical, 4)
@@ -264,7 +264,7 @@ struct QuestionChooser: View {
     private var declineButton: some View {
         Button { onDecline() } label: {
             Text("you pick")
-                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .font(.system(size: 11.5, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary.opacity(0.6))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -290,11 +290,11 @@ struct QuestionChooser: View {
         } label: {
             VStack(alignment: .leading, spacing: 1) {
                 Text(option.label)
-                    .font(.system(size: 11, weight: chosen ? .semibold : .regular, design: .rounded))
+                    .font(.system(size: 12.5, weight: chosen ? .semibold : .regular, design: .rounded))
                     .foregroundStyle(chosen ? Color.accentColor : .primary.opacity(0.82))
                 if let detail = option.detail, !detail.isEmpty {
                     Text(detail)
-                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .font(.system(size: 10.5, weight: .regular, design: .rounded))
                         .foregroundStyle(.secondary.opacity(0.5))
                         .lineLimit(3)
                         .fixedSize(horizontal: false, vertical: true)
