@@ -55,7 +55,7 @@ final class SessionWatcher: ObservableObject {
     }
 
     /// One `~/.claude/sessions/<pid>.json` record, reduced to what triage
-    /// needs. `name` is the CLI's own label for the tab ("lootwalk-37").
+    /// needs. `name` is the CLI's own label for the tab ("webapp-37").
     struct RegistryEntry: Equatable, Sendable {
         var pid: Int32
         var sessionId: String

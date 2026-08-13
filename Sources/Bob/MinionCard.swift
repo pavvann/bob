@@ -212,7 +212,7 @@ struct SessionTab: View {
         .help(count > 1 ? "\(count) tool calls waiting on you" : "a tool call is waiting on you")
     }
 
-    /// "~/Code/lootgo" — where this claude lives, home-abbreviated.
+    /// "~/Code/webapp" — where this claude lives, home-abbreviated.
     private var cwdTail: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let path = session.config.cwd.path

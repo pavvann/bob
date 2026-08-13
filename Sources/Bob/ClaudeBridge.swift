@@ -48,7 +48,7 @@ final class ClaudeBridge: ObservableObject {
     @Published var isStreaming: Bool = false
     @Published var lastError: String? = nil
 
-    /// The lens riding on this session — `"music"`, `"project:lootgo"`, or nil for
+    /// The lens riding on this session — `"music"`, `"project:webapp"`, or nil for
     /// none. Set by typing `@<name>` in the input bar and sticky until `@none` or
     /// a session reset: a lens is a *mode*, not a one-shot. On the streaming path
     /// it rides the process's system prompt (swapped by a graceful respawn), so
@@ -296,7 +296,7 @@ final class ClaudeBridge: ObservableObject {
         sessionStarted = false
     }
 
-    /// Switch the mode bob is in — `@music`, `@project:lootgo`, nil for none.
+    /// Switch the mode bob is in — `@music`, `@project:webapp`, nil for none.
     /// The chip updates now; on the streaming path the process respawns with
     /// the new system prompt while the owner types, and anything sent during
     /// the swap is queued and flushed, never dropped (D4).

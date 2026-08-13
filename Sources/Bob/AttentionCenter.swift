@@ -5,7 +5,7 @@ import Combine
 /// one flips into trouble — or quietly finishes while the owner is looking
 /// elsewhere — folds a ≤300-char digest into the COMPANION session as a hidden
 /// user message. Bob-the-model relays it in one line; the owner commands back
-/// with `>name …`. Digests only, never transcripts: bob hears that lootgo's
+/// with `>name …`. Digests only, never transcripts: bob hears that webapp's
 /// tests went red, not the whole scrollback.
 ///
 /// Delivery reuses the debrief gate's mechanics (ClaudeBridge.drainDebriefs):

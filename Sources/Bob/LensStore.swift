@@ -2,7 +2,7 @@ import Foundation
 
 /// One assembled lens, ready to hand to `claude --append-system-prompt`.
 struct LensContext {
-    /// Normalized spec — `music`, or `project:lootgo` for a parameterized lens.
+    /// Normalized spec — `music`, or `project:webapp` for a parameterized lens.
     let name: String
     let text: String
     let approxTokens: Int
@@ -36,7 +36,7 @@ final class LensStore {
 
     // MARK: api
 
-    /// `"music"` or `"project:lootgo"`. Returns nil on any failure — callers
+    /// `"music"` or `"project:webapp"`. Returns nil on any failure — callers
     /// then send with no `--append-system-prompt` at all (today's behavior).
     /// Every outcome, good or bad, lands in `state/lens-debug.log`.
     func resolve(_ spec: String) -> LensContext? {

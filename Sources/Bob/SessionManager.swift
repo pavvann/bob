@@ -396,7 +396,7 @@ final class SessionManager: ObservableObject {
         return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
     }
 
-    /// "~/Code/lootgo" → "lootgo". A path that ends up nameless still gets
+    /// "~/Code/webapp" → "webapp". A path that ends up nameless still gets
     /// something typeable rather than an empty tab.
     static func defaultName(for cwd: URL) -> String {
         let last = cwd.standardizedFileURL.lastPathComponent

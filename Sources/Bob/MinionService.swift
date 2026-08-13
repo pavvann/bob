@@ -19,7 +19,7 @@ final class MinionService: ObservableObject {
         var workdir: String?
         var status: String        // queued | working | done | failed
         var detail: String?
-        /// Optional lens spec (`bob-dev`, `project:lootgo`) — resolved by the
+        /// Optional lens spec (`bob-dev`, `project:webapp`) — resolved by the
         /// swift layer at spawn time and appended to the minion's system prompt.
         var lens: String?
         /// Who queued this: "user" (default) | "retro" | "self". Carried so a

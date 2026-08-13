@@ -31,7 +31,7 @@ struct CenterStage: View {
     @State private var breath = PhaseClock(period: 5.2)
     @State private var slashSelection = 0
     @State private var slashDismissed = false
-    /// The dispatch acknowledgment — "→ lootgo: fix the failing test" — shown
+    /// The dispatch acknowledgment — "→ webapp: fix the failing test" — shown
     /// briefly above the input bar after a `>name …` send, then gone.
     @State private var whisper: String?
     @State private var whisperSweep: Task<Void, Never>?
@@ -357,7 +357,7 @@ struct CenterStage: View {
         .animation(.easeInOut(duration: 0.2), value: bridge.activeLens)
     }
 
-    /// The mode bob is in, if any — `@music`, `@project:lootgo`. Sits just left
+    /// The mode bob is in, if any — `@music`, `@project:webapp`. Sits just left
     /// of the mic; click it to drop back to plain bob.
     @ViewBuilder
     private var lensChip: some View {
@@ -1001,8 +1001,8 @@ private struct DispatchWhisper: View {
     }
 }
 
-/// The `>` command grammar, mirroring the @lens parse: `>lootgo fix the test`
-/// sends into the session called lootgo, `>lootgo! stop, run the tests` stops
+/// The `>` command grammar, mirroring the @lens parse: `>webapp fix the test`
+/// sends into the session called webapp, `>webapp! stop, run the tests` stops
 /// it first (the ONLY road to an interrupt — never implicit). Names match by
 /// unambiguous case-insensitive prefix; an exact name beats a longer cousin.
 /// Pure, so the harness can table-test every verdict.
@@ -1011,7 +1011,7 @@ enum SessionDispatch {
         /// Not a dispatch at all — no `>` head, `> quoted text`, or a name
         /// with nothing to say after it.
         case none
-        /// `>lo …` with lootgo AND lootwalk alive — the message travels
+        /// `>web …` with webapp AND webapi alive — the message travels
         /// verbatim; bob can list what was close.
         case ambiguous([String])
         /// `>zzz …` — no session answers to that; verbatim again.
