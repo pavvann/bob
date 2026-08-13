@@ -26,21 +26,29 @@ enum ResumeIndex {
         /// A coding session's transcript is mostly tool traffic; counting that
         /// would say "1,400 messages" about an afternoon of eight questions.
         let prompts: Int
-        /// True when the count comes from the part of the file we read, and the
-        /// file is longer. The row says "8+" rather than pretending 8 is all.
-        let promptsAreAtLeast: Bool
+        /// Somebody typed into a terminal here. The CLI stamps those prompts
+        /// `origin: human` / `promptSource: typed`; everything an SDK client
+        /// sends — bob's own stdin, a Task subagent, a doc-generation run —
+        /// says `sdk` instead.
+        let humanTyped: Bool
         let gitBranch: String?
         /// `entrypoint: sdk-cli` means bob spawned it; a terminal session says
         /// `cli`. Both are resumable — the row says which so you can tell your
         /// own chat from a Ghostty session in the same project.
         let fromBob: Bool
 
-        /// One prompt, one answer, nothing to come back to. Bob's own machinery
-        /// makes these constantly — the greeting line, the nightly retro
-        /// dispatch, every minion — and they'd otherwise bury the handful of
-        /// real conversations. The index still reports them; deciding they're
-        /// not worth showing is the picker's call.
-        var isOneShot: Bool { prompts < 2 && !promptsAreAtLeast }
+        /// Nothing to come back to. A conversation someone typed always counts,
+        /// however short — that's the CLI's own bar for `/resume`, and matching
+        /// it is why a project with twenty-five transcripts lists the one
+        /// session you actually had. Everything else on disk is machinery: the
+        /// greeting line, the nightly retro, every minion, every Task subagent
+        /// — one prompt fired at a model, no dialogue to resume. Bob's own
+        /// chats survive on the same rule, because they run several prompts
+        /// deep even though the CLI files them as `sdk`.
+        ///
+        /// The index still reports these; deciding not to show them is the
+        /// picker's call.
+        var isOneShot: Bool { !humanTyped && prompts < 2 }
     }
 
     /// A reconstructed turn, ready to become a transcript row.
@@ -125,25 +133,33 @@ enum ResumeIndex {
     /// the same as a small one.
     static func conversation(at url: URL, headBytes: Int = 256 * 1024) -> Conversation? {
         guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent) else { return nil }
-        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
 
         var branch: String?
         var fromBob = false
         var firstPrompt: String?
-        var prompts = 0
+        var headPrompts = 0
         for line in headLines(of: url, bytes: headBytes) {
             guard let obj = json(line) else { continue }
             // "HEAD" is what the CLI records outside a repo (~/bob keeps no git
             // by design) — that's an absence, not a branch name
             if branch == nil, let b = obj["gitBranch"] as? String, !b.isEmpty, b != "HEAD" { branch = b }
             if let e = obj["entrypoint"] as? String { fromBob = (e == "sdk-cli") }
-            guard (obj["type"] as? String) == "user",
-                  (obj["isSidechain"] as? Bool) != true,
-                  (obj["isMeta"] as? Bool) != true,
-                  let text = promptText(obj)
-            else { continue }
-            prompts += 1
-            if firstPrompt == nil { firstPrompt = text }
+            if (obj["type"] as? String) == "user",
+               (obj["isSidechain"] as? Bool) != true,
+               (obj["isMeta"] as? Bool) != true,
+               let text = promptText(obj) {
+                headPrompts += 1
+                if firstPrompt == nil { firstPrompt = text }
+            }
+        }
+
+        // Provenance comes from byte markers, which means it depends on the
+        // CLI's exact wire format. If a version bump ever moves that ground,
+        // fall back to what parsing found and stay permissive: an extra row is
+        // a smaller failure than a picker that lists nothing.
+        var counted = provenance(of: url)
+        if counted.prompts == 0, headPrompts > 0 {
+            counted = (human: headPrompts, sdk: 0, prompts: headPrompts)
         }
 
         // A compacted conversation gets a real summary from the CLI, which
@@ -151,6 +167,9 @@ enum ResumeIndex {
         var summary: String?
         for line in tailLines(of: url, bytes: 128 * 1024) {
             guard let obj = json(line) else { continue }
+            // the branch a long session ENDED on is the one you'd recognize it
+            // by — sessions outlive the branch they were opened on
+            if let b = obj["gitBranch"] as? String, !b.isEmpty, b != "HEAD" { branch = b }
             switch obj["type"] as? String {
             case "ai-title": summary = (obj["aiTitle"] as? String) ?? summary
             case "summary":  summary = (obj["summary"] as? String) ?? summary
@@ -166,10 +185,61 @@ enum ResumeIndex {
                             fileURL: url,
                             title: String(title.prefix(120)),
                             lastActivity: modified(url),
-                            prompts: prompts,
-                            promptsAreAtLeast: size > headBytes,
+                            prompts: counted.prompts,
+                            humanTyped: counted.human > 0,
                             gitBranch: branch,
                             fromBob: fromBob)
+    }
+
+    /// Who was doing the talking, counted over the whole file in one pass.
+    ///
+    /// Reading every line as JSON to learn this would be minutes across a
+    /// project's history; these markers are distinctive enough to find in the
+    /// bytes. Tool results — the overwhelming bulk of a coding transcript —
+    /// carry no `promptSource` at all, so they can't inflate the count.
+    static func provenance(of url: URL) -> (human: Int, sdk: Int, prompts: Int) {
+        let origin = Data("\"origin\":{\"kind\":\"human\"}".utf8)
+        let typed = Data("\"promptSource\":\"typed\"".utf8)
+        let sdk = Data("\"promptSource\":\"sdk\"".utf8)
+        let counts = scan(url, for: [origin, typed, sdk])
+        // older transcripts predate `origin` and only carry promptSource, so
+        // take whichever marker saw more rather than assuming both exist
+        let human = max(counts[0], counts[1])
+        return (human, counts[2], human + counts[2])
+    }
+
+    /// Count needle occurrences in one streaming pass. Matches are deduped by
+    /// absolute file offset: consecutive windows deliberately overlap so a
+    /// marker split across two reads is still found, which would otherwise
+    /// count the short needles inside that overlap twice.
+    private static func scan(_ url: URL, for needles: [Data]) -> [Int] {
+        var counts = [Int](repeating: 0, count: needles.count)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return counts }
+        defer { try? handle.close() }
+
+        let overlap = max(0, (needles.map(\.count).max() ?? 1) - 1)
+        var lastEnd = [Int](repeating: Int.min, count: needles.count)
+        var carry = Data()
+        var windowStart = 0            // absolute offset of carry's first byte
+
+        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            var window = carry
+            window.append(chunk)
+            for (i, needle) in needles.enumerated() {
+                var from = window.startIndex
+                while let found = window.range(of: needle, in: from..<window.endIndex) {
+                    let absolute = windowStart + window.distance(from: window.startIndex, to: found.lowerBound)
+                    if absolute >= lastEnd[i] {
+                        counts[i] += 1
+                        lastEnd[i] = absolute + needle.count
+                    }
+                    from = found.upperBound
+                }
+            }
+            windowStart += window.count - overlap
+            carry = Data(window.suffix(overlap))
+        }
+        return counts
     }
 
     // MARK: - reading one back

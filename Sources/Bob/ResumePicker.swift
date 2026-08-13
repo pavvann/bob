@@ -170,8 +170,7 @@ private struct ResumeRow: View {
                         Text(Self.ago(conversation.lastActivity))
                         if conversation.prompts > 0 {
                             Text("·")
-                            Text("\(conversation.prompts)\(conversation.promptsAreAtLeast ? "+" : "") "
-                                 + "prompt\(conversation.prompts == 1 && !conversation.promptsAreAtLeast ? "" : "s")")
+                            Text("\(conversation.prompts) prompt\(conversation.prompts == 1 ? "" : "s")")
                         }
                         if let branch = conversation.gitBranch, !branch.isEmpty {
                             Text("·")
