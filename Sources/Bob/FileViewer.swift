@@ -1,25 +1,43 @@
 import SwiftUI
 import AppKit
 
-/// Click a file in the tree and it opens here: a floating window with the file
-/// in it, in the same glass language as the session panels.
+/// Click a file in the tree and it opens here: one floating window, with a tab
+/// per file, in the same glass language as the session panels.
 ///
 /// A reader, not an editor. Markdown renders; everything else is monospace with
 /// line numbers. Big files are truncated and say so, and something that isn't
 /// text says that rather than spraying bytes at you.
+///
+/// One window rather than one per file: reading three files means three tabs,
+/// not three windows to arrange. And the window remembers the size you gave it —
+/// `setFrameAutosaveName` is AppKit's own memory for that, so resizing once is
+/// the last time you have to.
 @MainActor
 final class FileViewerController: NSObject, NSWindowDelegate {
     static let shared = FileViewerController()
 
-    private var panels: [URL: NSPanel] = [:]
+    private let open = OpenFiles()
+    private var panel: NSPanel?
+
+    /// The key AppKit stores the frame under. Changing it forgets every size the
+    /// owner has already chosen, so it doesn't change.
+    private static let frameKey = "bob.fileViewer"
 
     func show(_ url: URL) {
-        if let existing = panels[url] {
-            existing.makeKeyAndOrderFront(nil)
-            return
-        }
+        open.show(url)
+        if panel == nil { panel = makePanel() }
+        panel?.makeKeyAndOrderFront(nil)
+    }
+
+    func closeAll() {
+        panel?.close()
+    }
+
+    private func makePanel() -> NSPanel {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 620),
+            // wider than tall by default: code is long lines, and 560pt wrapped
+            // things that had no business wrapping
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 700),
             styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -32,29 +50,30 @@ final class FileViewerController: NSObject, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.titlebarAppearsTransparent = true
         panel.titleVisibility = .hidden
-        panel.title = url.lastPathComponent
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.fullScreenNone, .moveToActiveSpace]
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
-        panel.minSize = NSSize(width: 360, height: 280)
+        panel.minSize = NSSize(width: 460, height: 300)
         panel.delegate = self
-        panel.contentView = NSHostingView(rootView: FileViewerView(url: url))
-        place(panel)
-        panels[url] = panel
-        panel.makeKeyAndOrderFront(nil)
-    }
+        panel.contentView = NSHostingView(
+            rootView: FileViewerWindow(open: open, onEmpty: { [weak self] in self?.panel?.close() })
+        )
 
-    func closeAll() {
-        for panel in panels.values where panel.isVisible { panel.close() }
+        // A remembered frame wins; only a first-ever open gets placed by the
+        // mouse. Order matters — autosaving after the frame is set is what makes
+        // AppKit restore instead of overwrite.
+        let remembered = UserDefaults.standard.string(forKey: "NSWindow Frame \(Self.frameKey)") != nil
+        if !remembered { place(panel) }
+        panel.setFrameAutosaveName(Self.frameKey)
+        return panel
     }
 
     private func place(_ panel: NSPanel) {
         let size = panel.frame.size
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
-        let cascade = CGFloat(panels.count % 5) * 26
-        var origin = NSPoint(x: mouse.x + 20 + cascade, y: mouse.y - size.height / 2 - cascade)
+        var origin = NSPoint(x: mouse.x + 20, y: mouse.y - size.height / 2)
         if let visible = screen?.visibleFrame {
             origin.x = max(visible.minX + 12, min(origin.x, visible.maxX - size.width - 12))
             origin.y = max(visible.minY + 12, min(origin.y, visible.maxY - size.height - 12))
@@ -63,10 +82,120 @@ final class FileViewerController: NSObject, NSWindowDelegate {
     }
 
     nonisolated func windowWillClose(_ notification: Notification) {
-        guard let panel = notification.object as? NSPanel else { return }
         Task { @MainActor in
-            panels = panels.filter { $0.value !== panel }
+            panel = nil
+            open.closeEverything()
         }
+    }
+}
+
+/// Which files are open, and which one you're looking at.
+@MainActor
+final class OpenFiles: ObservableObject {
+    @Published private(set) var files: [URL] = []
+    @Published var selected: URL?
+
+    func show(_ url: URL) {
+        if !files.contains(url) { files.append(url) }
+        selected = url
+    }
+
+    /// Closing the tab you're on lands you on its neighbour, not on nothing.
+    func close(_ url: URL) {
+        guard let index = files.firstIndex(of: url) else { return }
+        files.remove(at: index)
+        if selected == url {
+            selected = files.indices.contains(index) ? files[index] : files.last
+        }
+    }
+
+    func closeEverything() {
+        files = []
+        selected = nil
+    }
+}
+
+/// The window: a tab per open file over whichever one is selected.
+struct FileViewerWindow: View {
+    @ObservedObject var open: OpenFiles
+    let onEmpty: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            tabs
+            Divider().opacity(0.15)
+            if let url = open.selected {
+                FileViewerView(url: url)
+                    .id(url)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background {
+            VisualEffectView(material: .hudWindow, blendingMode: .behindWindow).ignoresSafeArea()
+        }
+        .onChange(of: open.files.isEmpty) { _, empty in
+            if empty { onEmpty() }   // last tab closed: the window goes with it
+        }
+    }
+
+    private var tabs: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 5) {
+                ForEach(open.files, id: \.self) { url in
+                    FileTab(url: url,
+                            isActive: url == open.selected,
+                            select: { open.selected = url },
+                            close: { open.close(url) })
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 9)
+            .padding(.bottom, 8)
+        }
+        .scrollIndicators(.never)
+    }
+}
+
+/// One tab. Shaped like the session tabs along the band's bottom, because it is
+/// the same idea: a thing you can put on stage, and close.
+private struct FileTab: View {
+    let url: URL
+    let isActive: Bool
+    let select: () -> Void
+    let close: () -> Void
+
+    @State private var hover = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(url.lastPathComponent)
+                .font(.system(size: 11, weight: isActive ? .medium : .regular, design: .rounded))
+                .foregroundStyle(isActive ? Color.primary.opacity(0.92) : Color.secondary.opacity(0.7))
+                .lineLimit(1)
+            if hover || isActive {
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.secondary.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background {
+            Capsule(style: .continuous)
+                .fill(isActive ? Color.accentColor.opacity(0.14) : .white.opacity(hover ? 0.08 : 0.04))
+        }
+        .overlay {
+            Capsule(style: .continuous)
+                .stroke(isActive ? Color.accentColor.opacity(0.35) : .white.opacity(0.06), lineWidth: 0.5)
+        }
+        .contentShape(Capsule(style: .continuous))
+        .onTapGesture(perform: select)
+        .onHover { hover = $0 }
     }
 }
 
@@ -99,17 +228,11 @@ struct FileViewerView: View {
             body(for: contents)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background {
-            VisualEffectView(material: .hudWindow, blendingMode: .behindWindow).ignoresSafeArea()
-        }
         .task(id: url) { await load() }
     }
 
     private var header: some View {
         HStack(spacing: 6) {
-            Text(url.lastPathComponent)
-                .font(.system(size: 11, weight: .medium, design: .rounded))
-                .foregroundStyle(.primary.opacity(0.9))
             Text(tidyParent)
                 .font(.system(size: 9, weight: .regular, design: .rounded))
                 .foregroundStyle(.secondary.opacity(0.5))
