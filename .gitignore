@@ -1,8 +1,11 @@
 # SPM build artefacts
 .build/
 .swiftpm/
-Package.resolved
 DerivedData/
+
+# Package.resolved is deliberately tracked — a binary grammar dependency has to
+# pin to an exact revision, or a fresh checkout can silently resolve a different
+# xcframework.
 
 # stray swift compile outputs (in case they leak out of .build/)
 *.o

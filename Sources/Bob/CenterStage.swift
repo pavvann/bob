@@ -656,10 +656,10 @@ private struct TurnRowView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .transition(.opacity)
                 } else {
-                    Text(text)
-                        .font(.system(size: 16, weight: .regular, design: .rounded))
-                        .foregroundStyle(.primary.opacity(0.92))
-                        .lineSpacing(4)
+                    // claude writes markdown; render it as markdown (tables,
+                    // fences, lists, emphasis) instead of making the owner
+                    // parse pipes and asterisks by eye
+                    MarkdownText(text: text)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                         .transition(.opacity)

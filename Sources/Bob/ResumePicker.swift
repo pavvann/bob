@@ -78,6 +78,9 @@ final class ResumeStore: ObservableObject {
                     ClaudeSession.Entry(role: $0.fromYou ? .you : .bob, text: $0.text)
                 }
             )
+            // the tab now points somewhere else — the registry has to know, or the
+            // next launch brings back the conversation you just left
+            SessionManager.shared.persist()
         }
     }
 }

@@ -107,6 +107,12 @@ final class ClaudeSession: ObservableObject, Identifiable {
     @Published private(set) var entries: [Entry] = []
     @Published private(set) var lastError: String? = nil
     @Published private(set) var lastResult: TurnResult? = nil
+    /// What claude is blocked on, waiting for a person to choose. The turn stays
+    /// `turnActive` while it's up — nothing moves until it's answered.
+    @Published private(set) var question: SessionQuestion? = nil
+    /// Agents this session has set running, newest last. Finished rows linger so
+    /// you can read the outcome rather than watching them vanish.
+    @Published private(set) var agents: [SessionAgent] = []
 
     /// Called with each completed sentence as the reply streams (D5). Only
     /// fires when `config.voiced`. Wired to VoiceOutput by the view layer.
@@ -507,6 +513,13 @@ final class ClaudeSession: ObservableObject, Identifiable {
         switch config.permissions {
         case .auto:
             args += ["--permission-mode", "auto"]
+            // The same hidden flag ask-first needs, for a different reason:
+            // without a permission-prompt sink the CLI *disables* every tool
+            // that requires a person, so AskUserQuestion doesn't exist and a
+            // question can never reach the owner (probe 2026-08-13). Adding it
+            // does NOT take ordinary permissions away from auto's classifier —
+            // probed: a Bash call still went straight through, no can_use_tool.
+            if !stdioPromptUnsupported { args += ["--permission-prompt-tool", "stdio"] }
         case .askFirst:
             args += ["--permission-mode", "manual"]
             // the hidden flag that turns manual mode from deny-by-default into a
@@ -590,10 +603,14 @@ final class ClaudeSession: ObservableObject, Identifiable {
             launchProcess()
             return true
         }
-        if config.permissions == .askFirst, !stdioPromptUnsupported {
+        // Both modes now pass --permission-prompt-tool, so both need the retry: a
+        // claude too old for it would otherwise take auto sessions down with it,
+        // and auto sessions are the default.
+        if !stdioPromptUnsupported {
             stdioPromptUnsupported = true
-            appendNotice("this claude can't be asked first — running deny-by-default; "
-                       + "each blocked tool gets a line")
+            appendNotice(config.permissions == .askFirst
+                ? "this claude can't be asked first — running deny-by-default; each blocked tool gets a line"
+                : "this claude can't relay questions — if it needs a choice it'll ask in the transcript")
             launchProcess()
             return true
         }
@@ -642,13 +659,36 @@ final class ClaudeSession: ObservableObject, Identifiable {
             // the notice row above the spontaneous turn that follows (D3) —
             // one row per task, live, and gone once the task has settled
             noteTask(id: id, text: summary ?? "background task \(status)", settled: Self.hasSettled(status))
+            settleAgent(id, status: status, summary: summary)
         case .taskUpdated(let id, let status):
             // no row of its own (the in-turn activity line covers a live task) —
             // but a patch saying "completed" settles a row that's already up
             if let status, Self.hasSettled(status), taskNoticeIndex(id) != nil {
                 armSweep(id)
             }
-        case .taskStarted, .backgroundTasksChanged:
+            settleAgent(id, status: status, summary: nil)
+        case .taskStarted(let id, let description, let subagentType, let taskType):
+            // the agents rail: one row per spawn, keyed on the task id the CLI
+            // threads through every later event
+            guard !id.isEmpty else { break }
+            // Only a spawn names a subagent type (or calls itself a local_agent);
+            // a long `grep` the CLI backgrounded arrives on this same channel and
+            // is not an agent, however much it looks like one from here.
+            let kind: SessionAgent.Kind =
+                (subagentType != nil || taskType == "local_agent") ? .agent : .command
+            if let index = agents.firstIndex(where: { $0.id == id }) {
+                agents[index].description = description ?? agents[index].description
+                agents[index].agentType = subagentType ?? agents[index].agentType
+                agents[index].kind = kind
+            } else {
+                agents.append(SessionAgent(id: id,
+                                           description: description ?? (kind == .agent ? "an agent" : "a command"),
+                                           kind: kind,
+                                           agentType: subagentType,
+                                           status: .running,
+                                           summary: nil))
+            }
+        case .backgroundTasksChanged:
             break
         case .permissionDenied(let tool, _):
             // normally silent: result.permission_denials carries the tally, and a
@@ -659,8 +699,16 @@ final class ClaudeSession: ObservableObject, Identifiable {
             }
         case .result(let r):
             finishTurn(r)
-        case .controlRequest(let id, let subtype, let toolName, let raw):
+        case .controlRequest(let id, let subtype, let toolName, let needsPerson, let raw):
             guard subtype == "can_use_tool" else { break }
+            // A tool that only a person can answer is a question, not a
+            // permission: same channel, different UI. If the payload doesn't
+            // decode into something choosable, it falls through to the broker
+            // rather than blocking forever on a card bob can't draw.
+            if needsPerson, let asked = SessionQuestion(rawJSON: raw, requestId: id) {
+                question = asked
+                return
+            }
             routeToBroker(requestId: id, toolName: toolName ?? "?", rawJSON: raw)
         case .controlResponse(let id, _):
             // the readiness handshake answered — the process is alive and
@@ -910,6 +958,51 @@ final class ClaudeSession: ObservableObject, Identifiable {
             guard let self else { return }
             let decision = await self.broker.decide(ask)
             self.answer(ask, decision)
+        }
+    }
+
+    /// Answer the question claude is blocked on. `choices` maps each question's
+    /// text to the labels picked for it; the CLI wants the original input echoed
+    /// back with those answers folded in, under an `allow`.
+    func answerQuestion(_ choices: [String: [String]]) {
+        guard let asked = question else { return }
+        writeLine([
+            "type": "control_response",
+            "response": [
+                "subtype": "success",
+                "request_id": asked.id,
+                "response": ["behavior": "allow",
+                             "updatedInput": asked.updatedInput(answers: choices)],
+            ],
+        ])
+        question = nil
+    }
+
+    /// Hand the decision back. Denying an AskUserQuestion doesn't kill the turn:
+    /// the model reads the message in place of an answer and carries on, which is
+    /// the closest thing to "you pick" that the protocol has.
+    func declineQuestion() {
+        guard let asked = question else { return }
+        writeLine([
+            "type": "control_response",
+            "response": [
+                "subtype": "success",
+                "request_id": asked.id,
+                "response": ["behavior": "deny",
+                             "message": "the owner didn't pick — use your own judgement and say what you chose"],
+            ],
+        ])
+        question = nil
+    }
+
+    /// Move an agent row to its ending. Unknown ids are ignored: a task that
+    /// never announced a start has no row to settle.
+    private func settleAgent(_ id: String, status: String?, summary: String?) {
+        guard let index = agents.firstIndex(where: { $0.id == id }) else { return }
+        let settled = SessionAgent.status(from: status)
+        if settled.isFinished { agents[index].status = settled }
+        if let summary, !summary.isEmpty {
+            agents[index].summary = summary.split(separator: "\n").first.map(String.init) ?? summary
         }
     }
 

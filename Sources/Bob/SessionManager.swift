@@ -422,6 +422,12 @@ final class SessionManager: ObservableObject {
         return last.isEmpty || last == "/" ? "session" : last
     }
 
+    /// Write the registry now. Callers that change a session's config out from
+    /// under the manager — `/resume` repointing a tab at a different conversation
+    /// — have to say so, or the next launch restores the old one and the resume
+    /// quietly never happened.
+    func persist() { save() }
+
     private func save() {
         guard let data = Self.encodeRecords(workSessions.map(record(for:))) else { return }
         try? FileManager.default.createDirectory(
