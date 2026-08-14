@@ -1,13 +1,92 @@
 import Foundation
-import CodeEditLanguages
 import SwiftTreeSitter
+import TreeSitterGrammars
 
 /// A language bob can highlight.
 ///
-/// An alias, not a wrapper: detection hands one of these back and the
-/// highlighter takes it straight, so no view has to import a grammar package or
-/// learn a second vocabulary for "this is Swift".
-typealias SyntaxLanguage = CodeLanguage
+/// bob's own type, deliberately, though nothing outside this file needs to know
+/// that: detection hands one of these back and the highlighter takes it straight,
+/// so no view imports a grammar package or learns a second vocabulary for "this
+/// is Swift".
+///
+/// It exists because the grammar package's equivalent resolves its parser through
+/// a single switch over all forty grammars it ships. Linking that switch
+/// references all forty C entry points, the linker duly pulls all forty parsers
+/// out of the static archive, and Bob.app weighs 101MB. A row here names exactly
+/// one entry point, so the archive gives up exactly one parser.
+struct SyntaxLanguage: Sendable {
+
+    /// Canonical name. Identity, cache key, and — by convention, not by rule —
+    /// the fence label a reader would type.
+    let id: String
+
+    /// Every fence spelling and file extension that resolves here. One flat set
+    /// per language instead of a second alias table: `ts`, `typescript` and
+    /// `app.ts` are the same question and deserve the same answer in one place.
+    let hints: Set<String>
+
+    /// Highlight queries to concatenate, as `<grammar directory>/<file>`,
+    /// **most specific first** — a query listing its precise rules before its
+    /// catch-alls is how tree-sitter expects to be read, and ``SyntaxHighlighter``
+    /// resolves ties in that order. TypeScript puts its own rules ahead of the
+    /// JavaScript ones it inherits; drop the inherited half and half the language
+    /// goes uncoloured.
+    let queries: [String]
+
+    /// The grammar's C entry point in the tree-sitter archive.
+    ///
+    /// Held as a function rather than a resolved pointer so the table stays a list
+    /// of literals, and so a grammar is only touched once something asks to
+    /// highlight in it.
+    let entry: @convention(c) () -> OpaquePointer?
+
+    /// The grammar, ready for a `Parser`.
+    var grammar: Language? { entry().map(Language.init(language:)) }
+}
+
+extension SyntaxLanguage: Hashable {
+
+    // Identity is the name. Two rows with the same `id` would be the same
+    // language, and `entry` — a function — has no equality worth speaking of.
+    static func == (lhs: SyntaxLanguage, rhs: SyntaxLanguage) -> Bool { lhs.id == rhs.id }
+
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+extension SyntaxLanguage {
+
+    /// Every language bob ships a parser for.
+    ///
+    /// **To add a language: add one row here.** That row is the only thing that
+    /// puts a parser in the binary — `Sources/TreeSitterGrammars/grammars.h`
+    /// already declares all forty entry points, and a declaration nobody
+    /// references costs nothing. Check the grammar's query directory name against
+    /// the package's `Resources/tree-sitter-*` folders; it isn't always the
+    /// obvious one (TSX highlights out of `tree-sitter-typescript`).
+    ///
+    /// Ten, because ten is what bob's transcripts and file viewer actually show.
+    /// Anything absent renders plain, which is a correct rendering of code bob
+    /// can't read.
+    static let all: [SyntaxLanguage] = [
+        .init(id: "swift",      hints: ["swift"],                                queries: ["swift/highlights"],                              entry: tree_sitter_swift),
+        .init(id: "typescript", hints: ["ts", "typescript", "cts", "mts"],       queries: ["typescript/highlights", "javascript/highlights"], entry: tree_sitter_typescript),
+        .init(id: "tsx",        hints: ["tsx"],                                  queries: ["typescript/highlights", "javascript/highlights"], entry: tree_sitter_tsx),
+        .init(id: "javascript", hints: ["js", "javascript", "cjs", "mjs"],       queries: ["javascript/highlights"],                         entry: tree_sitter_javascript),
+        .init(id: "python",     hints: ["py", "python", "python2", "python3"],   queries: ["python/highlights"],                             entry: tree_sitter_python),
+        .init(id: "json",       hints: ["json"],                                 queries: ["json/highlights"],                               entry: tree_sitter_json),
+        .init(id: "yaml",       hints: ["yml", "yaml"],                          queries: ["yaml/highlights"],                               entry: tree_sitter_yaml),
+        .init(id: "bash",       hints: ["sh", "bash", "shell", "zsh", "console"], queries: ["bash/highlights"],                              entry: tree_sitter_bash),
+        .init(id: "rust",       hints: ["rs", "rust"],                           queries: ["rust/highlights"],                               entry: tree_sitter_rust),
+        .init(id: "go",         hints: ["go", "golang"],                         queries: ["go/highlights"],                                 entry: tree_sitter_go)
+    ]
+
+    /// Every hint, resolved. Built once; a duplicate hint quietly keeps the first
+    /// row rather than trapping, because a table typo shouldn't take a running app
+    /// down over a code block.
+    static let byHint: [String: SyntaxLanguage] = Dictionary(
+        all.flatMap { language in language.hints.map { ($0, language) } },
+        uniquingKeysWith: { first, _ in first })
+}
 
 /// One painted role.
 ///
@@ -75,7 +154,7 @@ actor SyntaxHighlighter {
 
     private struct Key: Hashable {
         let content: Int
-        let language: TreeSitterLanguage
+        let language: String
     }
 
     /// Small on purpose. A reader looks at one file and a handful of fenced
@@ -85,9 +164,9 @@ actor SyntaxHighlighter {
     private var cache: [Key: [SyntaxSpan]] = [:]
     private var recency: [Key] = []      // oldest first
 
-    /// Compiled queries, kept for the life of the process. There are only ~40 of
+    /// Compiled queries, kept for the life of the process. There are only ten of
     /// them and compiling one is far dearer than parsing a small file.
-    private var queries: [TreeSitterLanguage: Query] = [:]
+    private var queries: [String: Query] = [:]
 
     /// Spans for `source` read as `language`. Cached — calling this on every
     /// frame of a streaming transcript costs one parse, not one per frame.
@@ -112,7 +191,7 @@ actor SyntaxHighlighter {
     private func parse(_ source: String, _ language: SyntaxLanguage) -> [SyntaxSpan] {
         // No grammar or no highlight query means no opinion — plain text is a
         // correct rendering of code bob can't read.
-        guard let grammar = language.language,
+        guard let grammar = language.grammar,
               let query = query(for: language, grammar: grammar) else { return [] }
 
         let parser = Parser()
@@ -141,23 +220,18 @@ actor SyntaxHighlighter {
     ///
     /// The second reason is that the package concatenates `folds`, `indents`,
     /// `locals` and `tags` into the highlight query. Those aren't colour queries;
-    /// their captures describe folding and scope. Only `highlights*` files count.
+    /// their captures describe folding and scope. Only `highlights*` files count,
+    /// which is why ``SyntaxLanguage/queries`` names them one by one.
+    ///
+    /// A missing or uncompilable file is not an error worth reporting: the
+    /// language simply goes unpainted.
     private func query(for language: SyntaxLanguage, grammar: Language) -> Query? {
         if let cached = queries[language.id] { return cached }
         guard let root = Self.queryRoot else { return nil }
 
-        var urls = [Self.scm(root, language.tsName, "highlights")]
-        // e.g. JSX ships `highlights-jsx.scm` alongside its main query.
-        for extra in language.additionalHighlights ?? [] where extra.hasPrefix("highlights") {
-            urls.append(Self.scm(root, language.tsName, extra))
-        }
-        // TypeScript inherits JavaScript's query, TSX inherits JSX's, C++ inherits
-        // C's. Without the parent, half the language goes uncoloured.
-        if let parent = language.parentQueryURL.flatMap(Self.grammarName) {
-            urls.append(Self.scm(root, parent, "highlights"))
-        }
-
-        let source = urls.compactMap { try? String(contentsOf: $0, encoding: .utf8) }
+        let source = language.queries
+            .map { Self.scm(root, $0) }
+            .compactMap { try? String(contentsOf: $0, encoding: .utf8) }
             .joined(separator: "\n")
         guard !source.isEmpty,
               let compiled = try? Query(language: grammar, data: Data(source.utf8)) else { return nil }
@@ -169,7 +243,7 @@ actor SyntaxHighlighter {
     /// The directory holding the `tree-sitter-*` query folders, wherever the
     /// grammar bundle ended up — `.build` during development, `Bob.app`'s
     /// resources once bundled.
-    private static let queryRoot: URL? = {
+    static let queryRoot: URL? = {
         let bundleName = "CodeEditLanguages_CodeEditLanguages.bundle"
         let roots = [Bundle.main.resourceURL,
                      Bundle.main.bundleURL,
@@ -180,23 +254,19 @@ actor SyntaxHighlighter {
             // Xcode nests one deeper than the SPM command-line layout does.
             for inner in ["Resources", "Contents/Resources/Resources", "Contents/Resources", ""] {
                 let candidate = inner.isEmpty ? bundle : bundle.appendingPathComponent(inner)
-                let sentinel = scm(candidate, "swift", "highlights")
+                let sentinel = scm(candidate, "swift/highlights")
                 if FileManager.default.fileExists(atPath: sentinel.path) { return candidate }
             }
         }
         return nil
     }()
 
-    private static func scm(_ root: URL, _ grammar: String, _ file: String) -> URL {
-        root.appendingPathComponent("tree-sitter-\(grammar)", isDirectory: true)
-            .appendingPathComponent("\(file).scm")
-    }
-
-    /// Recover a grammar's directory name from one of the package's own query
-    /// URLs — the only way it exposes which language a language inherits from.
-    private static func grammarName(from url: URL) -> String? {
-        url.pathComponents.last { $0.hasPrefix("tree-sitter-") }
-            .map { String($0.dropFirst("tree-sitter-".count)) }
+    /// A `<grammar directory>/<file>` query name, resolved inside the bundle.
+    static func scm(_ root: URL, _ query: String) -> URL {
+        let parts = query.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return root }
+        return root.appendingPathComponent("tree-sitter-\(parts[0])", isDirectory: true)
+            .appendingPathComponent("\(parts[1]).scm")
     }
 
     /// Resolve tree-sitter's overlapping captures into a flat, ordered list.
@@ -256,8 +326,10 @@ extension SyntaxHighlighter {
     /// fence info string — the three ways bob ever learns what it's looking at.
     ///
     /// One function and one table, because `"ts"`, `"typescript"` and
-    /// `"src/app.ts"` all deserve the same answer. Returns `nil` for anything
-    /// without a grammar, which callers should read as "render this plainly".
+    /// `"src/app.ts"` all deserve the same answer. Returns `nil` for anything bob
+    /// has no parser for, which callers should read as "render this plainly" —
+    /// and that covers `txt`, `log`, `text` and a bare fence for free, without a
+    /// list of things not to colour.
     static func language(for hint: String) -> SyntaxLanguage? {
         // Fence info strings carry extras: ```swift title="Foo.swift"
         guard var token = hint.lowercased()
@@ -270,26 +342,6 @@ extension SyntaxHighlighter {
             token = String(token[token.index(after: dot)...])
         }
 
-        if let alias = aliases[token] { token = alias }
-        guard !plainHints.contains(token) else { return nil }
-
-        // Extensions before grammar names, and not just as a preference. Two
-        // entries share the grammar name "typescript" — the TSX one is listed
-        // first — so matching on name would hand every plain `.ts` file the JSX
-        // grammar, which reads `<T>` as a tag instead of a type. The extension
-        // is the only unambiguous key.
-        return CodeLanguage.allLanguages.first { $0.extensions.contains(token) }
-            ?? CodeLanguage.allLanguages.first { $0.tsName == token }
+        return SyntaxLanguage.byHint[token]
     }
-
-    /// Fence spellings the package's own tables don't resolve correctly.
-    /// Everything else ("ts", "py", "json", "bash", "c++") they already cover.
-    private static let aliases: [String: String] = [
-        "typescript": "ts", "javascript": "js",
-        "shell": "bash", "zsh": "bash", "console": "bash",
-        "golang": "go", "c#": "cs", "csharp": "cs", "objective-c": "m"
-    ]
-
-    /// Fences that explicitly mean "don't colour this".
-    private static let plainHints: Set<String> = ["", "text", "txt", "plain", "plaintext", "log", "output"]
 }
