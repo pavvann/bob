@@ -108,8 +108,12 @@ struct BranchChip: View {
     }
 }
 
-/// What this session has running. Finished rows linger with their one-line
-/// outcome instead of vanishing, so a glance still tells you how it went.
+/// What this session has running — spawned agents and the shell commands the CLI
+/// moved to the background, which are both real work and were previously shown
+/// as the same thing. The glyph says which it is (a chip for an agent, a prompt
+/// for a command) and its colour says how it's going: green working, grey done,
+/// red stopped badly. Finished rows linger with their one-line outcome instead
+/// of vanishing, so a glance still tells you how it went.
 struct AgentRows: View {
     let agents: [SessionAgent]
 
@@ -118,9 +122,31 @@ struct AgentRows: View {
     private var working: [SessionAgent] { agents.filter { $0.status == .running } }
     private var finished: [SessionAgent] { agents.filter { $0.status != .running } }
 
+    /// Says what is actually running, since "2 working" reads very differently
+    /// when one of them is a grep.
+    private var header: String {
+        guard !working.isEmpty else { return "nothing running" }
+        let agentCount = working.filter { $0.kind == .agent }.count
+        let commandCount = working.count - agentCount
+        switch (agentCount, commandCount) {
+        case (let a, 0): return "\(a) agent\(a == 1 ? "" : "s") working"
+        case (0, let c): return "\(c) command\(c == 1 ? "" : "s") running"
+        case (let a, let c): return "\(a) agent\(a == 1 ? "" : "s"), \(c) command\(c == 1 ? "" : "s")"
+        }
+    }
+
+    /// Green working, grey done, red stopped badly.
+    static func tint(for status: SessionAgent.Status) -> Color {
+        switch status {
+        case .running: return .green.opacity(0.85)
+        case .done:    return .secondary.opacity(0.45)
+        case .failed:  return .red.opacity(0.8)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text(working.isEmpty ? "nothing running" : "\(working.count) working")
+            Text(header)
                 .font(.system(size: 10.5, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary.opacity(0.5))
 
@@ -163,25 +189,27 @@ struct AgentRows: View {
     }
 
     private func row(_ agent: SessionAgent) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Circle()
-                .fill(agent.status == .running ? Color.accentColor.opacity(0.75)
-                      : agent.status == .failed ? Color.orange.opacity(0.8)
-                      : Color.secondary.opacity(0.4))
-                .frame(width: 6, height: 6)
-                .padding(.top, 4)
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: agent.kind.symbol)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Self.tint(for: agent.status))
+                .frame(width: 12)
+                .padding(.top, 2)
             VStack(alignment: .leading, spacing: 1) {
                 Text(agent.description)
                     .font(.system(size: 12.5, weight: .medium, design: .rounded))
                     .foregroundStyle(.primary.opacity(agent.status == .running ? 0.85 : 0.6))
                     .lineLimit(2)
+                    // without this a row with a caption under it gets squeezed to
+                    // one line and the description dies in an ellipsis
+                    .fixedSize(horizontal: false, vertical: true)
                 if let summary = agent.summary, agent.status.isFinished {
                     Text(summary)
                         .font(.system(size: 10.5, weight: .regular, design: .rounded))
                         .foregroundStyle(.secondary.opacity(0.5))
                         .lineLimit(2)
-                } else if let kind = agent.kind, agent.status == .running {
-                    Text(kind)
+                } else if let type = agent.agentType, agent.status == .running {
+                    Text(type)
                         .font(.system(size: 10.5, weight: .regular, design: .rounded))
                         .foregroundStyle(.secondary.opacity(0.45))
                         .lineLimit(1)

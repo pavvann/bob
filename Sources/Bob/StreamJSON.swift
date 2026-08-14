@@ -60,7 +60,7 @@ enum StreamEvent: Equatable, Sendable {
     case assistant([AssistantBlock])
     /// `user` carrying tool_result blocks — a tool finished.
     case toolResult(isError: Bool)
-    case taskStarted(id: String, description: String?, subagentType: String?)
+    case taskStarted(id: String, description: String?, subagentType: String?, taskType: String?)
     case taskUpdated(id: String, status: String?)
     /// the between-turn doorbell (probe 1.2): a background task finished and
     /// a spontaneous model turn follows with no stdin input.
@@ -168,7 +168,8 @@ enum StreamJSON {
             return .taskStarted(
                 id: (obj["task_id"] as? String) ?? "",
                 description: obj["description"] as? String,
-                subagentType: obj["subagent_type"] as? String
+                subagentType: obj["subagent_type"] as? String,
+                taskType: obj["task_type"] as? String
             )
         case "task_updated":
             return .taskUpdated(

@@ -667,17 +667,24 @@ final class ClaudeSession: ObservableObject, Identifiable {
                 armSweep(id)
             }
             settleAgent(id, status: status, summary: nil)
-        case .taskStarted(let id, let description, let kind):
+        case .taskStarted(let id, let description, let subagentType, let taskType):
             // the agents rail: one row per spawn, keyed on the task id the CLI
             // threads through every later event
             guard !id.isEmpty else { break }
+            // Only a spawn names a subagent type (or calls itself a local_agent);
+            // a long `grep` the CLI backgrounded arrives on this same channel and
+            // is not an agent, however much it looks like one from here.
+            let kind: SessionAgent.Kind =
+                (subagentType != nil || taskType == "local_agent") ? .agent : .command
             if let index = agents.firstIndex(where: { $0.id == id }) {
                 agents[index].description = description ?? agents[index].description
-                agents[index].kind = kind ?? agents[index].kind
+                agents[index].agentType = subagentType ?? agents[index].agentType
+                agents[index].kind = kind
             } else {
                 agents.append(SessionAgent(id: id,
-                                           description: description ?? "an agent",
+                                           description: description ?? (kind == .agent ? "an agent" : "a command"),
                                            kind: kind,
+                                           agentType: subagentType,
                                            status: .running,
                                            summary: nil))
             }

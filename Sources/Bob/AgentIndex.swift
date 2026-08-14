@@ -62,7 +62,8 @@ enum AgentIndex {
 
         return SessionAgent(id: id,
                             description: description,
-                            kind: kind,
+                            kind: .agent,          // the subagents/ directory holds nothing else
+                            agentType: kind,
                             status: status,
                             summary: status == .done ? ending.lastText : nil)
     }

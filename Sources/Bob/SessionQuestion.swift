@@ -86,13 +86,28 @@ struct SessionQuestion: Identifiable, Equatable {
     }
 }
 
-/// One agent this session has running. The CLI calls the spawn tool `Agent`
-/// (not `Task`), launches it asynchronously, and threads a single `task_id`
-/// through every lifecycle event — that id is what a row is keyed on.
+/// One thing this session has set running. The CLI reports two kinds down the
+/// same channel and threads a single `task_id` through every lifecycle event —
+/// that id is what a row is keyed on.
+///
+/// Both kinds belong on screen: a backgrounded `grep` is real work the session
+/// is waiting on. What went wrong before was showing one as the other, so the
+/// glyph says which it is and its colour says how it's going.
 struct SessionAgent: Identifiable, Equatable {
+    /// A spawned subagent, or a shell command the CLI moved to the background.
+    enum Kind: Equatable {
+        case agent
+        case command
+
+        /// No `robot` in SF Symbols on macOS 14 — a chip reads as a worker, and
+        /// both glyphs stay legible at 10pt, which is what matters here.
+        var symbol: String { self == .agent ? "cpu" : "terminal" }
+    }
+
     let id: String
     var description: String
-    var kind: String?          // subagent_type, when the CLI names one
+    var kind: Kind
+    var agentType: String?     // subagent_type, when the CLI names one
     var status: Status
     var summary: String?
 
