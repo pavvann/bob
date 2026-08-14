@@ -296,17 +296,7 @@ struct MarkdownText: View {
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(.secondary.opacity(0.5))
                 }
-                // Wrapped, not side-scrolled. A horizontal ScrollView here is
-                // greedy in both axes — it grows to whatever height is spare —
-                // and its contents can't be verified offscreen, so long lines
-                // fold instead. Monospace keeps them readable either way.
-                Text(body)
-                    .font(.system(size: size - 2, design: .monospaced))
-                    .foregroundStyle(.primary.opacity(0.88))
-                    .textSelection(.enabled)
-                    .lineSpacing(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
+                CodeBlock(source: body, language: language, size: size - 2)
             }
             .padding(.horizontal, 11)
             .padding(.vertical, 9)
@@ -358,6 +348,53 @@ struct MarkdownText: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.leading, CGFloat(item.depth) * 16)
+    }
+}
+
+/// The body of a fenced block, coloured once it stops moving.
+///
+/// Wrapped, not side-scrolled. A horizontal ScrollView here is greedy in both
+/// axes — it grows to whatever height is spare — and its contents can't be
+/// verified offscreen, so long lines fold instead. Monospace keeps them readable
+/// either way.
+///
+/// Highlighting is async and a `body` is not, so the coloured version arrives
+/// through state: plain monospace shows first, and stays for good when the fence
+/// names a language bob has no grammar for. No spinner, nothing moves.
+///
+/// The wait is the streaming case. A fence inside a reply still arriving changes
+/// on every token, and the highlighter's cache is keyed by content, so every
+/// intermediate draft is a miss — parsing each one would parse the same block
+/// fifty times as it grows. Waiting for the fence to go quiet parses it once.
+private struct CodeBlock: View {
+    let source: String
+    let language: String?
+    let size: CGFloat
+
+    @State private var painted: AttributedString?
+
+    /// Long enough to sit out a stream of tokens, short enough that a finished
+    /// reply colours before you've finished reading its first line.
+    private static let quiet = Duration.milliseconds(150)
+
+    var body: some View {
+        (painted.map(Text.init) ?? Text(source))
+            .font(.system(size: size, design: .monospaced))
+            .foregroundStyle(SyntaxTheme.plain)
+            .textSelection(.enabled)
+            .lineSpacing(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .task(id: source) {
+                // Whatever was painted belongs to a shorter draft of this fence.
+                if painted != nil { painted = nil }
+                guard let language = language.flatMap(SyntaxHighlighter.language) else { return }
+                try? await Task.sleep(for: Self.quiet)
+                guard !Task.isCancelled else { return }   // another token landed
+                painted = AttributedString(
+                    painting: source,
+                    spans: await SyntaxHighlighter.shared.spans(for: source, language: language))
+            }
     }
 }
 
