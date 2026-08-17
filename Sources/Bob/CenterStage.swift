@@ -180,47 +180,68 @@ struct CenterStage: View {
             .frame(maxWidth: .infinity)
             .transition(.opacity.combined(with: .scale(scale: 0.98)))
         } else {
+            let inFlightID = self.inFlightID   // once per body, not once per row
             ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        ForEach(bridge.turns) { turn in
-                            TurnRowView(
-                                kind: turn.kind,
-                                text: turn.text,
-                                activity: turn.activity,
-                                streaming: bridge.isStreaming,
-                                inFlight: isInFlight(turn)
-                            )
+                GeometryReader { geo in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 18) {
+                            ForEach(bridge.turns) { turn in
+                                TurnRowView(
+                                    kind: turn.kind,
+                                    text: turn.text,
+                                    activity: turn.activity,
+                                    // scoped to the in-flight row: handing every
+                                    // row the global streaming bool re-rendered
+                                    // (and re-parsed) the whole thread per toggle
+                                    inFlight: turn.id == inFlightID
+                                )
+                            }
+                            Color.clear.frame(height: 1).id("end")
                         }
-                        Color.clear.frame(height: 1).id("end")
+                        .padding(.vertical, 4)
+                        // a short thread bottom-aligns by LAYOUT: with less
+                        // content than viewport there is no scroll range for
+                        // scrollTo to work with, and a second offset owner
+                        // (defaultScrollAnchor) is what caused the CPU storm
+                        .frame(minHeight: geo.size.height, alignment: .bottom)
+                        // task notices are live status — they sweep themselves once
+                        // the task settles. Keyed on just the notice rows so their
+                        // arrival and departure fade while ordinary turns keep
+                        // landing instantly.
+                        .animation(.easeInOut(duration: 0.3), value: noticeRows)
                     }
-                    .padding(.vertical, 4)
-                    // task notices are live status — they sweep themselves once
-                    // the task settles. Keyed on just the notice rows so their
-                    // arrival and departure fade while ordinary turns keep
-                    // landing instantly.
-                    .animation(.easeInOut(duration: 0.3), value: noticeRows)
+                    .scrollIndicators(.never)
+                    .onAppear {
+                        // a restored thread should open reading its newest turn
+                        proxy.scrollTo("end", anchor: .bottom)
+                    }
+                    .onChange(of: bridge.turns) { _, _ in
+                        // not animated: this fires per streamed delta, and an
+                        // animated scroll restarted 30×/sec is pure churn
+                        proxy.scrollTo("end", anchor: .bottom)
+                    }
                 }
                 // takes whatever height the window offers, up to this — tall
                 // enough that a real conversation reads like a thread instead of
-                // a letterbox. Bottom-anchored, so the newest turn always sits
-                // right above the input bar however short the exchange is.
+                // a letterbox. Bottom-anchoring is manual (the layout frame
+                // above + onAppear/onChange scrollTo): stacking
+                // .defaultScrollAnchor(.bottom) on top of the scrollTo gave the
+                // scroll view two owners of its offset, and every
+                // content-height change had them re-pinning each other per
+                // frame — the idle-transcript CPU storm.
                 .frame(maxHeight: 520)
-                .defaultScrollAnchor(.bottom)
-                .scrollIndicators(.never)
-                .onChange(of: bridge.turns) { _, _ in
-                    // not animated: this fires per streamed delta, and an
-                    // animated scroll restarted 30×/sec is pure churn
-                    proxy.scrollTo("end", anchor: .bottom)
-                }
             }
             .transition(.opacity)
         }
     }
 
-    /// The turn bob is speaking into right now — the last one, while streaming.
-    private func isInFlight(_ turn: ClaudeBridge.Turn) -> Bool {
-        bridge.isStreaming && bridge.turns.last?.id == turn.id
+    /// The turn bob is speaking into right now — the newest .bob row, while
+    /// streaming. Not "the last row": send() echoes the queued .you entry
+    /// immediately, and a task notice can land mid-reply — neither may steal
+    /// the thinking orb from a still-empty reply.
+    private var inFlightID: UUID? {
+        guard bridge.isStreaming else { return nil }
+        return bridge.turns.last(where: { $0.kind == .bob })?.id
     }
 
     // MARK: surfaces (notes, canvas)
@@ -653,9 +674,10 @@ private struct TurnRowView: View {
     let kind: ClaudeBridge.Turn.Kind
     let text: String
     let activity: String?
-    /// The session is streaming — an empty reply shows the thinking orb.
-    let streaming: Bool
-    /// This is the turn being spoken into right now (holds the activity slot).
+    /// This is the turn being spoken into right now: it holds the activity
+    /// slot, and while its reply is still empty it shows the thinking orb.
+    /// Only ever true for the last row — historical rows must receive a
+    /// constant here, or every streaming toggle re-renders the whole thread.
     let inFlight: Bool
 
     var body: some View {
@@ -671,7 +693,7 @@ private struct TurnRowView: View {
             }
         case .bob:
             VStack(alignment: .leading, spacing: 5) {
-                if text.isEmpty && streaming {
+                if text.isEmpty && inFlight {
                     // a quiet breathing dot where the reply will appear
                     ThinkingOrb()
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -784,31 +806,45 @@ private struct WorkStage: View {
             .transition(.opacity.combined(with: .scale(scale: 0.98)))
         } else {
             let rows = entries   // filter once, not once per row
+            // the newest bob entry, while streaming — not "the last row", see
+            // the companion thread's inFlightID
+            let inFlightID = session.isStreaming
+                ? rows.last(where: { kind(of: $0) == .bob })?.id
+                : nil
             VStack(alignment: .leading, spacing: 8) {
                 header
                 ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 18) {
-                            ForEach(rows) { entry in
-                                TurnRowView(
-                                    kind: kind(of: entry),
-                                    text: entry.text,
-                                    activity: entry.activity,
-                                    streaming: session.isStreaming,
-                                    inFlight: session.isStreaming && rows.last?.id == entry.id
-                                )
+                    GeometryReader { geo in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 18) {
+                                ForEach(rows) { entry in
+                                    TurnRowView(
+                                        kind: kind(of: entry),
+                                        text: entry.text,
+                                        activity: entry.activity,
+                                        // scoped like the companion thread's rows
+                                        inFlight: entry.id == inFlightID
+                                    )
+                                }
+                                Color.clear.frame(height: 1).id("end")
                             }
-                            Color.clear.frame(height: 1).id("end")
+                            .padding(.vertical, 4)
+                            // a short thread bottom-aligns by layout — see the
+                            // companion thread's note
+                            .frame(minHeight: geo.size.height, alignment: .bottom)
                         }
-                        .padding(.vertical, 4)
+                        .scrollIndicators(.never)
+                        .onAppear {
+                            // manual bottom-follow, same as the companion thread —
+                            // see the storm note there before re-adding an anchor
+                            proxy.scrollTo("end", anchor: .bottom)
+                        }
+                        .onChange(of: rows) { _, _ in
+                            // not animated — see the companion thread's onChange
+                            proxy.scrollTo("end", anchor: .bottom)
+                        }
                     }
                     .frame(maxHeight: 500)
-                    .defaultScrollAnchor(.bottom)
-                    .scrollIndicators(.never)
-                    .onChange(of: rows) { _, _ in
-                        // not animated — see the companion thread's onChange
-                        proxy.scrollTo("end", anchor: .bottom)
-                    }
                 }
             }
             .transition(.opacity)
