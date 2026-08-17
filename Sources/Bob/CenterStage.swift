@@ -613,12 +613,14 @@ struct CenterStage: View {
     }
 }
 
-/// The idle greeting's breath — one repeatForever scale/opacity animation that
-/// Core Animation composites on its own. Its predecessor was a display-rate
-/// TimelineView re-laying-out 38pt text 120 times a second, precisely while
-/// bob was doing nothing. The autoreversing ease stands in for the old sine;
-/// the caller keys this view's identity on `period`, so a tempo change lands
-/// as one clean restart.
+/// The idle greeting's breath — a few settling breaths, then stillness. It
+/// must not breathe forever: any SwiftUI-driven animation pumps a view-graph
+/// transaction per frame, and each transaction re-runs layout for the whole
+/// window — profiled at a full core once a transcript was on stage. So the
+/// rule every idle flourish follows: ease in, breathe briefly, hold. The odd
+/// repeat count ends the reversing ease exactly on the model value, so the
+/// freeze lands without a snap; the caller keys this view's identity on
+/// `period`, so a tempo change replays the settling breaths once.
 private struct BreathingGreeting: View {
     let text: String
     /// Full breath cycle in seconds (`BobPulse.breathPeriod`).
@@ -633,7 +635,7 @@ private struct BreathingGreeting: View {
             .scaleEffect(inhale ? 1.012 : 0.988)
             .opacity(inhale ? 1.0 : 0.84)
             .onAppear {
-                withAnimation(.easeInOut(duration: period / 2).repeatForever(autoreverses: true)) {
+                withAnimation(.easeInOut(duration: period / 2).repeatCount(5, autoreverses: true)) {
                     inhale = true
                 }
             }
