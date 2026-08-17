@@ -620,6 +620,12 @@ final class ClaudeBridge: ObservableObject {
     /// be read from background contexts (minion spawn, open-line generation).
     nonisolated static let claudePath: String = {
         let fm = FileManager.default
+        // BOB_CLAUDE_BIN: the bench harness (bench/run.sh) points every claude
+        // spawn at a deterministic stand-in. Real installs never set it.
+        if let override = ProcessInfo.processInfo.environment["BOB_CLAUDE_BIN"],
+           fm.isExecutableFile(atPath: override) {
+            return override
+        }
         let candidates = [
             "\(NSHomeDirectory())/.local/bin/claude",
             "/opt/homebrew/bin/claude",

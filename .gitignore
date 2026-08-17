@@ -17,6 +17,9 @@ DerivedData/
 # Built app bundle (output of `make app`)
 Bob.app/
 
+# bench profiles — big and noisy; the .md results are committed
+bench/results/*.sample.txt
+
 # Xcode (if anyone opens this in Xcode)
 *.xcodeproj/
 *.xcworkspace/
