@@ -6,31 +6,47 @@ import Foundation
 /// break at arbitrary byte offsets — mid-line, mid-codepoint — so bytes
 /// accumulate here and only whole lines come out; the partial tail waits for
 /// the next read. UTF-8 boundary safety falls out for free: a whole line is
-/// always codepoint-complete. A defensive cap drops any line past 4MB (init
-/// lines run ~10KB; megabytes mean something upstream broke) rather than
-/// buffering forever — callers watch `droppedLines` and log.
+/// always codepoint-complete. Consumption is a read cursor and ONE compaction
+/// per consume() — never a front-removal per line, which went quadratic on a
+/// bursty chunk. A defensive cap drops any line past 4MB (init lines run
+/// ~10KB; megabytes mean something upstream broke) whether it arrives in
+/// pieces or already newline-complete — callers watch `droppedLines` and log.
 struct LineFramer {
     static let maxLineBytes = 4 * 1024 * 1024
 
     private var buffer = Data()
+    /// Bytes already searched for a newline — a line arriving in many chunks
+    /// is still scanned once.
+    private var scanned = 0
     private var discardingOversized = false
     private(set) var droppedLines = 0
 
     mutating func consume(_ chunk: Data) -> [String] {
         buffer.append(chunk)
         var lines: [String] = []
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            let raw = buffer.subdata(in: buffer.startIndex..<newline)
-            buffer.removeSubrange(buffer.startIndex...newline)
+        var lineStart = buffer.startIndex
+        var searchFrom = buffer.index(buffer.startIndex, offsetBy: scanned)
+        while let newline = buffer[searchFrom...].firstIndex(of: 0x0A) {
+            let raw = buffer.subdata(in: lineStart..<newline)
+            searchFrom = buffer.index(after: newline)
+            lineStart = searchFrom
             if discardingOversized {
                 // the tail of a line whose head was already dropped
                 discardingOversized = false
                 droppedLines += 1
                 continue
             }
+            if raw.count > Self.maxLineBytes {
+                // oversized but complete in one buffer — the cap still holds
+                droppedLines += 1
+                continue
+            }
             guard !raw.isEmpty, var line = String(data: raw, encoding: .utf8) else { continue }
             if line.hasSuffix("\r") { line.removeLast() }
             if !line.isEmpty { lines.append(line) }
+        }
+        if lineStart > buffer.startIndex {
+            buffer.removeSubrange(buffer.startIndex..<lineStart)
         }
         if discardingOversized {
             // still inside the oversized line — everything buffered is part of it
@@ -39,6 +55,7 @@ struct LineFramer {
             buffer.removeAll(keepingCapacity: false)
             discardingOversized = true
         }
+        scanned = buffer.count
         return lines
     }
 }
