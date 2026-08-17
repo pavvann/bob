@@ -209,9 +209,9 @@ struct CenterStage: View {
                 .defaultScrollAnchor(.bottom)
                 .scrollIndicators(.never)
                 .onChange(of: bridge.turns) { _, _ in
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo("end", anchor: .bottom)
-                    }
+                    // not animated: this fires per streamed delta, and an
+                    // animated scroll restarted 30×/sec is pure churn
+                    proxy.scrollTo("end", anchor: .bottom)
                 }
             }
             .transition(.opacity)
@@ -804,9 +804,8 @@ private struct WorkStage: View {
                     .defaultScrollAnchor(.bottom)
                     .scrollIndicators(.never)
                     .onChange(of: rows) { _, _ in
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo("end", anchor: .bottom)
-                        }
+                        // not animated — see the companion thread's onChange
+                        proxy.scrollTo("end", anchor: .bottom)
                     }
                 }
             }
