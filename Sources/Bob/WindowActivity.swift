@@ -18,6 +18,13 @@ final class WindowActivity {
 
     nonisolated init() {}
 
+    deinit {
+        // NotificationCenter holds block tokens until they're removed — without
+        // this, every discarded panel leaves its three observers behind for the
+        // app's lifetime.
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+
     func bind(to window: NSWindow) {
         guard window !== self.window else { return }
         self.window = window
