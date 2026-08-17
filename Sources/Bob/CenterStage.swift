@@ -188,7 +188,9 @@ struct CenterStage: View {
                                 kind: turn.kind,
                                 text: turn.text,
                                 activity: turn.activity,
-                                streaming: bridge.isStreaming,
+                                // scoped to the in-flight row: handing every
+                                // row the global streaming bool re-rendered
+                                // (and re-parsed) the whole thread per toggle
                                 inFlight: isInFlight(turn)
                             )
                         }
@@ -203,11 +205,17 @@ struct CenterStage: View {
                 }
                 // takes whatever height the window offers, up to this — tall
                 // enough that a real conversation reads like a thread instead of
-                // a letterbox. Bottom-anchored, so the newest turn always sits
-                // right above the input bar however short the exchange is.
+                // a letterbox. Bottom-anchoring is manual (onAppear + onChange
+                // scrollTo): stacking .defaultScrollAnchor(.bottom) on top of
+                // the scrollTo gave the scroll view two owners of its offset,
+                // and every content-height change had them re-pinning each
+                // other per frame — the idle-transcript CPU storm.
                 .frame(maxHeight: 520)
-                .defaultScrollAnchor(.bottom)
                 .scrollIndicators(.never)
+                .onAppear {
+                    // a restored thread should open reading its newest turn
+                    proxy.scrollTo("end", anchor: .bottom)
+                }
                 .onChange(of: bridge.turns) { _, _ in
                     // not animated: this fires per streamed delta, and an
                     // animated scroll restarted 30×/sec is pure churn
@@ -653,9 +661,10 @@ private struct TurnRowView: View {
     let kind: ClaudeBridge.Turn.Kind
     let text: String
     let activity: String?
-    /// The session is streaming — an empty reply shows the thinking orb.
-    let streaming: Bool
-    /// This is the turn being spoken into right now (holds the activity slot).
+    /// This is the turn being spoken into right now: it holds the activity
+    /// slot, and while its reply is still empty it shows the thinking orb.
+    /// Only ever true for the last row — historical rows must receive a
+    /// constant here, or every streaming toggle re-renders the whole thread.
     let inFlight: Bool
 
     var body: some View {
@@ -671,7 +680,7 @@ private struct TurnRowView: View {
             }
         case .bob:
             VStack(alignment: .leading, spacing: 5) {
-                if text.isEmpty && streaming {
+                if text.isEmpty && inFlight {
                     // a quiet breathing dot where the reply will appear
                     ThinkingOrb()
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -794,7 +803,7 @@ private struct WorkStage: View {
                                     kind: kind(of: entry),
                                     text: entry.text,
                                     activity: entry.activity,
-                                    streaming: session.isStreaming,
+                                    // scoped like the companion thread's rows
                                     inFlight: session.isStreaming && rows.last?.id == entry.id
                                 )
                             }
@@ -803,8 +812,12 @@ private struct WorkStage: View {
                         .padding(.vertical, 4)
                     }
                     .frame(maxHeight: 500)
-                    .defaultScrollAnchor(.bottom)
                     .scrollIndicators(.never)
+                    .onAppear {
+                        // manual bottom-follow, same as the companion thread —
+                        // see the storm note there before re-adding an anchor
+                        proxy.scrollTo("end", anchor: .bottom)
+                    }
                     .onChange(of: rows) { _, _ in
                         // not animated — see the companion thread's onChange
                         proxy.scrollTo("end", anchor: .bottom)
