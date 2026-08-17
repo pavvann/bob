@@ -121,7 +121,13 @@ final class SessionPanelController: NSObject {
         panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.minSize = NSSize(width: 340, height: 320)
         panel.delegate = self
-        panel.contentView = NSHostingView(rootView: SessionPanelView(model: model))
+        // the panel's own visibility, not the main window's — its pulse dots
+        // pause with it alone
+        let activity = WindowActivity()
+        activity.bind(to: panel)
+        panel.contentView = NSHostingView(
+            rootView: SessionPanelView(model: model).environment(\.windowActivity, activity)
+        )
         place(panel)
         return panel
     }

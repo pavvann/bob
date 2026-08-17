@@ -838,9 +838,12 @@ struct ParkedDisclosure: View {
     }
 }
 
-/// The little breathing dot that means "alive right now".
+/// The little breathing dot that means "alive right now" — unless nobody's
+/// looking: a repeatForever keeps the render loop hot even in an occluded
+/// window, so the beat stops with the window's visibility.
 struct PulseDot: View {
     let color: Color
+    @Environment(\.windowActivity) private var activity
     @State private var pulse = false
 
     var body: some View {
@@ -849,10 +852,20 @@ struct PulseDot: View {
             .frame(width: 7, height: 7)
             .scaleEffect(pulse ? 1.0 : 0.5)
             .opacity(pulse ? 1.0 : 0.4)
-            .onAppear {
-                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
-                    pulse = true
+            .onAppear { if activity.isVisible { beat() } }
+            .onChange(of: activity.isVisible) { _, visible in
+                if visible {
+                    beat()
+                } else {
+                    // a plain finite write is what replaces the repeatForever
+                    withAnimation(.easeOut(duration: 0.2)) { pulse = false }
                 }
             }
+    }
+
+    private func beat() {
+        withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+            pulse = true
+        }
     }
 }
