@@ -54,6 +54,9 @@ final class UsageMeter: ObservableObject {
     /// One request at a time — activation and the loop can land together, and
     /// two fetches would only race to publish the same snapshot.
     private var fetching = false
+    /// A trigger that arrived while `fetching` was true. The in-flight request
+    /// may predate whatever it was telling us about, so it owes one more pass.
+    private var pendingRefresh = false
     private var lastNudge: Date = .distantPast
 
     private init() {
@@ -111,11 +114,31 @@ final class UsageMeter: ObservableObject {
     /// Ask the endpoint. Everything expensive — reading the credential, the
     /// request, the JSON — happens off the main actor in `fetch()`; what crosses
     /// back is one ==-guarded publish.
+    ///
+    /// Single-flight, but never at the cost of dropping a trigger: a request
+    /// already in the air may have LEFT before whatever moved the numbers, so
+    /// its answer cannot be allowed to stand as the last word. A trigger that
+    /// lands mid-flight is remembered and runs one more pass the moment this one
+    /// finishes — sequentially, so there are still never two requests out at
+    /// once. Without this, a nudge arriving during a fetch spent its 60s
+    /// allowance on a reply that predated the change, and the strip stayed stale
+    /// until the ten-minute poll.
     func refresh() async {
-        guard !fetching else { return }
+        guard !fetching else {
+            pendingRefresh = true
+            return
+        }
         fetching = true
         defer { fetching = false }
+        repeat {
+            // cleared before the pass, not after: a trigger arriving *during*
+            // the pass has to earn another one
+            pendingRefresh = false
+            await fetchOnce()
+        } while pendingRefresh
+    }
 
+    private func fetchOnce() async {
         guard var fetched = await Self.fetch() else {
             // no credential, offline, or a token the CLI has since rotated.
             // Empty, not stale: a percentage bob can't vouch for is worse than

@@ -199,8 +199,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
     private var taskSweeps: [String: Task<Void, Never>] = [:]
     /// The newest assistant message's token counts, held un-published until the
     /// turn ends: a turn writes several assistant messages and only the last
-    /// one's window is the one you're looking at.
-    private var latestUsage: TokenUsage?
+    /// one's window is the one you're looking at. Tagged with the conversation it
+    /// was measured in, so a reading can't outlive the thread it describes.
+    private var latestUsage: (conversation: UUID, tokens: TokenUsage)?
     /// The denominator `contextUsedPct` divides by — the reported model's window,
     /// or the dial alias's before the CLI has spoken.
     private var contextWindow = ContextWindow.fallback
@@ -731,8 +732,19 @@ final class ClaudeSession: ObservableObject, Identifiable {
         case .assistant(let blocks, let usage):
             spontaneousIfIdle()
             // held, not published: finishTurn publishes the last one (D-perf —
-            // the context meter is a turn-boundary value, not a live gauge)
-            if let usage { latestUsage = usage }
+            // the context meter is a turn-boundary value, not a live gauge).
+            //
+            // Not while draining. A reset or a /resume mid-turn supersedes the
+            // conversation, sets .draining and terminates — but the dying
+            // process's stdout is still arriving, and the reader drains it in
+            // full before processExited moves the state on. So every buffered
+            // event from a superseded process is seen in exactly this state, and
+            // its token counts describe a transcript that is already off screen.
+            // (A lens/model drain also passes through here, but only from idle,
+            // so there is no in-flight turn whose numbers this could cost.)
+            if let usage, state != .draining {
+                latestUsage = (config.sessionId, usage)
+            }
             for case .toolUse(_, let activity) in blocks { setActivity(activity) }
         case .toolResult:
             setActivity(nil)
@@ -905,9 +917,17 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// The context meter, once per turn. Clamped at 100: the CLI compacts around
     /// the ceiling and a turn straddling that moment can report more than the
     /// window holds, which would read as a bug rather than as "full".
+    ///
+    /// The conversation check is the second half of the staleness guard: a
+    /// trailing `result` from a superseded process still reaches finishTurn, and
+    /// a number measured in a thread this tab has since left must not be
+    /// published under the one now on screen.
     private func publishContextUse() {
-        guard let usage = latestUsage, contextWindow > 0 else { return }
-        let pct = min(100, Double(usage.contextInUse) / Double(contextWindow) * 100)
+        guard let latest = latestUsage,
+              latest.conversation == config.sessionId,
+              contextWindow > 0
+        else { return }
+        let pct = min(100, Double(latest.tokens.contextInUse) / Double(contextWindow) * 100)
         if contextUsedPct != pct { contextUsedPct = pct }
     }
 
