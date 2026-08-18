@@ -45,6 +45,13 @@ struct CenterStage: View {
         return active
     }
 
+    /// Bob's own session, by id rather than `sessions.first` — in compatibility
+    /// mode there is no companion at all, and index 0 is then somebody else.
+    private var companionSession: ClaudeSession? {
+        guard let id = manager.companionID else { return nil }
+        return manager.sessions.first { $0.id == id }
+    }
+
     var body: some View {
         // A surface (notes, canvas) takes the whole stage — even over an active
         // work tab, which keeps running behind its band chip. The companion
@@ -95,8 +102,17 @@ struct CenterStage: View {
                     }
                 }
                 if let whisper { DispatchWhisper(text: whisper) }
-                inputBar
-                    .overlay(alignment: .top) { slashPalette }
+                // the caption is a sibling of the bar, not a passenger: it sits
+                // outside the material fill and outside AnimatedBorder's bleed,
+                // so the comet stroke still encloses exactly the input box.
+                VStack(alignment: .trailing, spacing: 5) {
+                    inputBar
+                        .overlay(alignment: .top) { slashPalette }
+                    if let companion = companionSession {
+                        SessionMeterCaption(session: companion)
+                            .padding(.trailing, 8)
+                    }
+                }
             }
             .animation(.easeInOut(duration: 0.25), value: whisper)
             .animation(.easeInOut(duration: 0.25), value: surfaceReplyEntry == nil)
@@ -802,7 +818,13 @@ private struct WorkStage: View {
             stage
             VStack(alignment: .leading, spacing: 8) {
                 if let whisper { DispatchWhisper(text: whisper) }
-                inputBar
+                // same shape as the companion's: outside the bar's fill and
+                // outside the border's bleed
+                VStack(alignment: .trailing, spacing: 5) {
+                    inputBar
+                    SessionMeterCaption(session: session)
+                        .padding(.trailing, 8)
+                }
             }
             .animation(.easeInOut(duration: 0.25), value: whisper)
         }

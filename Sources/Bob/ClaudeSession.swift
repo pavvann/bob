@@ -104,6 +104,15 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// Agents this session has set running, newest last. Finished rows linger so
     /// you can read the outcome rather than watching them vanish.
     @Published private(set) var agents: [SessionAgent] = []
+    /// How full this conversation's context was at the end of the last turn, as a
+    /// percentage of the model's window. Session state, not transcript — so it
+    /// lives on the @Published surface and moves once a turn, at the boundary,
+    /// never on a delta. nil until a turn has actually reported usage.
+    @Published private(set) var contextUsedPct: Double? = nil
+    /// The tier word for whatever model this session is running — "opus". The
+    /// dial's alias to begin with, replaced by whatever the CLI's init line
+    /// actually names. nil when neither has said (the bare CLI default).
+    @Published private(set) var modelShortName: String? = nil
 
     /// Called with each completed sentence as the reply streams (D5). Only
     /// fires when `config.voiced`. Wired to VoiceOutput by the view layer.
@@ -188,6 +197,13 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// Pending sweeps, one per task id — cancelled and re-armed whenever the
     /// task speaks again, so a late ping never leaves two rows or a stale timer.
     private var taskSweeps: [String: Task<Void, Never>] = [:]
+    /// The newest assistant message's token counts, held un-published until the
+    /// turn ends: a turn writes several assistant messages and only the last
+    /// one's window is the one you're looking at.
+    private var latestUsage: TokenUsage?
+    /// The denominator `contextUsedPct` divides by — the reported model's window,
+    /// or the dial alias's before the CLI has spoken.
+    private var contextWindow = ContextWindow.fallback
 
     /// `claudePath`/`stderrSink` are injected (SessionManager passes
     /// ClaudeBridge's statics) so the core stays testable standalone.
@@ -198,6 +214,8 @@ final class ClaudeSession: ObservableObject, Identifiable {
         self.stderrSink = stderrSink
         self.taskNoticeLinger = taskNoticeLinger
         self.sessionOnDisk = config.resumed
+        self.modelShortName = ContextWindow.shortName(for: config.model)
+        self.contextWindow = ContextWindow.size(for: config.model)
         if config.permissions == .askFirst { self.broker = UIPermissionBroker.shared }
     }
 
@@ -276,6 +294,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// keeps the choice even if the respawn waits for the turn to end.
     func setModel(_ model: String?) {
         config.model = model
+        // the caption follows the choice at once, not at the respawn: showing the
+        // model you just left would be worse than showing none. Back to the CLI
+        // default means bob has no word for it until the next init line says one.
+        adoptModel(model)
         switch state {
         case .unspawned, .failed:
             break                        // next spawn reads config
@@ -296,6 +318,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         transcript.replaceAll([])
         lastError = nil
         lastResult = nil
+        forgetContextUse()
         clientQueue.removeAll()
         cliQueuedSends = 0
         currentBob = nil
@@ -336,6 +359,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
             : "resumed this conversation — the last \(history.count) turns, read from disk"))
         lastError = nil
         lastResult = nil
+        forgetContextUse()
         clientQueue.removeAll()
         cliQueuedSends = 0
         currentBob = nil
@@ -687,12 +711,15 @@ final class ClaudeSession: ObservableObject, Identifiable {
     private func handle(_ event: StreamEvent) {
         broadcast(event)
         switch event {
-        case .initialized:
+        case .initialized(_, let model):
             // init arrives at the start of EVERY turn (never spontaneously at
             // spawn) — it confirms the session file exists, and doubles as a
             // readiness fallback should a future CLI drop the handshake
             sessionOnDisk = true
             confirmedOnDisk = true
+            // it also names the model the CLI actually resolved, dated id and
+            // all, which is the only way to know it when the dial said "default"
+            if ContextWindow.shortName(for: model) != nil { adoptModel(model) }
             becomeReadyIfSpawning()
         case .status:
             spontaneousIfIdle()
@@ -701,8 +728,11 @@ final class ClaudeSession: ObservableObject, Identifiable {
             // into applyPump; what's left is block/message chatter worth an
             // idle check and nothing more
             spontaneousIfIdle()
-        case .assistant(let blocks):
+        case .assistant(let blocks, let usage):
             spontaneousIfIdle()
+            // held, not published: finishTurn publishes the last one (D-perf —
+            // the context meter is a turn-boundary value, not a live gauge)
+            if let usage { latestUsage = usage }
             for case .toolUse(_, let activity) in blocks { setActivity(activity) }
         case .toolResult:
             setActivity(nil)
@@ -769,9 +799,23 @@ final class ClaudeSession: ObservableObject, Identifiable {
                 becomeReadyIfSpawning()
             }
             // interrupt acks need no handling — the aborted result does it
+        case .rateLimit(let type, let resetsAt, let overage):
+            // the subscription is one account's, not this session's, so the
+            // numbers go to the one meter the whole window reads. The wire knows
+            // the reset instant before the endpoint does; the percentages still
+            // come from the endpoint, on a coalesced refresh.
+            UsageMeter.shared.nudge(type: type, resetsAt: resetsAt, isUsingOverage: overage)
         case .ignored:
             break
         }
+    }
+
+    /// One doorway for "this session is running that model": the caption's word
+    /// and the context meter's denominator can never disagree.
+    private func adoptModel(_ model: String?) {
+        let short = ContextWindow.shortName(for: model)
+        if short != modelShortName { modelShortName = short }
+        contextWindow = ContextWindow.size(for: model)
     }
 
     private func becomeReadyIfSpawning() {
@@ -802,6 +846,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     private func finishTurn(_ r: TurnResult) {
         lastResult = r
+        publishContextUse()
         let interrupted = state == .interrupting || r.terminalReason == "aborted_streaming"
         if let entry = currentBob {
             transcript.set(activity: nil, of: entry)
@@ -847,6 +892,23 @@ final class ClaudeSession: ObservableObject, Identifiable {
             state = .idle
             afterIdle()
         }
+    }
+
+    /// A different conversation is in this tab now (reset, or a /resume): the old
+    /// one's context number describes nothing on screen. Blank until the new
+    /// thread takes its first turn.
+    private func forgetContextUse() {
+        latestUsage = nil
+        if contextUsedPct != nil { contextUsedPct = nil }
+    }
+
+    /// The context meter, once per turn. Clamped at 100: the CLI compacts around
+    /// the ceiling and a turn straddling that moment can report more than the
+    /// window holds, which would read as a bug rather than as "full".
+    private func publishContextUse() {
+        guard let usage = latestUsage, contextWindow > 0 else { return }
+        let pct = min(100, Double(usage.contextInUse) / Double(contextWindow) * 100)
+        if contextUsedPct != pct { contextUsedPct = pct }
     }
 
     /// Client-side queue drains the moment a fresh process reports in (D4):
