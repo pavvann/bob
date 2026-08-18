@@ -333,7 +333,11 @@ final class ClaudeBridge: ObservableObject {
         if !hidden {
             transcript.append(TranscriptEntry(role: .you, text: prompt))
         }
-        transcript.append(TranscriptEntry(role: .bob, text: ""))
+        // the row THIS child owns. A resubmit terminates the running child and
+        // streams into a newer row, so the callbacks below must write to their
+        // own entry by reference — "the latest bob row" would be someone else's.
+        let reply = TranscriptEntry(role: .bob, text: "")
+        transcript.append(reply)
 
         let process = Process()
         let pipe = Pipe()
@@ -423,7 +427,7 @@ final class ClaudeBridge: ObservableObject {
             pendingData = remainder
             guard !text.isEmpty else { return }
             Task { @MainActor in
-                self?.appendToReply(text)
+                self?.appendToReply(text, to: reply)
             }
         }
 
@@ -431,13 +435,18 @@ final class ClaudeBridge: ObservableObject {
             pipe.fileHandleForReading.readabilityHandler = nil
             Task { @MainActor in
                 guard let self else { return }
-                // speak any trailing fragment that never got a terminator
-                if let entry = self.transcript.entries.last(where: { $0.role == .bob }) {
-                    self.flushSpeakable(entry.text, final: true)
+                // superseded: a resubmit already owns the stream state and
+                // spokenIndex now indexes ITS row's text — this child only
+                // freezes its own finished reply on the way out
+                if self.transcript.entries.last(where: { $0.role == .bob }) === reply {
+                    // speak any trailing fragment that never got a terminator
+                    self.flushSpeakable(reply.text, final: true)
+                    self.isStreaming = false
+                    self.currentProcess = nil
                 }
-                self.isStreaming = false
-                self.currentProcess = nil
+                self.transcript.finalize(reply)
                 // a debrief that arrived while bob was replying can fire now
+                // (drainDebriefs re-checks isStreaming for itself)
                 self.drainDebriefs()
             }
         }
@@ -456,11 +465,13 @@ final class ClaudeBridge: ObservableObject {
         }
     }
 
-    /// Append streamed text to the in-flight bob turn, and speak any sentences
-    /// that just completed.
-    private func appendToReply(_ text: String) {
-        guard let entry = transcript.entries.last(where: { $0.role == .bob }) else { return }
+    /// Append streamed text to the bob turn a legacy child owns, and speak any
+    /// sentences that just completed. Speech only while that turn is still the
+    /// newest — a superseded child's stragglers render in their own row but
+    /// stay unspoken, because `spokenIndex` indexes the newer row's text.
+    private func appendToReply(_ text: String, to entry: TranscriptEntry) {
         transcript.append(text: text, to: entry)
+        guard transcript.entries.last(where: { $0.role == .bob }) === entry else { return }
         flushSpeakable(entry.text)
     }
 
@@ -513,6 +524,7 @@ final class ClaudeBridge: ObservableObject {
     private func setReply(_ text: String) {
         guard let entry = transcript.entries.last(where: { $0.role == .bob }) else { return }
         transcript.set(text: text, of: entry)
+        transcript.finalize(entry)   // error text is terminal — freeze it
     }
 
     // MARK: - shared plumbing

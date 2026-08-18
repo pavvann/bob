@@ -696,10 +696,17 @@ private struct TurnRowView: View {
                     ThinkingOrb()
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .transition(.opacity)
-                } else {
+                } else if let render = entry.render {
                     // claude writes markdown; render it as markdown (tables,
-                    // fences, lists, emphasis) instead of making the owner
-                    // parse pipes and asterisks by eye
+                    // fences, lists, emphasis) — from the entry's model,
+                    // which parsed each block exactly once as it arrived
+                    StreamedMarkdownText(model: render)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .transition(.opacity)
+                } else {
+                    // every bob row carries a model; kept for form, not for
+                    // a case that happens
                     MarkdownText(text: entry.text)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
