@@ -28,14 +28,20 @@ struct ContentView: View {
                     // hover any tile to grow it (dock-style) into the richer
                     // expanded variant. HStack alignment top so smaller tiles
                     // sit at the top while the hovered one expands downward.
-                    HStack(alignment: .top, spacing: 12) {
-                        HoverTile(title: "work") { exp in WorkTileContent(expanded: exp) }
-                        HoverTile(title: "music") { exp in MusicTileContent(expanded: exp) }
-                        HoverTile(title: "todos") { exp in TodoTileContent(expanded: exp) }
-                        HoverTile(title: "calendar") { exp in CalendarTileContent(expanded: exp) }
-                        HoverTile(title: "weather") { exp in WeatherTileContent(expanded: exp) }
+                    // Full tiles on bob's own stage; on a session page they
+                    // collapse to icons and give the transcript the height back.
+                    // Leading-aligned when collapsed so the row reads as a small
+                    // strip of controls rather than five lonely dots spread wide.
+                    HStack(alignment: .top, spacing: ambientCollapsed ? 8 : 12) {
+                        HoverTile(title: "work", iconified: ambientCollapsed) { exp in WorkTileContent(expanded: exp) }
+                        HoverTile(title: "music", iconified: ambientCollapsed) { exp in MusicTileContent(expanded: exp) }
+                        HoverTile(title: "todos", iconified: ambientCollapsed) { exp in TodoTileContent(expanded: exp) }
+                        HoverTile(title: "calendar", iconified: ambientCollapsed) { exp in CalendarTileContent(expanded: exp) }
+                        HoverTile(title: "weather", iconified: ambientCollapsed) { exp in WeatherTileContent(expanded: exp) }
+                        if ambientCollapsed { Spacer(minLength: 0) }
                     }
-                    .frame(height: 110, alignment: .top)
+                    .frame(height: ambientCollapsed ? 30 : 110, alignment: .top)
+                    .animation(.spring(response: 0.34, dampingFraction: 0.84), value: ambientCollapsed)
                     .zIndex(2)
 
                     // bob — the conductor, centered in everything the tiles and
@@ -223,6 +229,13 @@ struct ContentView: View {
                 Spacer(minLength: 10)
             }
         }
+    }
+
+    /// A session or a surface is on stage, so the ambient tiles step aside. Bob's
+    /// own thread keeps them: there, they *are* the point.
+    private var ambientCollapsed: Bool {
+        SurfaceRouter.shared.active != nil
+            || (sessionManager.activeID != nil && sessionManager.activeID != sessionManager.companionID)
     }
 
     /// Whichever session is on stage — bob's own thread included. Bob can be
