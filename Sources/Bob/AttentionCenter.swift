@@ -113,7 +113,7 @@ final class AttentionCenter {
     /// What flipped it — the same evidence status derivation used, as words.
     private func badReason(_ session: ClaudeSession, status: SessionStatus) -> String {
         if status == .error { return session.lastError ?? "the session is down" }
-        if let last = session.entries.last, last.role == .notice, last.taskId == nil {
+        if let last = session.transcript.entries.last, last.role == .notice, last.taskId == nil {
             return last.text   // "session dropped — reconnecting" and kin
         }
         if let r = session.lastResult, r.isError {
@@ -136,8 +136,8 @@ final class AttentionCenter {
             cwdTail: Self.cwdTail(session.config.cwd),
             digest: Self.digest(
                 reason: reason,
-                lastPrompt: session.entries.last(where: { $0.role == .you && !$0.hidden })?.text,
-                lastReply: session.entries.last(where: { $0.role == .bob && !$0.text.isEmpty })?.text
+                lastPrompt: session.transcript.entries.last(where: { $0.role == .you && !$0.hidden })?.text,
+                lastReply: session.transcript.entries.last(where: { $0.role == .bob && !$0.text.isEmpty })?.text
             )
         )
         if let i = pending.firstIndex(where: { $0.id == session.id }) {
