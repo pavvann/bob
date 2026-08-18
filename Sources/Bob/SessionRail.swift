@@ -52,13 +52,21 @@ struct SessionRail: View {
         .animation(.spring(response: 0.32, dampingFraction: 0.84), value: session.question?.id)
         .animation(.easeInOut(duration: 0.18), value: agents)
         .task(id: session.id) {
-            // one poll each, following whichever session is on stage
-            GitStatus.shared.watch(session.config.cwd)
-            AgentWatcher.shared.watch(conversation: session.config.sessionId, cwd: session.config.cwd)
+            // one watch each, following whichever session is on stage, held for
+            // exactly as long as the rail is mounted. `.task` cancellation is the
+            // release hook: onDisappear doesn't reliably pair with onAppear under
+            // SwiftUI remounts, which is how both of these used to leak.
+            GitStatus.shared.acquire(session.config.cwd)
+            AgentWatcher.shared.acquire(conversation: session.config.sessionId, cwd: session.config.cwd)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_600_000_000_000)
+            }
+            GitStatus.shared.release()
+            AgentWatcher.shared.release()
         }
         .onChange(of: session.config.sessionId) { _, id in
             // /resume points the tab at a different conversation — different agents
-            AgentWatcher.shared.watch(conversation: id, cwd: session.config.cwd)
+            AgentWatcher.shared.retarget(conversation: id, cwd: session.config.cwd)
         }
     }
 

@@ -3,10 +3,16 @@ import EventKit
 import AppKit
 
 /// EventKit-backed calendar service. Aggregates iCloud/Google/Exchange/local
-/// calendars (whatever Calendar.app sees). Refreshes on `EKEventStoreChanged`
-/// notifications + a 60s timer for countdown updates. Mirrors current state to
+/// calendars (whatever Calendar.app sees). Mirrors current state to
 /// `~/bob/state/calendar.json` so claude can answer "what's next?" queries
 /// instantly without shelling out.
+///
+/// `EKEventStoreChanged` is the trigger for re-querying EventKit. The minute tick
+/// no longer does: it only re-derives now/next from the events already in hand,
+/// and publishes only when the answer actually changed — an event beginning or
+/// ending is a handful of publishes a day, not 1,440. The "in 12m" countdown a
+/// tile shows advances in the tile, under its own `TimelineView`, rather than
+/// invalidating the window from down here.
 @MainActor
 final class CalendarService: ObservableObject {
     static let shared = CalendarService()
@@ -32,11 +38,28 @@ final class CalendarService: ObservableObject {
         let conferenceURL: String?
     }
 
+    /// What the tile renders. Carries no timestamp on purpose: a `Date()` stamped
+    /// on every tick guarantees inequality, and an unconditional publish of an
+    /// unchanged tile is a whole-window invalidation for nothing.
     struct State: Codable, Equatable {
         let authorization: Authorization
         let now: Event?
         let next: Event?
+    }
+
+    /// The disk mirror, which does want a timestamp — claude reads
+    /// `calendar.json` and deserves to know how stale it is.
+    private struct Snapshot: Encodable {
+        let state: State
         let updatedAt: Date
+
+        enum CodingKeys: String, CodingKey { case updatedAt }
+
+        func encode(to encoder: Encoder) throws {
+            try state.encode(to: encoder)
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(updatedAt, forKey: .updatedAt)
+        }
     }
 
     @Published private(set) var state: State?
@@ -46,6 +69,15 @@ final class CalendarService: ObservableObject {
     private let stateFile: URL
     private var changeObserver: NSObjectProtocol?
     private var tickerTask: Task<Void, Never>?
+
+    /// The 7-day window as last fetched, so the minute tick can re-derive now/next
+    /// without going back to EventKit.
+    private var window: [Event] = []
+    private var lastQuery: Date = .distantPast
+
+    /// How stale the cached window may get before the tick pays for a re-query.
+    /// A 7-day horizon does age out; a minute is just not how fast.
+    private static let requeryAfter: TimeInterval = 30 * 60
 
     private init() {
         let stateDir = BobHome.shared.root.appendingPathComponent("state", isDirectory: true)
@@ -63,12 +95,12 @@ final class CalendarService: ObservableObject {
             Task { @MainActor in await self?.refresh() }
         }
 
-        // Tick every 60s so the "in 12m" / "ends in 5m" countdowns advance
-        // without needing a separate timer in the view.
+        // Tick every 60s so an event that has just begun or just ended moves from
+        // `next` to `now` to gone. Not an EventKit query, and not a disk write.
         tickerTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
-                await self?.refresh()
+                await self?.roll()
             }
         }
 
@@ -104,18 +136,20 @@ final class CalendarService: ObservableObject {
             if granted {
                 await refresh()
             } else {
-                writeState()
+                adopt(State(authorization: authorization, now: nil, next: nil), toDisk: true)
             }
         } catch {
             authorization = .denied
-            writeState()
+            adopt(State(authorization: .denied, now: nil, next: nil), toDisk: true)
         }
     }
 
     func refresh() async {
-        authorization = Self.currentAuthorization()
-        guard authorization == .fullAccess else {
-            writeState()
+        let granted = Self.currentAuthorization()
+        if granted != authorization { authorization = granted }
+        guard granted == .fullAccess else {
+            window = []
+            adopt(State(authorization: granted, now: nil, next: nil), toDisk: true)
             return
         }
 
@@ -125,21 +159,39 @@ final class CalendarService: ObservableObject {
         let lookAhead = calendar.date(byAdding: .day, value: 7, to: now) ?? now.addingTimeInterval(7 * 86400)
         let predicate = store.predicateForEvents(withStart: now.addingTimeInterval(-3600), end: lookAhead, calendars: nil)
 
-        let events = store.events(matching: predicate)
+        window = store.events(matching: predicate)
             .filter { !$0.isAllDay }
             .sorted { $0.startDate < $1.startDate }
+            .map(mapEvent)
+        lastQuery = now
+        adopt(derived(at: now), toDisk: true)
+    }
 
-        let currentEK = events.first { $0.startDate <= now && $0.endDate > now }
-        let nextEK = events.first { $0.startDate > now }
+    /// The minute tick: whose turn is it now, given the window we already have.
+    /// Costs nothing when the answer hasn't changed, which is almost always.
+    private func roll() async {
+        guard authorization == .fullAccess else { return }
+        if Date().timeIntervalSince(lastQuery) > Self.requeryAfter {
+            await refresh()
+            return
+        }
+        adopt(derived(at: Date()), toDisk: false)
+    }
 
-        let newState = State(
+    private func derived(at now: Date) -> State {
+        State(
             authorization: authorization,
-            now: currentEK.map(mapEvent),
-            next: nextEK.map(mapEvent),
-            updatedAt: Date()
+            now: window.first { $0.startDate <= now && $0.endDate > now },
+            next: window.first { $0.startDate > now }
         )
-        self.state = newState
-        writeState()
+    }
+
+    /// `toDisk` forces a write even when nothing changed, so `calendar.json`'s
+    /// timestamp still tells claude when we last actually asked EventKit.
+    private func adopt(_ new: State, toDisk: Bool) {
+        let changed = new != state
+        if changed { state = new }
+        if changed || toDisk { writeState(new) }
     }
 
     private func mapEvent(_ e: EKEvent) -> Event {
@@ -191,21 +243,15 @@ final class CalendarService: ObservableObject {
 
     // MARK: state file
 
-    private func writeState() {
-        let snapshot = State(
-            authorization: authorization,
-            now: state?.now,
-            next: state?.next,
-            updatedAt: Date()
-        )
-        do {
+    private func writeState(_ state: State) {
+        let snapshot = Snapshot(state: state, updatedAt: Date())
+        let file = stateFile
+        Task.detached(priority: .utility) {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(snapshot)
-            try data.write(to: stateFile, options: .atomic)
-        } catch {
-            // best effort
+            guard let data = try? encoder.encode(snapshot) else { return }
+            try? data.write(to: file, options: .atomic)
         }
     }
 

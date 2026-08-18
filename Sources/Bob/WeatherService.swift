@@ -13,6 +13,9 @@ import CoreLocation
 final class WeatherService: NSObject, ObservableObject {
     static let shared = WeatherService()
 
+    /// What the tile renders. The freshness stamp lives on the disk mirror, not
+    /// in here — the weather at 3pm and the weather at 3.30pm are usually the
+    /// same tile, and a timestamp would make them compare unequal.
     struct State: Codable, Equatable {
         let temperatureC: Double
         let condition: String
@@ -20,7 +23,6 @@ final class WeatherService: NSObject, ObservableObject {
         let locationName: String
         let highC: Double?
         let lowC: Double?
-        let updatedAt: Date
 
         enum CodingKeys: String, CodingKey {
             case temperatureC = "temperature_c"
@@ -29,7 +31,20 @@ final class WeatherService: NSObject, ObservableObject {
             case locationName = "location_name"
             case highC = "high_c"
             case lowC = "low_c"
-            case updatedAt = "updated_at"
+        }
+    }
+
+    /// The `~/bob/state/weather.json` mirror claude reads.
+    private struct Snapshot: Encodable {
+        let state: State
+        let updatedAt: Date
+
+        enum CodingKeys: String, CodingKey { case updatedAt = "updated_at" }
+
+        func encode(to encoder: Encoder) throws {
+            try state.encode(to: encoder)
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(updatedAt, forKey: .updatedAt)
         }
     }
 
@@ -92,22 +107,22 @@ final class WeatherService: NSObject, ObservableObject {
                 symbolName: current.symbolName,
                 locationName: place,
                 highC: today?.highTemperature.converted(to: .celsius).value,
-                lowC: today?.lowTemperature.converted(to: .celsius).value,
-                updatedAt: Date()
+                lowC: today?.lowTemperature.converted(to: .celsius).value
             )
-            self.state = newState
-            self.lastError = nil
-            writeState()
+            if newState != state { state = newState }
+            if lastError != nil { lastError = nil }
+            writeState(newState)
             Self.log("weather updated: \(Int(newState.temperatureC.rounded()))°C \(newState.condition) @ \(place)")
         } catch {
             let desc = String(describing: error)
             // The XPC failure to weatherkit.authservice means the app lacks the
-            // WeatherKit entitlement (ad-hoc signed). Surface a clear message.
-            if desc.contains("weatherkit") || desc.contains("xpcConnectionFailed") {
-                self.lastError = "weatherkit needs app signing"
-            } else {
-                self.lastError = "couldn't load weather"
-            }
+            // WeatherKit entitlement (ad-hoc signed). Surface a clear message —
+            // guarded, because an unentitled build fails every refresh forever
+            // and the same string twice is not news.
+            let message = desc.contains("weatherkit") || desc.contains("xpcConnectionFailed")
+                ? "weatherkit needs app signing"
+                : "couldn't load weather"
+            if message != lastError { lastError = message }
             Self.log("WeatherKit error: \(desc)")
         }
     }
@@ -123,16 +138,15 @@ final class WeatherService: NSObject, ObservableObject {
 
     // MARK: state file
 
-    private func writeState() {
-        guard let state else { return }
-        do {
+    private func writeState(_ state: State) {
+        let snapshot = Snapshot(state: state, updatedAt: Date())
+        let file = stateFile
+        Task.detached(priority: .utility) {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(state)
-            try data.write(to: stateFile, options: .atomic)
-        } catch {
-            // best effort
+            guard let data = try? encoder.encode(snapshot) else { return }
+            try? data.write(to: file, options: .atomic)
         }
     }
 

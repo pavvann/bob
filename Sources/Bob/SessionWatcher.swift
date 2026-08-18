@@ -19,6 +19,13 @@ import Foundation
 /// disclosure, not a card. Bob's own spawned runs stamp `entrypoint:
 /// "sdk-cli"` (transcripts and registry alike) and are filtered out. All file
 /// IO runs off the main actor.
+///
+/// The whole tree it reads lives under `~/.claude`, so the scan is watcher-driven
+/// — 82 directory enumerations and a thousand mtime stats now happen when claude
+/// writes something, not every three seconds forever. Two clocks survive on
+/// purpose: a slow safety sweep, and the 180s freshness window, which is a real
+/// clock — a session going quiet produces no filesystem event at all, so only a
+/// tick can retire it.
 @MainActor
 final class SessionWatcher: ObservableObject {
     static let shared = SessionWatcher()
@@ -71,22 +78,39 @@ final class SessionWatcher: ObservableObject {
     /// Idle-but-alive externals — the "3 idle" disclosure, rendered on demand.
     @Published private(set) var parked: [Session] = []
 
-    private var pollTask: Task<Void, Never>?
+    private var sweepTask: Task<Void, Never>?
+
+    /// The floor on watcher-driven scans. A streaming transcript is appended to
+    /// dozens of times a second; the old poll's period is the right ceiling on
+    /// how often an 82-directory walk is worth repeating.
+    private nonisolated static let floor: TimeInterval = 3
+    /// The safety net, and the clock the freshness window rides on.
+    private nonisolated static let sweepInterval: UInt64 = 45_000_000_000
 
     private init() {
-        pollTask = Task { [weak self] in
+        DirWatcher.shared.acquire(
+            path: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude").path,
+            id: "session-watcher",
+            floor: Self.floor
+        ) { [weak self] _ in
+            let found = Self.scan()
+            Task { @MainActor in self?.publish(found) }
+        }
+        sweepTask = Task { [weak self] in
             while !Task.isCancelled {
                 let found = await Task.detached(priority: .utility) { Self.scan() }.value
-                if let self {
-                    if self.live != found.shown { self.live = found.shown }
-                    if self.parked != found.parked { self.parked = found.parked }
-                }
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                self?.publish(found)
+                try? await Task.sleep(nanoseconds: Self.sweepInterval)
             }
         }
     }
 
-    deinit { pollTask?.cancel() }
+    deinit { sweepTask?.cancel() }
+
+    private func publish(_ found: (shown: [Session], parked: [Session])) {
+        if live != found.shown { live = found.shown }
+        if parked != found.parked { parked = found.parked }
+    }
 
     private nonisolated static let liveWindow: TimeInterval = 180
 

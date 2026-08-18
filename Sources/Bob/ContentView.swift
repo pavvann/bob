@@ -838,9 +838,7 @@ private struct CalendarTileContent: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-            Text(timingText(event: event, isInProgress: isInProgress))
-                .font(.system(size: 11, weight: .regular, design: .rounded))
-                .foregroundStyle(.secondary.opacity(0.75))
+            EventTiming(event: event, isInProgress: isInProgress)
             if !event.calendarTitle.isEmpty {
                 Text(event.calendarTitle)
                     .font(.system(size: 9, weight: .regular, design: .rounded))
@@ -871,17 +869,32 @@ private struct CalendarTileContent: View {
             Spacer(minLength: 0)
         }
     }
+}
 
-    private func timingText(event: CalendarService.Event, isInProgress: Bool) -> String {
-        if isInProgress {
-            return "ends \(humanInterval(from: Date(), to: event.endDate))"
-        } else {
-            return "starts \(humanInterval(from: Date(), to: event.startDate)) · \(absoluteTime(event.startDate))"
+/// One line of countdown, and the only thing in the calendar tile that needs a
+/// clock. It owns its own minute tick so the service doesn't have to publish
+/// (and invalidate the window) just to move "in 12m" to "in 11m".
+private struct EventTiming: View {
+    let event: CalendarService.Event
+    let isInProgress: Bool
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { ctx in
+            Text(text(at: ctx.date))
+                .font(.system(size: 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.75))
         }
     }
 
+    private func text(at now: Date) -> String {
+        if isInProgress {
+            return "ends \(Self.humanInterval(from: now, to: event.endDate))"
+        }
+        return "starts \(Self.humanInterval(from: now, to: event.startDate)) · \(Self.absoluteTime(event.startDate))"
+    }
+
     /// "in 12m" / "in 1h 5m" / "in 2d 3h" etc.
-    private func humanInterval(from start: Date, to end: Date) -> String {
+    private static func humanInterval(from start: Date, to end: Date) -> String {
         let interval = max(0, end.timeIntervalSince(start))
         if interval < 60 { return "now" }
         if interval < 3600 {
@@ -897,7 +910,7 @@ private struct CalendarTileContent: View {
         return hours > 0 ? "in \(days)d \(hours)h" : "in \(days)d"
     }
 
-    private func absoluteTime(_ date: Date) -> String {
+    private static func absoluteTime(_ date: Date) -> String {
         let cal = Calendar.current
         if cal.isDateInToday(date) {
             let f = DateFormatter(); f.dateFormat = "h:mm a"

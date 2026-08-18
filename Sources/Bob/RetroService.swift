@@ -16,7 +16,7 @@ final class RetroService {
 
     /// A retro day closes at 04:00 local — he works past midnight, so calendar
     /// midnight is the wrong seam.
-    static let dayEndHour = 4
+    nonisolated static let dayEndHour = 4
 
     /// Let the tiles settle and the open line land before touching anything.
     private static let firstCheckDelay: UInt64 = 120_000_000_000   // 2 min
@@ -50,15 +50,23 @@ final class RetroService {
 
     /// Queues a retro for the most recent completed retro-day if one hasn't run
     /// yet and nothing retro-shaped is already in flight. Idempotent, cheap.
+    ///
+    /// The four small disk touches run off the main actor: cheap is not free, and
+    /// nothing about this needs to happen on the thread that draws.
     func checkNow() {
-        let day = Self.lastCompletedDay()
-        guard lastRun() < day else { return }
-        guard !retroInFlight() else { return }
+        let stateFile = self.stateFile
+        let activeDir = self.activeDir
+        let root = self.root
+        Task.detached(priority: .utility) {
+            let day = Self.lastCompletedDay()
+            guard Self.lastRun(stateFile) < day else { return }
+            guard !Self.retroInFlight(activeDir) else { return }
 
-        // write-before-queue: a retro that dies mid-flight skips its day rather
-        // than ever running twice. the failure is visible on the minion card.
-        recordLastRun(day)
-        queueRetro(for: day)
+            // write-before-queue: a retro that dies mid-flight skips its day rather
+            // than ever running twice. the failure is visible on the minion card.
+            Self.recordLastRun(day, to: stateFile)
+            Self.queueRetro(for: day, root: root, activeDir: activeDir)
+        }
     }
 
     /// The most recent **completed** retro-day, as `yyyy-MM-dd`.
@@ -66,7 +74,7 @@ final class RetroService {
     /// Retro-day D covers D 00:00 → D+1 04:00, so it only becomes reviewable at
     /// 04:00 the next morning: at 03:59 on the 11th the last completed day is
     /// still the 9th; at 04:01 it flips to the 10th.
-    static func lastCompletedDay(now: Date = Date(), calendar: Calendar = .current) -> String {
+    nonisolated static func lastCompletedDay(now: Date = Date(), calendar: Calendar = .current) -> String {
         // wall-clock arithmetic, not `now - 28h`: subtracting hours across a DST
         // seam slides the boundary by an hour, and "before 4am" is a wall-clock
         // idea. before 04:00 we're still inside yesterday's retro-day, so the
@@ -78,7 +86,7 @@ final class RetroService {
         return dateString(day, calendar: calendar)
     }
 
-    static func dateString(_ date: Date, calendar: Calendar = .current) -> String {
+    nonisolated static func dateString(_ date: Date, calendar: Calendar = .current) -> String {
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.calendar = calendar
@@ -91,7 +99,7 @@ final class RetroService {
 
     /// Day last reviewed, or `""` when the file is missing/unreadable (which
     /// makes the first launch run one catch-up retro — by design).
-    private func lastRun() -> String {
+    private nonisolated static func lastRun(_ stateFile: URL) -> String {
         guard let data = try? Data(contentsOf: stateFile),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let day = obj["last_run"] as? String
@@ -99,7 +107,7 @@ final class RetroService {
         return day
     }
 
-    private func recordLastRun(_ day: String) {
+    private nonisolated static func recordLastRun(_ day: String, to stateFile: URL) {
         try? FileManager.default.createDirectory(
             at: stateFile.deletingLastPathComponent(), withIntermediateDirectories: true)
         let json = "{\n  \"last_run\": \"\(day)\"\n}\n"
@@ -108,14 +116,14 @@ final class RetroService {
 
     // MARK: the minion record
 
-    private func retroInFlight() -> Bool {
+    private nonisolated static func retroInFlight(_ activeDir: URL) -> Bool {
         let files = (try? FileManager.default.contentsOfDirectory(
             at: activeDir, includingPropertiesForKeys: nil)) ?? []
         // records are `<id>.json` and every retro id carries `-retro-`
         return files.contains { $0.lastPathComponent.contains("-retro-") }
     }
 
-    private func queueRetro(for day: String) {
+    private nonisolated static func queueRetro(for day: String, root: URL, activeDir: URL) {
         let id = "\(Int(Date().timeIntervalSince1970))-retro-\(day)"
         let record: [String: Any] = [
             "id": id,
@@ -135,7 +143,7 @@ final class RetroService {
     /// The retro prompt. Deliberately thin — the judgment lives in
     /// `~/bob/wiki/bob/retro.md` so bob can refine its own protocol; this
     /// template only supplies the date and points at the sources.
-    static func prompt(for day: String, root: URL) -> String {
+    nonisolated static func prompt(for day: String, root: URL) -> String {
         // claude's own transcript store encodes a project dir by swapping `/` for `-`
         let encoded = root.path.replacingOccurrences(of: "/", with: "-")
         let transcripts = "~/.claude/projects/\(encoded)/*.jsonl"
