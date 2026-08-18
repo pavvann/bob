@@ -75,7 +75,7 @@ final class ResumeStore: ObservableObject {
             session.resume(
                 conversationId: conversation.id,
                 history: turns.map {
-                    ClaudeSession.Entry(role: $0.fromYou ? .you : .bob, text: $0.text)
+                    TranscriptEntry(role: $0.fromYou ? .you : .bob, text: $0.text)
                 }
             )
             // the tab now points somewhere else — the registry has to know, or the

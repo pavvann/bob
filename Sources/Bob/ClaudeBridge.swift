@@ -1,50 +1,21 @@
 import Foundation
 import Combine
 
-/// bob's mouth. Since P1c this is an *adapter*: with the persistent session on
-/// (the default now), `turns`/`isStreaming` are a republished view of
-/// SessionManager.companion's transcript, and sending a message is one line
-/// down a living process's stdin instead of a fresh `claude -p` per turn. The
-/// old one-shot implementation is still here as `sendLegacy` — reachable by
-/// flag, and taken automatically for the rest of the run if the streaming
-/// session ever falls over (plan D7). Nothing above this file knows which path
-/// is live.
+/// bob's mouth. Since P2b this is a command/status facade: message content
+/// lives in a TranscriptStore — the companion session's own store once
+/// attached — and the bridge publishes only the low-frequency surface
+/// (activeLens, lastError, isStreaming) plus which store to read. The old
+/// one-shot implementation is still here as `sendLegacy` — reachable by flag,
+/// taken automatically for the rest of the run if the streaming session ever
+/// falls over (plan D7), and writing into the SAME store, so nothing above
+/// this file knows which path is live.
 @MainActor
 final class ClaudeBridge: ObservableObject {
-    // MARK: - the turn model
-
-    /// Transitional two-case role — CenterStage's `turnRow` still switches on
-    /// it, so notices render as bob's text until P1d's rewrite switches to
-    /// `Turn.kind` (three cases). Delete this and the accessor below with that
-    /// commit.
-    enum Role: String { case you, bob }
-
-    /// One row of the running conversation. `notice` is bob's system-styled
-    /// aside — a background task finished, the session dropped, the bridge fell
-    /// back. `activity` is the live tool line ("reading Foo.swift") and is
-    /// non-nil only on the in-flight bob turn.
-    struct Turn: Identifiable, Equatable {
-        enum Kind: Equatable { case you, bob, notice }
-        let id: UUID
-        var kind: Kind
-        var text: String
-        var activity: String?
-
-        init(id: UUID = UUID(), kind: Kind, text: String, activity: String? = nil) {
-            self.id = id
-            self.kind = kind
-            self.text = text
-            self.activity = activity
-        }
-
-        var role: Role { kind == .you ? .you : .bob }
-    }
-
-    /// The running conversation for this session — your turns and bob's
-    /// streamed replies, in order. On the streaming path this is a projection
-    /// of the companion session's entries (hidden ones filtered out); on the
-    /// legacy path the bridge appends to it directly.
-    @Published private(set) var turns: [Turn] = []
+    /// The conversation on stage. Starts as the bridge's own (the pure-legacy
+    /// path writes here); `attach` swaps in the live session's store — a rare
+    /// publish, and on fallback the dead session's store is kept so the turns
+    /// already on screen stay.
+    @Published private(set) var transcript = TranscriptStore()
     @Published var isStreaming: Bool = false
     @Published var lastError: String? = nil
 
@@ -56,7 +27,7 @@ final class ClaudeBridge: ObservableObject {
     @Published var activeLens: String? = nil
 
     /// bob's most recent reply text (used for text-to-speech).
-    var lastResponse: String { turns.last(where: { $0.kind == .bob })?.text ?? "" }
+    var lastResponse: String { transcript.entries.last(where: { $0.role == .bob })?.text ?? "" }
 
     /// Called with each completed sentence as bob streams, so bob can speak as
     /// he thinks rather than reading a finished wall of text. Wired by the view
@@ -151,15 +122,12 @@ final class ClaudeBridge: ObservableObject {
         // both paths must name the same conversation (D7) — adopt the session's
         // id, whoever minted it
         sessionId = live.config.sessionId.uuidString.lowercased()
-        sessionStarted = live.lastResult != nil || live.entries.contains { $0.role == .bob }
+        sessionStarted = live.lastResult != nil || live.transcript.entries.contains { $0.role == .bob }
         live.onSentence = onSentence
 
         // @Published fires on willSet from the main actor, so these run inline
         // and in order — the new value arrives as the argument, never by
         // re-reading the property.
-        live.$entries.sink { [weak self] entries in
-            MainActor.assumeIsolated { self?.republish(entries) }
-        }.store(in: &mirrors)
         live.$state.sink { [weak self] state in
             MainActor.assumeIsolated { self?.mirror(state) }
         }.store(in: &mirrors)
@@ -167,7 +135,7 @@ final class ClaudeBridge: ObservableObject {
             MainActor.assumeIsolated { if let error { self?.lastError = error } }
         }.store(in: &mirrors)
 
-        republish(live.entries)
+        transcript = live.transcript
         mirror(live.state)
         syncLens(to: live, force: true)
     }
@@ -176,25 +144,6 @@ final class ClaudeBridge: ObservableObject {
         mirrors.removeAll()
         managerWatch = nil
         session = nil
-    }
-
-    /// The companion's entries become bob's turns. Hidden entries (debrief
-    /// injections) are dropped here and nowhere else — that filter is the whole
-    /// reason a debrief shows only bob's reply. Entry ids carry through so
-    /// SwiftUI keeps its rows.
-    private func republish(_ entries: [ClaudeSession.Entry]) {
-        turns = entries.compactMap { entry in
-            guard !entry.hidden else { return nil }
-            return Turn(id: entry.id, kind: Self.kind(of: entry.role), text: entry.text, activity: entry.activity)
-        }
-    }
-
-    private static func kind(of role: ClaudeSession.Role) -> Turn.Kind {
-        switch role {
-        case .you: return .you
-        case .bob: return .bob
-        case .notice: return .notice
-        }
     }
 
     private func mirror(_ state: ClaudeSession.State) {
@@ -248,7 +197,7 @@ final class ClaudeBridge: ObservableObject {
         guard !fellBack else { return }
         fellBack = true
         detach()
-        turns.append(Turn(kind: .notice, text: "running in compatibility mode"))
+        transcript.append(TranscriptEntry(role: .notice, text: "running in compatibility mode"))
         logToSink("streaming session failed (\(reason)) — falling back to the legacy one-shot path")
         isStreaming = false
         if let prompt = pendingPrompt {
@@ -281,7 +230,7 @@ final class ClaudeBridge: ObservableObject {
         currentProcess = nil
         activeLens = nil
         pushedLens = nil
-        turns = []
+        transcript.replaceAll([])
         lastError = nil
         isStreaming = false
         spokenIndex = nil
@@ -382,9 +331,9 @@ final class ClaudeBridge: ObservableObject {
         // A hidden turn (e.g. a minion debrief) shows only bob's reply, not the
         // prompt that triggered it.
         if !hidden {
-            turns.append(Turn(kind: .you, text: prompt))
+            transcript.append(TranscriptEntry(role: .you, text: prompt))
         }
-        turns.append(Turn(kind: .bob, text: ""))
+        transcript.append(TranscriptEntry(role: .bob, text: ""))
 
         let process = Process()
         let pipe = Pipe()
@@ -483,8 +432,8 @@ final class ClaudeBridge: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 // speak any trailing fragment that never got a terminator
-                if let idx = self.turns.lastIndex(where: { $0.kind == .bob }) {
-                    self.flushSpeakable(self.turns[idx].text, final: true)
+                if let entry = self.transcript.entries.last(where: { $0.role == .bob }) {
+                    self.flushSpeakable(entry.text, final: true)
                 }
                 self.isStreaming = false
                 self.currentProcess = nil
@@ -510,9 +459,9 @@ final class ClaudeBridge: ObservableObject {
     /// Append streamed text to the in-flight bob turn, and speak any sentences
     /// that just completed.
     private func appendToReply(_ text: String) {
-        guard let idx = turns.lastIndex(where: { $0.kind == .bob }) else { return }
-        turns[idx].text += text
-        flushSpeakable(turns[idx].text)
+        guard let entry = transcript.entries.last(where: { $0.role == .bob }) else { return }
+        transcript.append(text: text, to: entry)
+        flushSpeakable(entry.text)
     }
 
     /// Emit any newly-completed sentences (since `spokenIndex`) to `onSentence`.
@@ -562,8 +511,8 @@ final class ClaudeBridge: ObservableObject {
 
     /// Replace the in-flight bob turn's text (used for error messages).
     private func setReply(_ text: String) {
-        guard let idx = turns.lastIndex(where: { $0.kind == .bob }) else { return }
-        turns[idx].text = text
+        guard let entry = transcript.entries.last(where: { $0.role == .bob }) else { return }
+        transcript.set(text: text, of: entry)
     }
 
     // MARK: - shared plumbing

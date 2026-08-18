@@ -87,24 +87,15 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     enum Role: Equatable { case you, bob, notice }
 
-    struct Entry: Identifiable, Equatable {
-        let id = UUID()
-        let role: Role
-        var text: String
-        var hidden: Bool = false      // injected prompts (debriefs) — never rendered
-        var activity: String? = nil   // live tool line ("reading Foo.swift") while in flight
-        /// Non-nil on a background-task notice: this row is *live status* for one
-        /// task — rewritten in place as the task talks, swept once it settles
-        /// (D3). Every other notice (session dropped, compatibility mode) leaves
-        /// this nil and stays in the transcript forever.
-        var taskId: String? = nil
-    }
-
     let id = UUID()
     private(set) var config: SessionConfig
 
+    /// Message content lives in its own @Observable store (P2b): a streamed
+    /// token wakes the one row reading it, and the @Published surface below
+    /// speaks only at boundaries.
+    let transcript = TranscriptStore()
+
     @Published private(set) var state: State = .unspawned
-    @Published private(set) var entries: [Entry] = []
     @Published private(set) var lastError: String? = nil
     @Published private(set) var lastResult: TurnResult? = nil
     /// What claude is blocked on, waiting for a person to choose. The turn stays
@@ -131,7 +122,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
     }
 
     /// Most recent completed-or-streaming reply (adapter convenience).
-    var lastResponse: String { entries.last(where: { $0.role == .bob })?.text ?? "" }
+    var lastResponse: String { transcript.entries.last(where: { $0.role == .bob })?.text ?? "" }
 
     var pid: Int32? { process?.processIdentifier }
     var isRunning: Bool { process?.isRunning ?? false }
@@ -164,9 +155,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// Sends already written to a busy process's stdin; the CLI queues them
     /// natively and runs each as the next turn (probe 1.7).
     private var cliQueuedSends = 0
-    /// Index of the in-flight bob entry — deltas append here. Not "last bob
-    /// entry": queued user turns may already sit after it.
-    private var currentBobIndex: Int?
+    /// The in-flight bob entry — deltas append here. Not "the last bob
+    /// entry": queued user turns may already sit after it. A reference, not
+    /// an index, so a task notice sweeping itself above can't skew it.
+    private var currentBob: TranscriptEntry?
     /// Text not yet handed to `onSentence` — its own buffer, never an index
     /// into a string that mutates under it (a reused String.Index is UB).
     private var unspoken = ""
@@ -233,7 +225,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
             return
         }
         lastError = nil
-        entries.append(Entry(role: .you, text: prompt, hidden: hidden))
+        transcript.append(TranscriptEntry(role: .you, text: prompt, hidden: hidden))
         switch state {
         case .idle:
             writeUserMessage(prompt)
@@ -301,12 +293,12 @@ final class ClaudeSession: ObservableObject, Identifiable {
         config.sessionId = UUID()
         config.appendSystemPrompt = nil
         sessionOnDisk = false
-        entries = []
+        transcript.replaceAll([])
         lastError = nil
         lastResult = nil
         clientQueue.removeAll()
         cliQueuedSends = 0
-        currentBobIndex = nil
+        currentBob = nil
         unspoken = ""
         pendingPromptChange = nil
         recentDeaths.removeAll()
@@ -332,21 +324,21 @@ final class ClaudeSession: ObservableObject, Identifiable {
     ///
     /// The seam is announced (a notice row), because a switch nobody can see is
     /// a switch that gets narrated wrong later.
-    func resume(conversationId: UUID, history: [Entry]) {
+    func resume(conversationId: UUID, history: [TranscriptEntry]) {
         guard conversationId != config.sessionId else { return }
         config.sessionId = conversationId
         sessionOnDisk = true            // it exists: --resume, not --session-id
         confirmedOnDisk = false         // this process hasn't confirmed it yet
         resumeFallbackUsed = false      // a new id earns its own single retry
-        entries = history
-        entries.append(Entry(role: .notice, text: history.isEmpty
+        transcript.replaceAll(history)
+        transcript.append(TranscriptEntry(role: .notice, text: history.isEmpty
             ? "resumed this conversation — nothing readable on disk, but the model has it"
             : "resumed this conversation — the last \(history.count) turns, read from disk"))
         lastError = nil
         lastResult = nil
         clientQueue.removeAll()
         cliQueuedSends = 0
-        currentBobIndex = nil
+        currentBob = nil
         unspoken = ""
         pendingPromptChange = nil
         pendingModelDrain = false
@@ -614,16 +606,16 @@ final class ClaudeSession: ObservableObject, Identifiable {
             // mid-turn death: close the in-flight entry and NEVER auto-resend
             // — tools may have half-run (edge 2). CLI-queued sends died with
             // the process; their prompts stay visible for a one-Enter re-send.
-            if let idx = currentBobIndex {
-                entries[idx].activity = nil
-                let tail = entries[idx].text.isEmpty
+            if let entry = currentBob {
+                transcript.set(activity: nil, of: entry)
+                let tail = entry.text.isEmpty
                     ? "(connection lost — say that again?)"
                     : " (connection lost — say that again?)"
-                entries[idx].text += tail
+                transcript.append(text: tail, to: entry)
                 if config.voiced { unspoken += tail }
                 flushSpeakable(final: true)
             }
-            currentBobIndex = nil
+            currentBob = nil
             unspoken = ""
             cliQueuedSends = 0
             appendNotice("bob's session dropped — reconnecting")
@@ -721,7 +713,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         case .taskUpdated(let id, let status):
             // no row of its own (the in-turn activity line covers a live task) —
             // but a patch saying "completed" settles a row that's already up
-            if let status, Self.hasSettled(status), taskNoticeIndex(id) != nil {
+            if let status, Self.hasSettled(status), taskNotice(id) != nil {
                 armSweep(id)
             }
             settleAgent(id, status: status, summary: nil)
@@ -799,8 +791,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
     }
 
     private func beginTurn(source: TurnSource) {
-        entries.append(Entry(role: .bob, text: ""))
-        currentBobIndex = entries.count - 1
+        let entry = TranscriptEntry(role: .bob, text: "")
+        transcript.append(entry)
+        currentBob = entry
         unspoken = ""
         state = .turnActive(source)
         note(.turnBegan)
@@ -809,18 +802,18 @@ final class ClaudeSession: ObservableObject, Identifiable {
     private func finishTurn(_ r: TurnResult) {
         lastResult = r
         let interrupted = state == .interrupting || r.terminalReason == "aborted_streaming"
-        if let idx = currentBobIndex {
-            entries[idx].activity = nil
-            if entries[idx].text.isEmpty, let text = r.text, !text.isEmpty, !r.isError {
+        if let entry = currentBob {
+            transcript.set(activity: nil, of: entry)
+            if entry.text.isEmpty, let text = r.text, !text.isEmpty, !r.isError {
                 // synthetic turns (/context, slash commands) stream no deltas;
                 // the result event carries their whole reply (probe 1.3)
-                entries[idx].text = text
+                transcript.set(text: text, of: entry)
                 if config.voiced { unspoken = text }
             }
             if interrupted {
                 // aborted is not an error — the owner asked for it (edge 4)
-                let tail = entries[idx].text.isEmpty ? "(interrupted)" : " (interrupted)"
-                entries[idx].text += tail
+                let tail = entry.text.isEmpty ? "(interrupted)" : " (interrupted)"
+                transcript.append(text: tail, to: entry)
                 if config.voiced { unspoken += tail }
             }
             flushSpeakable(final: true)
@@ -828,7 +821,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         if r.isError && !interrupted {
             lastError = r.text ?? "claude returned \(r.subtype ?? "an error")"
         }
-        currentBobIndex = nil
+        currentBob = nil
         unspoken = ""
 
         switch state {
@@ -894,19 +887,19 @@ final class ClaudeSession: ObservableObject, Identifiable {
     // MARK: - transcript + speech (D5)
 
     private func appendDelta(_ text: String) {
-        guard !text.isEmpty, let idx = currentBobIndex else { return }
-        entries[idx].text += text
+        guard !text.isEmpty, let entry = currentBob else { return }
+        transcript.append(text: text, to: entry)
         if config.voiced { unspoken += text }
         flushSpeakable()
     }
 
     private func setActivity(_ activity: String?) {
-        guard let idx = currentBobIndex else { return }
-        entries[idx].activity = activity
+        guard let entry = currentBob else { return }
+        transcript.set(activity: activity, of: entry)
     }
 
     private func appendNotice(_ text: String) {
-        entries.append(Entry(role: .notice, text: text))
+        transcript.append(TranscriptEntry(role: .notice, text: text))
         note(.activityChanged)   // a permanent notice is session health — listeners re-read status
     }
 
@@ -918,10 +911,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// settles. Everything else appendNotice writes is permanent.
     private func noteTask(id: String, text: String, settled: Bool) {
         taskSweeps.removeValue(forKey: id)?.cancel()
-        if let idx = taskNoticeIndex(id) {
-            entries[idx].text = text
+        if let entry = taskNotice(id) {
+            transcript.set(text: text, of: entry)
         } else {
-            entries.append(Entry(role: .notice, text: text, taskId: id))
+            transcript.append(TranscriptEntry(role: .notice, text: text, taskId: id))
         }
         if settled { armSweep(id) }
     }
@@ -938,15 +931,12 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     private func sweepTask(_ id: String) {
         taskSweeps[id] = nil
-        guard let idx = taskNoticeIndex(id) else { return }
-        entries.remove(at: idx)
-        // currentBobIndex is an index, not a reference — a row vanishing above
-        // the in-flight reply would otherwise point it one past the end
-        if let current = currentBobIndex, current > idx { currentBobIndex = current - 1 }
+        guard let entry = taskNotice(id) else { return }
+        transcript.remove(entry)
     }
 
-    private func taskNoticeIndex(_ id: String) -> Int? {
-        entries.firstIndex { $0.taskId == id }
+    private func taskNotice(_ id: String) -> TranscriptEntry? {
+        transcript.entries.first { $0.taskId == id }
     }
 
     private func cancelSweeps() {
