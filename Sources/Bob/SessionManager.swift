@@ -311,7 +311,7 @@ final class SessionManager: ObservableObject {
         //    appends is session health ("dropped — reconnecting"); live
         //    background-task rows all carry a taskId. Last row = nothing has
         //    happened since, so the owner still hasn't heard.
-        if let last = session.entries.last, last.role == .notice, last.taskId == nil {
+        if let last = session.transcript.entries.last, last.role == .notice, last.taskId == nil {
             return .needsAttention
         }
         // 3. an ask-first tool call is holding for the owner. Checked before
@@ -333,7 +333,7 @@ final class SessionManager: ObservableObject {
         }
         // 6. it wants the owner: tools were denied, or the reply ends in a question.
         if let result = session.lastResult, !result.deniedTools.isEmpty { return .awaitingInput }
-        if endsInQuestion(session.entries.last(where: { $0.role == .bob && !$0.hidden })?.text) {
+        if endsInQuestion(session.transcript.entries.last(where: { $0.role == .bob && !$0.hidden })?.text) {
             return .awaitingInput
         }
         // 7. idle — or never spawned — with a clean last turn.

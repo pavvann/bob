@@ -154,8 +154,10 @@ enum Markdown {
         return blocks
     }
 
-    /// ``` or ~~~ with an optional language tag.
-    private static func fence(_ trimmed: String) -> String? {
+    /// ``` or ~~~ with an optional language tag. Internal because the
+    /// streaming committer (IncrementalBlocks) must agree, line for line,
+    /// on what opens and closes a fence.
+    static func fence(_ trimmed: String) -> String? {
         for marker in ["```", "~~~"] where trimmed.hasPrefix(marker) {
             return String(trimmed.dropFirst(marker.count)).trimmingCharacters(in: .whitespaces)
         }
@@ -229,45 +231,57 @@ enum Markdown {
     }
 }
 
-/// Renders a markdown string as bob's transcript prose.
+/// Renders a markdown string as bob's prose — the one-shot path, for text
+/// that holds still (files, surfaces). It parses per evaluation, which is
+/// fine precisely because nothing re-evaluates it per token: the transcript's
+/// growing replies render through their entry's MarkdownRenderModel instead.
 struct MarkdownText: View {
     let text: String
     var size: CGFloat = 16
     var tint: Color = .primary.opacity(0.92)
 
-    /// Past this, parsing every streamed token stops being free — a reply that
-    /// long is a document, and plain text is a fair reading of it.
-    private static let ceiling = 24_000
+    var body: some View {
+        MarkdownBlocksView(blocks: rendered, size: size, tint: tint)
+    }
+
+    private var rendered: [RenderedBlock] {
+        Markdown.parse(text).enumerated().map { index, block in
+            RenderedBlock(id: index, live: false, block: block, size: size,
+                          inline: Markdown.inline)
+        }
+    }
+}
+
+/// The block column both markdown paths share. Blocks arrive with their
+/// AttributedStrings already built; laying them out must not do any thinking.
+struct MarkdownBlocksView: View {
+    let blocks: [RenderedBlock]
+    var size: CGFloat = 16
+    var tint: Color = .primary.opacity(0.92)
+    /// Highlighter cache identity for fenced blocks; nil for one-shot text.
+    var slot: String? = nil
 
     var body: some View {
-        if text.utf8.count > Self.ceiling {
-            Text(text)
-                .font(.system(size: size, weight: .regular, design: .rounded))
-                .foregroundStyle(tint)
-                .lineSpacing(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            VStack(alignment: .leading, spacing: 9) {
-                ForEach(Array(Markdown.parse(text).enumerated()), id: \.offset) { _, block in
-                    view(for: block)
-                }
+        VStack(alignment: .leading, spacing: 9) {
+            ForEach(blocks) { block in
+                view(for: block)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
-    private func view(for block: Markdown.Block) -> some View {
-        switch block {
+    private func view(for block: RenderedBlock) -> some View {
+        switch block.content {
         case .paragraph(let body):
-            Text(Markdown.inline(body, codeSize: size - 1.5))
+            Text(body)
                 .font(.system(size: size, weight: .regular, design: .rounded))
                 .foregroundStyle(tint)
                 .lineSpacing(4)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
         case .heading(let level, let body):
-            Text(Markdown.inline(body, codeSize: size))
+            Text(body)
                 .font(.system(size: level <= 1 ? size + 4 : level == 2 ? size + 2 : size + 0.5,
                               weight: level <= 2 ? .semibold : .medium,
                               design: .rounded))
@@ -296,7 +310,8 @@ struct MarkdownText: View {
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(.secondary.opacity(0.5))
                 }
-                CodeBlock(source: body, language: language, size: size - 2)
+                CodeBlock(source: body, language: language, size: size - 2,
+                          slot: slot.map { "\($0)/\(block.id)" }, live: block.live)
             }
             .padding(.horizontal, 11)
             .padding(.vertical, 9)
@@ -318,7 +333,7 @@ struct MarkdownText: View {
                 RoundedRectangle(cornerRadius: 1)
                     .fill(Color.accentColor.opacity(0.35))
                     .frame(width: 2)
-                Text(Markdown.inline(body, codeSize: size - 2))
+                Text(body)
                     .font(.system(size: size - 1, weight: .regular, design: .rounded))
                     .foregroundStyle(.secondary.opacity(0.85))
                     .lineSpacing(3)
@@ -333,7 +348,7 @@ struct MarkdownText: View {
         }
     }
 
-    private func row(marker: String, item: Markdown.Item, monospacedMarker: Bool) -> some View {
+    private func row(marker: String, item: RenderedBlock.Item, monospacedMarker: Bool) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 7) {
             Text(marker)
                 .font(.system(size: size - 3,
@@ -341,7 +356,7 @@ struct MarkdownText: View {
                               design: monospacedMarker ? .monospaced : .rounded))
                 .foregroundStyle(.secondary.opacity(0.55))
                 .frame(minWidth: monospacedMarker ? 16 : 8, alignment: .trailing)
-            Text(Markdown.inline(item.text, codeSize: size - 1.5))
+            Text(item.text)
                 .font(.system(size: size, weight: .regular, design: .rounded))
                 .foregroundStyle(tint)
                 .lineSpacing(3)
@@ -362,19 +377,25 @@ struct MarkdownText: View {
 /// through state: plain monospace shows first, and stays for good when the fence
 /// names a language bob has no grammar for. No spinner, nothing moves.
 ///
-/// The wait is the streaming case. A fence inside a reply still arriving changes
-/// on every token, and the highlighter's cache is keyed by content, so every
-/// intermediate draft is a miss — parsing each one would parse the same block
-/// fifty times as it grows. Waiting for the fence to go quiet parses it once.
+/// The wait is for the open fence only. A fence still streaming changes on
+/// every flush, and parsing each draft would parse the same block fifty times
+/// as it grows — waiting for it to go quiet parses it once. A committed or
+/// one-shot fence is final and colours immediately.
 private struct CodeBlock: View {
     let source: String
     let language: String?
     let size: CGFloat
+    /// Highlighter cache slot — stable per block while it streams, so drafts
+    /// of a growing fence overwrite one entry instead of flooding the cache.
+    var slot: String? = nil
+    /// Part of a still-arriving tail: sit out the token stream before
+    /// colouring.
+    var live: Bool = false
 
     @State private var painted: AttributedString?
 
-    /// Long enough to sit out a stream of tokens, short enough that a finished
-    /// reply colours before you've finished reading its first line.
+    /// Long enough to sit out a stream of tokens, short enough that a fence
+    /// colours before you've finished reading its first line.
     private static let quiet = Duration.milliseconds(150)
 
     var body: some View {
@@ -389,11 +410,13 @@ private struct CodeBlock: View {
                 // Whatever was painted belongs to a shorter draft of this fence.
                 if painted != nil { painted = nil }
                 guard let language = language.flatMap(SyntaxHighlighter.language) else { return }
-                try? await Task.sleep(for: Self.quiet)
-                guard !Task.isCancelled else { return }   // another token landed
-                painted = AttributedString(
-                    painting: source,
-                    spans: await SyntaxHighlighter.shared.spans(for: source, language: language))
+                if live {
+                    try? await Task.sleep(for: Self.quiet)
+                    guard !Task.isCancelled else { return }   // another token landed
+                }
+                painted = await SyntaxHighlighter.shared.painted(
+                    source, language: language,
+                    slot: slot ?? "anon/\(source.hashValue)")
             }
     }
 }
@@ -402,8 +425,8 @@ private struct CodeBlock: View {
 /// is a fixed column, and a sentence in a cell is the normal case here, so
 /// wrapping keeps the comparison readable instead of pushing it offscreen.
 private struct TableBlock: View {
-    let head: [String]
-    let rows: [[String]]
+    let head: [AttributedString]
+    let rows: [[AttributedString]]
     let size: CGFloat
     let tint: Color
 
@@ -420,7 +443,8 @@ private struct TableBlock: View {
             ForEach(rows.indices, id: \.self) { index in
                 GridRow {
                     ForEach(head.indices, id: \.self) { column in
-                        cell(index < rows.count && column < rows[index].count ? rows[index][column] : "",
+                        cell(index < rows.count && column < rows[index].count
+                                ? rows[index][column] : AttributedString(),
                              weight: .regular, color: tint)
                     }
                 }
@@ -443,8 +467,8 @@ private struct TableBlock: View {
         }
     }
 
-    private func cell(_ text: String, weight: Font.Weight, color: Color) -> some View {
-        Text(Markdown.inline(text, codeSize: size - 3.5))
+    private func cell(_ text: AttributedString, weight: Font.Weight, color: Color) -> some View {
+        Text(text)
             .font(.system(size: size - 2, weight: weight, design: .rounded))
             .foregroundStyle(color)
             .lineSpacing(2)

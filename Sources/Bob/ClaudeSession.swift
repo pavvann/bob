@@ -87,24 +87,15 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     enum Role: Equatable { case you, bob, notice }
 
-    struct Entry: Identifiable, Equatable {
-        let id = UUID()
-        let role: Role
-        var text: String
-        var hidden: Bool = false      // injected prompts (debriefs) — never rendered
-        var activity: String? = nil   // live tool line ("reading Foo.swift") while in flight
-        /// Non-nil on a background-task notice: this row is *live status* for one
-        /// task — rewritten in place as the task talks, swept once it settles
-        /// (D3). Every other notice (session dropped, compatibility mode) leaves
-        /// this nil and stays in the transcript forever.
-        var taskId: String? = nil
-    }
-
     let id = UUID()
     private(set) var config: SessionConfig
 
+    /// Message content lives in its own @Observable store (P2b): a streamed
+    /// token wakes the one row reading it, and the @Published surface below
+    /// speaks only at boundaries.
+    let transcript = TranscriptStore()
+
     @Published private(set) var state: State = .unspawned
-    @Published private(set) var entries: [Entry] = []
     @Published private(set) var lastError: String? = nil
     @Published private(set) var lastResult: TurnResult? = nil
     /// What claude is blocked on, waiting for a person to choose. The turn stays
@@ -131,7 +122,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
     }
 
     /// Most recent completed-or-streaming reply (adapter convenience).
-    var lastResponse: String { entries.last(where: { $0.role == .bob })?.text ?? "" }
+    var lastResponse: String { transcript.entries.last(where: { $0.role == .bob })?.text ?? "" }
 
     var pid: Int32? { process?.processIdentifier }
     var isRunning: Bool { process?.isRunning ?? false }
@@ -156,6 +147,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
     private var readerTask: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
     private var eventTaps: [UUID: AsyncStream<StreamEvent>.Continuation] = [:]
+    private var noteTaps: [UUID: AsyncStream<SessionNote>.Continuation] = [:]
 
     /// Sends made while no live process could take them (spawning/draining) —
     /// flushed the moment init lands (D4). Nothing is ever silently dropped.
@@ -163,10 +155,13 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// Sends already written to a busy process's stdin; the CLI queues them
     /// natively and runs each as the next turn (probe 1.7).
     private var cliQueuedSends = 0
-    /// Index of the in-flight bob entry — deltas append here. Not "last bob
-    /// entry": queued user turns may already sit after it.
-    private var currentBobIndex: Int?
-    private var spokenIndex: String.Index?
+    /// The in-flight bob entry — deltas append here. Not "the last bob
+    /// entry": queued user turns may already sit after it. A reference, not
+    /// an index, so a task notice sweeping itself above can't skew it.
+    private var currentBob: TranscriptEntry?
+    /// Text not yet handed to `onSentence` — its own buffer, never an index
+    /// into a string that mutates under it (a reused String.Index is UB).
+    private var unspoken = ""
     /// A lens change requested mid-turn (D4.2) — `.some(newPrompt)` applies at
     /// the next idle; the prompt itself may be nil (@none).
     private var pendingPromptChange: String?? = nil
@@ -230,7 +225,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
             return
         }
         lastError = nil
-        entries.append(Entry(role: .you, text: prompt, hidden: hidden))
+        transcript.append(TranscriptEntry(role: .you, text: prompt, hidden: hidden))
         switch state {
         case .idle:
             writeUserMessage(prompt)
@@ -257,6 +252,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
             "request": ["subtype": "interrupt"],
         ])
         state = .interrupting
+        note(.activityChanged)   // listeners record it: this stop is the owner's, not news
     }
 
     /// Swap the lens/persona riding this session (D4). Takes resolved prompt
@@ -297,13 +293,13 @@ final class ClaudeSession: ObservableObject, Identifiable {
         config.sessionId = UUID()
         config.appendSystemPrompt = nil
         sessionOnDisk = false
-        entries = []
+        transcript.replaceAll([])
         lastError = nil
         lastResult = nil
         clientQueue.removeAll()
         cliQueuedSends = 0
-        currentBobIndex = nil
-        spokenIndex = nil
+        currentBob = nil
+        unspoken = ""
         pendingPromptChange = nil
         recentDeaths.removeAll()
         cancelSweeps()
@@ -328,22 +324,22 @@ final class ClaudeSession: ObservableObject, Identifiable {
     ///
     /// The seam is announced (a notice row), because a switch nobody can see is
     /// a switch that gets narrated wrong later.
-    func resume(conversationId: UUID, history: [Entry]) {
+    func resume(conversationId: UUID, history: [TranscriptEntry]) {
         guard conversationId != config.sessionId else { return }
         config.sessionId = conversationId
         sessionOnDisk = true            // it exists: --resume, not --session-id
         confirmedOnDisk = false         // this process hasn't confirmed it yet
         resumeFallbackUsed = false      // a new id earns its own single retry
-        entries = history
-        entries.append(Entry(role: .notice, text: history.isEmpty
+        transcript.replaceAll(history)
+        transcript.append(TranscriptEntry(role: .notice, text: history.isEmpty
             ? "resumed this conversation — nothing readable on disk, but the model has it"
             : "resumed this conversation — the last \(history.count) turns, read from disk"))
         lastError = nil
         lastResult = nil
         clientQueue.removeAll()
         cliQueuedSends = 0
-        currentBobIndex = nil
-        spokenIndex = nil
+        currentBob = nil
+        unspoken = ""
         pendingPromptChange = nil
         pendingModelDrain = false
         recentDeaths.removeAll()
@@ -381,10 +377,11 @@ final class ClaudeSession: ObservableObject, Identifiable {
     // MARK: - event fan-out (the phase-3 manager substrate, D9)
 
     /// Every decoded event, multicast: each access mints an independent
-    /// stream. Status derivation and AttentionCenter subscribe here without
-    /// touching the state machine.
+    /// stream. Bounded — a tap that stops draining loses its oldest events
+    /// rather than growing a queue forever. Text deltas arrive already
+    /// coalesced to the pump's ~16ms windows.
     var events: AsyncStream<StreamEvent> {
-        AsyncStream { continuation in
+        AsyncStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
             let key = UUID()
             eventTaps[key] = continuation
             continuation.onTermination = { [weak self] _ in
@@ -395,6 +392,31 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     private func broadcast(_ event: StreamEvent) {
         for tap in eventTaps.values { tap.yield(event) }
+    }
+
+    /// The semantic beat: turn boundaries and health flips, nothing per-token.
+    /// AttentionCenter listens here instead of objectWillChange, so a
+    /// streaming turn wakes it a handful of times, not once per delta. Emitted
+    /// after the mutation they describe — a consumer always reads post-change.
+    enum SessionNote: Sendable {
+        case turnBegan
+        case activityChanged   // a notice landed / readiness moved — status may have changed
+        case turnEnded
+        case sessionFailed
+    }
+
+    var notes: AsyncStream<SessionNote> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(16)) { continuation in
+            let key = UUID()
+            noteTaps[key] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.noteTaps[key] = nil }
+            }
+        }
+    }
+
+    private func note(_ n: SessionNote) {
+        for tap in noteTaps.values { tap.yield(n) }
     }
 
     // MARK: - process lifecycle (D1)
@@ -422,9 +444,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
         proc.standardError = stderrSink
 
         // stdout → lines → events, in strict order: one detached task frames
-        // and decodes off the main actor, then awaits each event into the
-        // state machine. AsyncStream buffers unboundedly, so the pipe never
-        // backs up against a busy UI.
+        // and decodes off the main actor, then feeds the pump — which
+        // coalesces text deltas to ~16ms windows and drops non-visual chatter
+        // before anything crosses to the main actor. AsyncStream buffers
+        // unboundedly, so the pipe never backs up against a busy UI.
         let bytes = AsyncStream<Data> { continuation in
             stdout.fileHandleForReading.readabilityHandler = { handle in
                 let chunk = handle.availableData
@@ -436,23 +459,29 @@ final class ClaudeSession: ObservableObject, Identifiable {
                 }
             }
         }
-        let reader = Task.detached(priority: .userInitiated) { [weak self] in
+        let pump = StreamPump(session: self)
+        let name = config.name
+        let sink = stderrSink
+        let reader = Task.detached(priority: .userInitiated) {
             var framer = LineFramer()
             var dropped = 0
             for await chunk in bytes {
                 for line in framer.consume(chunk) {
                     let event = StreamJSON.decode(line)
                     if case .ignored(let forensic) = event {
-                        if let forensic { await self?.noteForensic(forensic) }
+                        if let forensic { Self.noteForensic(forensic, name: name, sink: sink) }
                         continue
                     }
-                    await self?.handle(event)
+                    await pump.ingest(event)
                 }
                 if framer.droppedLines > dropped {
                     dropped = framer.droppedLines
-                    await self?.noteForensic("(dropped oversized stdout line, >4MB)")
+                    Self.noteForensic("(dropped oversized stdout line, >4MB)", name: name, sink: sink)
                 }
             }
+            // flush the pump's tail before the exit handler awaits us — a
+            // final fragment must land before crash/drain handling runs
+            await pump.finish()
         }
         readerTask = reader
 
@@ -473,6 +502,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
             stdout.fileHandleForReading.readabilityHandler = nil
             lastError = "couldn't start claude: \(error.localizedDescription)"
             state = .failed(lastError!)
+            note(.sessionFailed)
             return
         }
         process = proc
@@ -540,6 +570,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         guard proc === process, state == .spawning else { return }
         lastError = "claude didn't answer the readiness handshake within 30s"
         state = .failed(lastError!)
+        note(.sessionFailed)
         proc.terminate()               // exit handler sees .failed and stays down
     }
 
@@ -575,15 +606,18 @@ final class ClaudeSession: ObservableObject, Identifiable {
             // mid-turn death: close the in-flight entry and NEVER auto-resend
             // — tools may have half-run (edge 2). CLI-queued sends died with
             // the process; their prompts stay visible for a one-Enter re-send.
-            if let idx = currentBobIndex {
-                entries[idx].activity = nil
-                entries[idx].text += entries[idx].text.isEmpty
+            if let entry = currentBob {
+                transcript.set(activity: nil, of: entry)
+                let tail = entry.text.isEmpty
                     ? "(connection lost — say that again?)"
                     : " (connection lost — say that again?)"
-                flushSpeakable(entries[idx].text, final: true)
+                transcript.append(text: tail, to: entry)
+                if config.voiced { unspoken += tail }
+                flushSpeakable(final: true)
+                transcript.finalize(entry)
             }
-            currentBobIndex = nil
-            spokenIndex = nil
+            currentBob = nil
+            unspoken = ""
             cliQueuedSends = 0
             appendNotice("bob's session dropped — reconnecting")
             respawnAfterUnexpectedDeath()
@@ -626,6 +660,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
             // .failed and falls back to the legacy one-shot path.
             lastError = "crashed twice in a minute"
             state = .failed(lastError!)
+            note(.sessionFailed)
             appendNotice("bob's session keeps dying — check state/bridge-stderr.log")
             return
         }
@@ -633,6 +668,21 @@ final class ClaudeSession: ObservableObject, Identifiable {
     }
 
     // MARK: - the state machine (D2)
+
+    /// The pump's one doorway onto the main actor. Coalesced text lands
+    /// first, then the boundary that flushed it — ordering survives the
+    /// trip, and a window's worth of deltas costs one entries mutation.
+    /// Text nil with no boundary is thinking chatter's idle check (D5).
+    func applyPump(text: String?, boundary: StreamEvent?) {
+        if let text {
+            spontaneousIfIdle()
+            broadcast(.streamEvent(.textDelta(text)))
+            appendDelta(text)
+        } else if boundary == nil {
+            spontaneousIfIdle()
+        }
+        if let boundary { handle(boundary) }
+    }
 
     private func handle(_ event: StreamEvent) {
         broadcast(event)
@@ -646,10 +696,11 @@ final class ClaudeSession: ObservableObject, Identifiable {
             becomeReadyIfSpawning()
         case .status:
             spontaneousIfIdle()
-        case .streamEvent(let partial):
+        case .streamEvent:
+            // text/thinking deltas never reach here — the pump coalesces them
+            // into applyPump; what's left is block/message chatter worth an
+            // idle check and nothing more
             spontaneousIfIdle()
-            if case .textDelta(let text) = partial { appendDelta(text) }
-            // thinking deltas: never spoken, not rendered in v1 (D5)
         case .assistant(let blocks):
             spontaneousIfIdle()
             for case .toolUse(_, let activity) in blocks { setActivity(activity) }
@@ -663,7 +714,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         case .taskUpdated(let id, let status):
             // no row of its own (the in-turn activity line covers a live task) —
             // but a patch saying "completed" settles a row that's already up
-            if let status, Self.hasSettled(status), taskNoticeIndex(id) != nil {
+            if let status, Self.hasSettled(status), taskNotice(id) != nil {
                 armSweep(id)
             }
             settleAgent(id, status: status, summary: nil)
@@ -728,6 +779,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         watchdog?.cancel()
         watchdog = nil
         state = .idle
+        note(.activityChanged)
         flushClientQueue()
     }
 
@@ -740,33 +792,39 @@ final class ClaudeSession: ObservableObject, Identifiable {
     }
 
     private func beginTurn(source: TurnSource) {
-        entries.append(Entry(role: .bob, text: ""))
-        currentBobIndex = entries.count - 1
-        spokenIndex = nil
+        let entry = TranscriptEntry(role: .bob, text: "")
+        transcript.append(entry)
+        currentBob = entry
+        unspoken = ""
         state = .turnActive(source)
+        note(.turnBegan)
     }
 
     private func finishTurn(_ r: TurnResult) {
         lastResult = r
         let interrupted = state == .interrupting || r.terminalReason == "aborted_streaming"
-        if let idx = currentBobIndex {
-            entries[idx].activity = nil
-            if entries[idx].text.isEmpty, let text = r.text, !text.isEmpty, !r.isError {
+        if let entry = currentBob {
+            transcript.set(activity: nil, of: entry)
+            if entry.text.isEmpty, let text = r.text, !text.isEmpty, !r.isError {
                 // synthetic turns (/context, slash commands) stream no deltas;
                 // the result event carries their whole reply (probe 1.3)
-                entries[idx].text = text
+                transcript.set(text: text, of: entry)
+                if config.voiced { unspoken = text }
             }
             if interrupted {
                 // aborted is not an error — the owner asked for it (edge 4)
-                entries[idx].text += entries[idx].text.isEmpty ? "(interrupted)" : " (interrupted)"
+                let tail = entry.text.isEmpty ? "(interrupted)" : " (interrupted)"
+                transcript.append(text: tail, to: entry)
+                if config.voiced { unspoken += tail }
             }
-            flushSpeakable(entries[idx].text, final: true)
+            flushSpeakable(final: true)
+            transcript.finalize(entry)
         }
         if r.isError && !interrupted {
             lastError = r.text ?? "claude returned \(r.subtype ?? "an error")"
         }
-        currentBobIndex = nil
-        spokenIndex = nil
+        currentBob = nil
+        unspoken = ""
 
         switch state {
         case .turnActive, .interrupting:
@@ -774,6 +832,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
         default:
             return   // stray result while draining/idle — entry closed, state untouched
         }
+        note(.turnEnded)
         if !interrupted, cliQueuedSends > 0 {
             // a send queued in the CLI mid-turn becomes the next turn
             // immediately (probe 1.7) — pre-label it so the incoming events
@@ -830,18 +889,20 @@ final class ClaudeSession: ObservableObject, Identifiable {
     // MARK: - transcript + speech (D5)
 
     private func appendDelta(_ text: String) {
-        guard !text.isEmpty, let idx = currentBobIndex else { return }
-        entries[idx].text += text
-        flushSpeakable(entries[idx].text)
+        guard !text.isEmpty, let entry = currentBob else { return }
+        transcript.append(text: text, to: entry)
+        if config.voiced { unspoken += text }
+        flushSpeakable()
     }
 
     private func setActivity(_ activity: String?) {
-        guard let idx = currentBobIndex else { return }
-        entries[idx].activity = activity
+        guard let entry = currentBob else { return }
+        transcript.set(activity: activity, of: entry)
     }
 
     private func appendNotice(_ text: String) {
-        entries.append(Entry(role: .notice, text: text))
+        transcript.append(TranscriptEntry(role: .notice, text: text))
+        note(.activityChanged)   // a permanent notice is session health — listeners re-read status
     }
 
     // MARK: - task notices (live status, not history)
@@ -852,10 +913,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// settles. Everything else appendNotice writes is permanent.
     private func noteTask(id: String, text: String, settled: Bool) {
         taskSweeps.removeValue(forKey: id)?.cancel()
-        if let idx = taskNoticeIndex(id) {
-            entries[idx].text = text
+        if let entry = taskNotice(id) {
+            transcript.set(text: text, of: entry)
         } else {
-            entries.append(Entry(role: .notice, text: text, taskId: id))
+            transcript.append(TranscriptEntry(role: .notice, text: text, taskId: id))
         }
         if settled { armSweep(id) }
     }
@@ -872,15 +933,12 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     private func sweepTask(_ id: String) {
         taskSweeps[id] = nil
-        guard let idx = taskNoticeIndex(id) else { return }
-        entries.remove(at: idx)
-        // currentBobIndex is an index, not a reference — a row vanishing above
-        // the in-flight reply would otherwise point it one past the end
-        if let current = currentBobIndex, current > idx { currentBobIndex = current - 1 }
+        guard let entry = taskNotice(id) else { return }
+        transcript.remove(entry)
     }
 
-    private func taskNoticeIndex(_ id: String) -> Int? {
-        entries.firstIndex { $0.taskId == id }
+    private func taskNotice(_ id: String) -> TranscriptEntry? {
+        transcript.entries.first { $0.taskId == id }
     }
 
     private func cancelSweeps() {
@@ -896,34 +954,31 @@ final class ClaudeSession: ObservableObject, Identifiable {
             .contains(status.lowercased())
     }
 
-    /// Emit any newly-completed sentences (since `spokenIndex`) to
-    /// `onSentence`. Moved from ClaudeBridge; deltas arrive as whole strings
-    /// now, so the byte-boundary decoding is gone — framing already
-    /// guarantees valid UTF-8. A sentence ends at . ? ! or newline followed
-    /// by whitespace or end. Scans only the unspoken suffix.
-    private func flushSpeakable(_ full: String, final: Bool = false) {
-        guard config.voiced, onSentence != nil else { return }
-        let start = spokenIndex ?? full.startIndex
-        guard start < full.endIndex else { return }
+    /// Emit any newly-completed sentences to `onSentence`. Voiced deltas
+    /// mirror into `unspoken`; complete sentences leave it, the fragment
+    /// stays — no index survives a mutation. A sentence ends at . ? ! or
+    /// newline followed by whitespace or end. Runs once per coalesced flush.
+    private func flushSpeakable(final: Bool = false) {
+        guard config.voiced, onSentence != nil, !unspoken.isEmpty else { return }
 
-        var lastBoundary = start
-        var i = start
-        while i < full.endIndex {
-            let ch = full[i]
-            let next = full.index(after: i)
+        var lastBoundary = unspoken.startIndex
+        var i = unspoken.startIndex
+        while i < unspoken.endIndex {
+            let ch = unspoken[i]
+            let next = unspoken.index(after: i)
             if ch == "." || ch == "!" || ch == "?" || ch == "\n" {
-                if next == full.endIndex || full[next].isWhitespace {
+                if next == unspoken.endIndex || unspoken[next].isWhitespace {
                     lastBoundary = next
                 }
             }
             i = next
         }
-        if final { lastBoundary = full.endIndex }
+        if final { lastBoundary = unspoken.endIndex }
 
-        guard lastBoundary > start else { return }
-        let chunk = String(full[start..<lastBoundary])
+        guard lastBoundary > unspoken.startIndex else { return }
+        let chunk = String(unspoken[..<lastBoundary])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        spokenIndex = lastBoundary
+        unspoken = String(unspoken[lastBoundary...])
         if !chunk.isEmpty { onSentence?(chunk) }
     }
 
@@ -1044,10 +1099,11 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     /// Undecodable stdout lines land in the shared stderr sink (edge 10) —
     /// same file a curious owner already checks: state/bridge-stderr.log.
-    private func noteForensic(_ line: String) {
-        let entry = "[bob:\(config.name)] undecodable stream line: \(line.prefix(2000))\n"
+    /// Written straight from the reader: a diagnostic never wakes the main actor.
+    private nonisolated static func noteForensic(_ line: String, name: String, sink: FileHandle) {
+        let entry = "[bob:\(name)] undecodable stream line: \(line.prefix(2000))\n"
         if let data = entry.data(using: .utf8) {
-            try? stderrSink.write(contentsOf: data)
+            try? sink.write(contentsOf: data)
         }
     }
 }

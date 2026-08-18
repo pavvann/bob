@@ -196,10 +196,10 @@ struct CanvasBoard {
     }
 }
 
-/// File-backed store for the canvas surface. Same shape as TodoService:
-/// poll the file every 700ms, write back debounced + atomic. A dirty-position
-/// guard keeps the poll from ever clobbering an in-flight drag or edit —
-/// our debounced write wins, like notes.
+/// File-backed store for the canvas surface. Same shape as TodoService: watch
+/// the directory, write back debounced + atomic. A dirty-position guard keeps a
+/// scan from ever clobbering an in-flight drag or edit — our debounced write
+/// wins, like notes.
 @MainActor
 final class CanvasStore: ObservableObject {
     static let shared = CanvasStore()
@@ -221,8 +221,9 @@ final class CanvasStore: ObservableObject {
     private let root: URL
     private var lastDiskText = ""
     private var dirty = false
+    /// Bumped per scan — only the newest one gets to land.
+    private var scanEpoch = 0
     private var saveTask: Task<Void, Never>?
-    private var pollTask: Task<Void, Never>?
 
     private var currentURL: URL? { boardName.map { root.appendingPathComponent($0 + ".md") } }
     var cards: [CanvasCard] { board?.cards ?? [] }
@@ -231,18 +232,28 @@ final class CanvasStore: ObservableObject {
         self.root = root ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("bob/canvas", isDirectory: true)
         try? FileManager.default.createDirectory(at: self.root, withIntermediateDirectories: true)
+        DirWatcher.shared.acquire(path: self.root.path, id: "canvas-\(self.root.path)") { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
         refreshBoards()
-        startPolling()
     }
 
     deinit {
-        pollTask?.cancel()
         saveTask?.cancel()
+        DirWatcher.shared.release(id: "canvas-\(root.path)")
     }
 
     // MARK: boards
 
+    /// Synchronous — the callers are user actions (opening the surface, switching
+    /// boards) that need the list before they can pick one. The watcher path goes
+    /// through `refresh()` and never touches disk on the main actor.
     func refreshBoards() {
+        let refs = Self.list(root: root)
+        if refs != boards { boards = refs }
+    }
+
+    private nonisolated static func list(root: URL) -> [BoardRef] {
         let files = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
         var refs = files.filter { $0.pathExtension == "md" }
             .map { BoardRef(name: $0.deletingPathExtension().lastPathComponent, url: $0) }
@@ -250,7 +261,7 @@ final class CanvasStore: ObservableObject {
         if let i = refs.firstIndex(where: { $0.name == "scratch" }), i > 0 {
             refs.insert(refs.remove(at: i), at: 0)
         }
-        if refs != boards { boards = refs }
+        return refs
     }
 
     /// First open of the surface: pick up where we were, else the first
@@ -348,20 +359,30 @@ final class CanvasStore: ObservableObject {
         dirty = false
     }
 
-    private func startPolling() {
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                self?.tick()
-                try? await Task.sleep(nanoseconds: 700_000_000)
-            }
+    /// A change under `canvas/`. The listing and the read run off the main actor;
+    /// the dirty-position guard is applied twice — once before the read, so a
+    /// drag doesn't pay for it, and again on the way back in, because the drag
+    /// may have started while the read was in flight.
+    private func refresh() {
+        scanEpoch += 1
+        let epoch = scanEpoch
+        let root = self.root
+        let target = (!dirty && activeDragID == nil && !editingHold) ? currentURL : nil
+        Task.detached(priority: .utility) { [weak self] in
+            let listed = Self.list(root: root)
+            let text = target.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+            await self?.apply(listed, text: text, from: target, epoch: epoch)
         }
     }
 
-    private func tick() {
-        refreshBoards()
-        // dirty-position guard: a poll never clobbers unsaved local state.
-        guard !dirty, activeDragID == nil, !editingHold, let url = currentURL else { return }
-        guard let text = try? String(contentsOf: url, encoding: .utf8), text != lastDiskText else { return }
+    private func apply(_ listed: [BoardRef], text: String?, from url: URL?, epoch: Int) {
+        // same rule as notes: two overlapping scans can finish out of order, and
+        // the older one's text would land on top of the newer one's.
+        guard epoch == scanEpoch else { return }
+        if listed != boards { boards = listed }
+        guard let url, url == currentURL, !dirty, activeDragID == nil, !editingHold,
+              let text, text != lastDiskText
+        else { return }
         adopt(text)
     }
 }

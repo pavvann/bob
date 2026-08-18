@@ -19,13 +19,16 @@ final class GitHubService: ObservableObject {
         let repo: String  // owner/repo
     }
 
+    /// What the tile renders — no timestamp, so equality means "the same tile".
+    /// The freshness stamp belongs to the disk mirror, not to the UI: a fresh
+    /// `Date()` in here guaranteed a whole-window invalidation every 180s whether
+    /// or not github had anything new to say.
     struct State: Codable, Equatable {
         let reviewRequests: [PR]
         let openPRs: [PR]
         let unreadNotifications: Int
         let ghAvailable: Bool
         let lastError: String?
-        let updatedAt: Date
 
         enum CodingKeys: String, CodingKey {
             case reviewRequests = "review_requests"
@@ -33,7 +36,21 @@ final class GitHubService: ObservableObject {
             case unreadNotifications = "unread_notifications"
             case ghAvailable = "gh_available"
             case lastError = "last_error"
-            case updatedAt = "updated_at"
+        }
+    }
+
+    /// The `~/bob/state/work.json` mirror, which claude reads and does want to
+    /// know the age of.
+    private struct Snapshot: Encodable {
+        let state: State
+        let updatedAt: Date
+
+        enum CodingKeys: String, CodingKey { case updatedAt = "updated_at" }
+
+        func encode(to encoder: Encoder) throws {
+            try state.encode(to: encoder)
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(updatedAt, forKey: .updatedAt)
         }
     }
 
@@ -69,7 +86,7 @@ final class GitHubService: ObservableObject {
     func refresh() async {
         guard let ghPath = Self.findGh() else {
             update(.init(reviewRequests: [], openPRs: [], unreadNotifications: 0,
-                         ghAvailable: false, lastError: "gh CLI not installed", updatedAt: Date()))
+                         ghAvailable: false, lastError: "gh CLI not installed"))
             return
         }
 
@@ -78,8 +95,7 @@ final class GitHubService: ObservableObject {
         guard auth.exitCode == 0 else {
             update(.init(reviewRequests: [], openPRs: [], unreadNotifications: 0,
                          ghAvailable: false,
-                         lastError: "gh not authed — run `gh auth login` in your terminal",
-                         updatedAt: Date()))
+                         lastError: "gh not authed — run `gh auth login` in your terminal"))
             return
         }
 
@@ -90,8 +106,7 @@ final class GitHubService: ObservableObject {
                      openPRs: openPRs,
                      unreadNotifications: notifs,
                      ghAvailable: true,
-                     lastError: nil,
-                     updatedAt: Date()))
+                     lastError: nil))
     }
 
     // MARK: gh queries
@@ -146,17 +161,11 @@ final class GitHubService: ObservableObject {
 
     // MARK: state
 
+    /// The publish is guarded; the write isn't, so `work.json`'s `updated_at`
+    /// still says when we last actually asked github. It goes off-main either way.
     private func update(_ new: State) {
-        self.state = new
-        do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(new)
-            try data.write(to: stateFile, options: .atomic)
-        } catch {
-            // best effort
-        }
+        if new != state { state = new }
+        StateMirror.write(Snapshot(state: new, updatedAt: Date()), to: stateFile)
     }
 
     private func loadCached() {

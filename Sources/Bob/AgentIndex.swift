@@ -123,7 +123,13 @@ enum AgentIndex {
     }
 }
 
-/// Polls the agents of whichever session is on stage.
+/// The agents of whichever session is on stage, re-read when their transcripts
+/// change. Subagent transcripts live under `~/.claude`, so the watcher drives
+/// this; the sweep behind it is a safety net, not the mechanism.
+///
+/// The subscription is ref-counted, and the rail releases it when its `.task` is
+/// cancelled. Nothing ever called the old `watch(nil)`, so a rail that unmounted
+/// left its poll running for the life of the app.
 @MainActor
 final class AgentWatcher: ObservableObject {
     static let shared = AgentWatcher()
@@ -131,23 +137,63 @@ final class AgentWatcher: ObservableObject {
     @Published private(set) var agents: [SessionAgent] = []
 
     private var watching: UUID?
-    private var poll: Task<Void, Never>?
+    private var cwd: URL?
+    private var holders = 0
+    private var sweep: Task<Void, Never>?
 
-    func watch(conversation: UUID?, cwd: URL?) {
-        guard watching != conversation else { return }
+    private static let watchID = "agent-watcher"
+    private static let floor: TimeInterval = 2.5
+    private static let sweepInterval: UInt64 = 30_000_000_000
+
+    func acquire(conversation: UUID?, cwd: URL?) {
+        holders += 1
+        if holders == 1 { start() }
+        retarget(conversation: conversation, cwd: cwd)
+    }
+
+    func release() {
+        holders -= 1
+        guard holders <= 0 else { return }
+        holders = 0
+        DirWatcher.shared.release(id: Self.watchID)
+        sweep?.cancel()
+        sweep = nil
+        watching = nil
+        cwd = nil
+        if !agents.isEmpty { agents = [] }
+    }
+
+    /// `/resume` points a tab at a different conversation — different agents.
+    func retarget(conversation: UUID?, cwd: URL?) {
+        guard conversation != watching || cwd != self.cwd else { return }
         watching = conversation
-        poll?.cancel()
-        agents = []
-        guard let conversation, let cwd else { return }
-        poll = Task { [weak self] in
+        self.cwd = cwd
+        if !agents.isEmpty { agents = [] }
+        refresh()
+    }
+
+    private func start() {
+        let projects = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects", isDirectory: true)
+        DirWatcher.shared.acquire(path: projects.path, id: Self.watchID, floor: Self.floor) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        sweep = Task { [weak self] in
             while !Task.isCancelled {
-                let found = await Task.detached(priority: .utility) {
-                    AgentIndex.agents(conversation: conversation, cwd: cwd)
-                }.value
-                guard !Task.isCancelled else { return }
-                if self?.watching == conversation, self?.agents != found { self?.agents = found }
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                try? await Task.sleep(nanoseconds: Self.sweepInterval)
+                self?.refresh()
             }
+        }
+    }
+
+    private func refresh() {
+        guard let conversation = watching, let cwd else { return }
+        Task { [weak self] in
+            let found = await Task.detached(priority: .utility) {
+                AgentIndex.agents(conversation: conversation, cwd: cwd)
+            }.value
+            guard let self, self.watching == conversation, self.agents != found else { return }
+            self.agents = found
         }
     }
 }

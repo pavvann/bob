@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import Observation
 
 /// Feeds one floating panel. File-fed panels (minions, external cli sessions)
 /// tail their own file with their own byte offset — unrelated minion churn on
@@ -34,8 +35,11 @@ final class SessionFeedModel: ObservableObject {
     private let flavor: TranscriptParser.Flavor
     private var pollTask: Task<Void, Never>?
     private var liveTap: AnyCancellable?
-    /// entry id → the row it produced. A streaming turn republishes `entries`
-    /// on every delta; rows whose text hasn't moved hand back the very same
+    /// Invalidates a stale transcript watch after stop() — the re-arming
+    /// observation below checks it before every re-ingest.
+    private var liveGeneration = 0
+    /// entry id → the row it produced. A streaming turn re-ingests per
+    /// coalesced flush; rows whose text hasn't moved hand back the very same
     /// FeedEvent, identity included, so SwiftUI redraws the one row that's
     /// growing and not the whole feed.
     private var liveRows: [UUID: FeedEvent] = [:]
@@ -86,15 +90,19 @@ final class SessionFeedModel: ObservableObject {
         if case .live(let session) = source {
             guard liveTap == nil else { return }
             // BACKFILL, always, before subscribing: `session.events` mints a
-            // fresh multicast stream per access and replays nothing, so
-            // `entries` is the only history there is. A panel opened mid-turn
+            // fresh multicast stream per access and replays nothing, so the
+            // transcript is the only history there is. A panel opened mid-turn
             // has to read it rather than wait for what comes next.
             ingestLive(session)
+            // boundaries (state, question, agents) — low-frequency since the
+            // transcript moved off the session's published surface (P2b)
             liveTap = session.objectWillChange
                 .receive(on: DispatchQueue.main)   // willChange fires pre-mutation
                 .sink { [weak self] in
                     MainActor.assumeIsolated { self?.ingestLive(session) }
                 }
+            liveGeneration += 1
+            watchTranscript(session, generation: liveGeneration)
             return
         }
         guard pollTask == nil else { return }
@@ -110,6 +118,22 @@ final class SessionFeedModel: ObservableObject {
         pollTask?.cancel()
         pollTask = nil
         liveTap = nil
+        liveGeneration += 1
+    }
+
+    /// Per-flush text comes straight from the store: one observation of its
+    /// revision, re-armed after every read. willSet fires pre-mutation, so
+    /// the re-read hops the actor once and lands post-change.
+    private func watchTranscript(_ session: ClaudeSession, generation: Int) {
+        withObservationTracking {
+            _ = session.transcript.revision
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.liveGeneration == generation else { return }
+                self.ingestLive(session)
+                self.watchTranscript(session, generation: generation)
+            }
+        }
     }
 
     /// The cold panel's button. Idempotent — ClaudeSession.spawn() only acts
@@ -123,15 +147,15 @@ final class SessionFeedModel: ObservableObject {
 
     // MARK: live in-app session (PanelSource.live)
 
-    /// Rebuild the panel's face from what the session publishes. Runs once per
-    /// streamed delta, hence the row cache and the equality gates: an update
+    /// Rebuild the panel's face from what the session holds. Runs once per
+    /// coalesced flush, hence the row cache and the equality gates: an update
     /// that changes nothing publishes nothing.
     private func ingestLive(_ session: ClaudeSession) {
         var rows: [FeedEvent] = []
         var cache: [UUID: FeedEvent] = [:]
         // hidden entries (debrief injections) are invisible here for the same
         // reason they're invisible in chat — the owner never wrote them
-        for entry in session.entries where !entry.hidden {
+        for entry in session.transcript.entries where !entry.hidden {
             guard let text = Self.tidy(entry.text, limit: entry.role == .you ? 300 : 280)
             else { continue }
             let row: FeedEvent
@@ -149,12 +173,12 @@ final class SessionFeedModel: ObservableObject {
             lastActivity = Date()
         }
         let streaming = session.isStreaming
-        let tool = streaming ? session.entries.last(where: { $0.activity != nil })?.activity : nil
+        let tool = streaming ? session.transcript.entries.last(where: { $0.activity != nil })?.activity : nil
         if tool != activity {
             activity = tool
             if tool != nil { lastActivity = Date() }
         }
-        // equality-gated like everything above: this runs per streamed delta,
+        // equality-gated like everything above: this runs per coalesced flush,
         // and an unchanged publish still invalidates the whole panel
         let status = SessionManager.status(of: session)
         if status != liveStatus { liveStatus = status }
@@ -174,7 +198,7 @@ final class SessionFeedModel: ObservableObject {
         }
     }
 
-    private static func symbol(_ entry: ClaudeSession.Entry) -> String {
+    private static func symbol(_ entry: TranscriptEntry) -> String {
         switch entry.role {
         case .you: return "person.fill"
         case .bob: return "bubble.left"

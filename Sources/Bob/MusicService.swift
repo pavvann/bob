@@ -24,15 +24,30 @@ final class MusicService: ObservableObject {
         }
     }
 
+    /// What the tile renders. No timestamp: Music.app re-announces the same track
+    /// often enough that a `Date()` in here made every announcement a fresh
+    /// publish, and every publish an artwork-palette recompute.
     struct Playback: Codable, Equatable {
         let source: String         // "apple_music" | "spotify"
         let state: String          // "playing" | "paused" | "stopped"
         let track: Track?
-        let updatedAt: Date
 
         enum CodingKeys: String, CodingKey {
             case source, state, track
-            case updatedAt = "updated_at"
+        }
+    }
+
+    /// The `~/bob/state/music.json` mirror claude reads.
+    private struct Snapshot: Encodable {
+        let playback: Playback
+        let updatedAt: Date
+
+        enum CodingKeys: String, CodingKey { case updatedAt = "updated_at" }
+
+        func encode(to encoder: Encoder) throws {
+            try playback.encode(to: encoder)
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(updatedAt, forKey: .updatedAt)
         }
     }
 
@@ -56,8 +71,7 @@ final class MusicService: ObservableObject {
     /// ApplicationMusicPlayer — Music.app's playerInfo notification doesn't
     /// fire for that, so we push directly to the tile).
     func publish(track: Track, state: String = "playing", source: String = "apple_music_catalog") {
-        self.current = Playback(source: source, state: state, track: track, updatedAt: Date())
-        writeState()
+        adopt(Playback(source: source, state: state, track: track))
     }
 
     /// State-only update for the in-process catalog player (pause/resume/stop
@@ -66,9 +80,15 @@ final class MusicService: ObservableObject {
     /// Spotify play.
     func publishCatalogState(_ state: String) {
         guard let cur = current, cur.source == "apple_music_catalog", cur.state != state else { return }
-        current = Playback(source: cur.source, state: state,
-                           track: state == "stopped" ? nil : cur.track, updatedAt: Date())
-        writeState()
+        adopt(Playback(source: cur.source, state: state,
+                       track: state == "stopped" ? nil : cur.track))
+    }
+
+    /// The one door onto `current`: the publish is `==`-guarded, and the disk
+    /// mirror is written off-main whenever the player has spoken.
+    private func adopt(_ playback: Playback) {
+        if playback != current { current = playback }
+        StateMirror.write(Snapshot(playback: playback, updatedAt: Date()), to: stateFile)
     }
 
     // MARK: album-art palette
@@ -174,8 +194,7 @@ final class MusicService: ObservableObject {
 
             let art = await lookupArtwork(artist: artist, album: album, track: name)
             let track = Track(name: name, artist: artist, album: album, durationMs: nil, artworkURL: art)
-            current = Playback(source: source, state: state, track: track, updatedAt: Date())
-            writeState()
+            adopt(Playback(source: source, state: state, track: track))
         }
     }
 
@@ -251,8 +270,7 @@ final class MusicService: ObservableObject {
 
         guard state != "stopped" else {
             Task { @MainActor in
-                self.current = Playback(source: "apple_music", state: "stopped", track: nil, updatedAt: Date())
-                self.writeState()
+                self.adopt(Playback(source: "apple_music", state: "stopped", track: nil))
             }
             return
         }
@@ -265,8 +283,7 @@ final class MusicService: ObservableObject {
         Task { @MainActor in
             let art = await self.lookupArtwork(artist: artist, album: album, track: name)
             let track = Track(name: name, artist: artist, album: album, durationMs: duration, artworkURL: art)
-            self.current = Playback(source: "apple_music", state: state, track: track, updatedAt: Date())
-            self.writeState()
+            self.adopt(Playback(source: "apple_music", state: state, track: track))
         }
     }
 
@@ -277,8 +294,7 @@ final class MusicService: ObservableObject {
 
         guard state != "stopped" else {
             Task { @MainActor in
-                self.current = Playback(source: "spotify", state: "stopped", track: nil, updatedAt: Date())
-                self.writeState()
+                self.adopt(Playback(source: "spotify", state: "stopped", track: nil))
             }
             return
         }
@@ -303,8 +319,7 @@ final class MusicService: ObservableObject {
                 art = await self.lookupArtwork(artist: artist, album: album, track: name)
             }
             let track = Track(name: name, artist: artist, album: album, durationMs: duration, artworkURL: art)
-            self.current = Playback(source: "spotify", state: state, track: track, updatedAt: Date())
-            self.writeState()
+            self.adopt(Playback(source: "spotify", state: state, track: track))
         }
     }
 
@@ -349,16 +364,4 @@ final class MusicService: ObservableObject {
 
     // MARK: state file
 
-    private func writeState() {
-        guard let playback = current else { return }
-        do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(playback)
-            try data.write(to: stateFile, options: .atomic)
-        } catch {
-            // ignore — best effort
-        }
-    }
 }

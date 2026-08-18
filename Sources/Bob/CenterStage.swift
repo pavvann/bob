@@ -65,13 +65,13 @@ struct CenterStage: View {
     /// a system whisper ("running in compatibility mode") shouldn't take over
     /// bob's face at launch — it shows in the thread the moment there's one.
     private var isIdle: Bool {
-        !bridge.isStreaming && !bridge.turns.contains(where: { $0.kind != .notice })
+        !bridge.isStreaming && !bridge.transcript.entries.contains { $0.role != .notice && !$0.hidden }
     }
 
     /// Which notice rows are up — the one thing in the thread that comes and
     /// goes on its own (see the animation on the turn list).
     private var noticeRows: [UUID] {
-        bridge.turns.filter { $0.kind == .notice }.map(\.id)
+        bridge.transcript.entries.filter { $0.role == .notice }.map(\.id)
     }
 
     private var companion: some View {
@@ -85,8 +85,8 @@ struct CenterStage: View {
                 // two whispers, stacked when they overlap: bob's clamped reply
                 // (his voice — click to rejoin the thread) above the dispatch
                 // ack (the room's voice, gone in a beat).
-                if router.active != nil, let reply = surfaceReply {
-                    SurfaceReplyStrip(text: reply, streaming: bridge.isStreaming) {
+                if router.active != nil, surfaceReplyEntry != nil || bridge.isStreaming {
+                    SurfaceReplyStrip(entry: surfaceReplyEntry, streaming: bridge.isStreaming) {
                         router.close()
                         // the strip is the companion's reply — clicking it means
                         // "show me the conversation", not whichever work tab
@@ -99,7 +99,7 @@ struct CenterStage: View {
                     .overlay(alignment: .top) { slashPalette }
             }
             .animation(.easeInOut(duration: 0.25), value: whisper)
-            .animation(.easeInOut(duration: 0.25), value: surfaceReply == nil)
+            .animation(.easeInOut(duration: 0.25), value: surfaceReplyEntry == nil)
         }
         .animation(.easeInOut(duration: 0.3), value: router.active)
         .onAppear {
@@ -180,47 +180,65 @@ struct CenterStage: View {
             .frame(maxWidth: .infinity)
             .transition(.opacity.combined(with: .scale(scale: 0.98)))
         } else {
+            // hidden entries (debrief injections) are dropped here and nowhere
+            // else — that filter is the whole reason a debrief shows only
+            // bob's reply
+            let rows = bridge.transcript.entries.filter { !$0.hidden }
+            let inFlightID = self.inFlightID   // once per body, not once per row
             ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        ForEach(bridge.turns) { turn in
-                            TurnRowView(
-                                kind: turn.kind,
-                                text: turn.text,
-                                activity: turn.activity,
-                                streaming: bridge.isStreaming,
-                                inFlight: isInFlight(turn)
-                            )
+                GeometryReader { geo in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 18) {
+                            ForEach(rows) { entry in
+                                TurnRowView(
+                                    entry: entry,
+                                    // scoped to the in-flight row: handing every
+                                    // row the global streaming bool re-rendered
+                                    // (and re-parsed) the whole thread per toggle
+                                    inFlight: entry.id == inFlightID
+                                )
+                            }
+                            FollowTail(store: bridge.transcript, proxy: proxy)
                         }
-                        Color.clear.frame(height: 1).id("end")
+                        .padding(.vertical, 4)
+                        // a short thread bottom-aligns by LAYOUT: with less
+                        // content than viewport there is no scroll range for
+                        // scrollTo to work with, and a second offset owner
+                        // (defaultScrollAnchor) is what caused the CPU storm
+                        .frame(minHeight: geo.size.height, alignment: .bottom)
+                        // task notices are live status — they sweep themselves once
+                        // the task settles. Keyed on just the notice rows so their
+                        // arrival and departure fade while ordinary turns keep
+                        // landing instantly.
+                        .animation(.easeInOut(duration: 0.3), value: noticeRows)
                     }
-                    .padding(.vertical, 4)
-                    // task notices are live status — they sweep themselves once
-                    // the task settles. Keyed on just the notice rows so their
-                    // arrival and departure fade while ordinary turns keep
-                    // landing instantly.
-                    .animation(.easeInOut(duration: 0.3), value: noticeRows)
+                    .scrollIndicators(.never)
+                    .onAppear {
+                        // a restored thread should open reading its newest turn
+                        proxy.scrollTo("end", anchor: .bottom)
+                    }
                 }
                 // takes whatever height the window offers, up to this — tall
                 // enough that a real conversation reads like a thread instead of
-                // a letterbox. Bottom-anchored, so the newest turn always sits
-                // right above the input bar however short the exchange is.
+                // a letterbox. Bottom-anchoring is manual (the layout frame
+                // above + onAppear/onChange scrollTo): stacking
+                // .defaultScrollAnchor(.bottom) on top of the scrollTo gave the
+                // scroll view two owners of its offset, and every
+                // content-height change had them re-pinning each other per
+                // frame — the idle-transcript CPU storm.
                 .frame(maxHeight: 520)
-                .defaultScrollAnchor(.bottom)
-                .scrollIndicators(.never)
-                .onChange(of: bridge.turns) { _, _ in
-                    // not animated: this fires per streamed delta, and an
-                    // animated scroll restarted 30×/sec is pure churn
-                    proxy.scrollTo("end", anchor: .bottom)
-                }
             }
             .transition(.opacity)
         }
     }
 
-    /// The turn bob is speaking into right now — the last one, while streaming.
-    private func isInFlight(_ turn: ClaudeBridge.Turn) -> Bool {
-        bridge.isStreaming && bridge.turns.last?.id == turn.id
+    /// The turn bob is speaking into right now — the newest .bob row, while
+    /// streaming. Not "the last row": send() echoes the queued .you entry
+    /// immediately, and a task notice can land mid-reply — neither may steal
+    /// the thinking orb from a still-empty reply.
+    private var inFlightID: UUID? {
+        guard bridge.isStreaming else { return nil }
+        return bridge.transcript.entries.last(where: { $0.role == .bob })?.id
     }
 
     // MARK: surfaces (notes, canvas)
@@ -244,10 +262,10 @@ struct CenterStage: View {
 
     /// What the strip whispers: bob's latest reply, or the one landing right
     /// now (empty while he's still thinking — the strip shows a beat of "…").
-    /// Nil when there's no conversation to keep audible.
-    private var surfaceReply: String? {
-        if let last = bridge.turns.last(where: { $0.kind == .bob }) { return last.text }
-        return bridge.isStreaming ? "" : nil
+    /// Nil when there's no conversation to keep audible. The entry, not its
+    /// text: the strip is the leaf that reads the growing string.
+    private var surfaceReplyEntry: TranscriptEntry? {
+        bridge.transcript.entries.last(where: { $0.role == .bob && !$0.hidden })
     }
 
     // MARK: input
@@ -649,21 +667,23 @@ private struct BreathingGreeting: View {
 /// are a whisper the conversation flows around. Minimal — a thread, not chat
 /// bubbles. Shared verbatim by the companion thread and WorkStage, so the two
 /// stages can never drift apart visually.
+///
+/// Reads its own entry: with Observation, a streamed token growing the tail's
+/// text re-runs THIS row's body and nothing else — completed rows never move.
 private struct TurnRowView: View {
-    let kind: ClaudeBridge.Turn.Kind
-    let text: String
-    let activity: String?
-    /// The session is streaming — an empty reply shows the thinking orb.
-    let streaming: Bool
-    /// This is the turn being spoken into right now (holds the activity slot).
+    let entry: TranscriptEntry
+    /// This is the turn being spoken into right now: it holds the activity
+    /// slot, and while its reply is still empty it shows the thinking orb.
+    /// Only ever true for the last row — historical rows must receive a
+    /// constant here, or every streaming toggle re-renders the whole thread.
     let inFlight: Bool
 
     var body: some View {
-        switch kind {
+        switch entry.role {
         case .you:
             HStack {
                 Spacer(minLength: 48)
-                Text(text)
+                Text(entry.text)
                     .font(.system(size: 14, weight: .regular, design: .rounded))
                     .foregroundStyle(.secondary.opacity(0.7))
                     .multilineTextAlignment(.trailing)
@@ -671,16 +691,23 @@ private struct TurnRowView: View {
             }
         case .bob:
             VStack(alignment: .leading, spacing: 5) {
-                if text.isEmpty && streaming {
+                if entry.text.isEmpty && inFlight {
                     // a quiet breathing dot where the reply will appear
                     ThinkingOrb()
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .transition(.opacity)
-                } else {
+                } else if let render = entry.render {
                     // claude writes markdown; render it as markdown (tables,
-                    // fences, lists, emphasis) instead of making the owner
-                    // parse pipes and asterisks by eye
-                    MarkdownText(text: text)
+                    // fences, lists, emphasis) — from the entry's model,
+                    // which parsed each block exactly once as it arrived
+                    StreamedMarkdownText(model: render)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .transition(.opacity)
+                } else {
+                    // every bob row carries a model; kept for form, not for
+                    // a case that happens
+                    MarkdownText(text: entry.text)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                         .transition(.opacity)
@@ -695,7 +722,7 @@ private struct TurnRowView: View {
                 Text("⏺")
                     .font(.system(size: 8))
                     .foregroundStyle(.secondary.opacity(0.4))
-                Text(text)
+                Text(entry.text)
                     .font(.system(size: 11, weight: .regular, design: .rounded))
                     .foregroundStyle(.secondary.opacity(0.55))
                     .lineLimit(2)
@@ -714,16 +741,38 @@ private struct TurnRowView: View {
     /// text around; it collapses once, when the reply lands.
     @ViewBuilder
     private var activityLine: some View {
-        if activity != nil || inFlight {
-            Text(activity ?? " ")
+        if entry.activity != nil || inFlight {
+            Text(entry.activity ?? " ")
                 .font(.system(size: 11, weight: .regular, design: .rounded))
                 .foregroundStyle(.secondary.opacity(0.5))
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .opacity(activity == nil ? 0 : 1)
+                .opacity(entry.activity == nil ? 0 : 1)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .animation(.easeInOut(duration: 0.18), value: activity)
+                .animation(.easeInOut(duration: 0.18), value: entry.activity)
         }
+    }
+}
+
+/// The tail sentinel and the ONE manual scroll follow (the storm fix: a
+/// single owner of the scroll offset, never animated — see the notes on the
+/// containers). Reading `revision` here, and only here, means a growing reply
+/// re-evaluates this zero-size leaf per coalesced flush while the rows above
+/// stay quiet.
+private struct FollowTail: View {
+    let store: TranscriptStore
+    let proxy: ScrollViewProxy
+
+    var body: some View {
+        // the explicit read is the subscription — body must observe the
+        // revision for the onChange below to be woken at all
+        let revision = store.revision
+        Color.clear.frame(height: 1).id("end")
+            .onChange(of: revision) { _, _ in
+                // not animated: this fires per coalesced flush, and an
+                // animated scroll restarted 30×/sec is pure churn
+                proxy.scrollTo("end", anchor: .bottom)
+            }
     }
 }
 
@@ -745,8 +794,8 @@ private struct WorkStage: View {
     @FocusState private var inputFocused: Bool
 
     /// Nothing is hidden in a work session today, but the filter keeps parity
-    /// with the bridge's projection if P3 ever injects into one.
-    private var entries: [ClaudeSession.Entry] { session.entries.filter { !$0.hidden } }
+    /// with the companion thread if P3 ever injects into one.
+    private var entries: [TranscriptEntry] { session.transcript.entries.filter { !$0.hidden } }
 
     var body: some View {
         VStack(spacing: 24) {
@@ -784,31 +833,39 @@ private struct WorkStage: View {
             .transition(.opacity.combined(with: .scale(scale: 0.98)))
         } else {
             let rows = entries   // filter once, not once per row
+            // the newest bob entry, while streaming — not "the last row", see
+            // the companion thread's inFlightID
+            let inFlightID = session.isStreaming
+                ? rows.last(where: { $0.role == .bob })?.id
+                : nil
             VStack(alignment: .leading, spacing: 8) {
                 header
                 ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 18) {
-                            ForEach(rows) { entry in
-                                TurnRowView(
-                                    kind: kind(of: entry),
-                                    text: entry.text,
-                                    activity: entry.activity,
-                                    streaming: session.isStreaming,
-                                    inFlight: session.isStreaming && rows.last?.id == entry.id
-                                )
+                    GeometryReader { geo in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 18) {
+                                ForEach(rows) { entry in
+                                    TurnRowView(
+                                        entry: entry,
+                                        // scoped like the companion thread's rows
+                                        inFlight: entry.id == inFlightID
+                                    )
+                                }
+                                FollowTail(store: session.transcript, proxy: proxy)
                             }
-                            Color.clear.frame(height: 1).id("end")
+                            .padding(.vertical, 4)
+                            // a short thread bottom-aligns by layout — see the
+                            // companion thread's note
+                            .frame(minHeight: geo.size.height, alignment: .bottom)
                         }
-                        .padding(.vertical, 4)
+                        .scrollIndicators(.never)
+                        .onAppear {
+                            // manual bottom-follow, same as the companion thread —
+                            // see the storm note there before re-adding an anchor
+                            proxy.scrollTo("end", anchor: .bottom)
+                        }
                     }
                     .frame(maxHeight: 500)
-                    .defaultScrollAnchor(.bottom)
-                    .scrollIndicators(.never)
-                    .onChange(of: rows) { _, _ in
-                        // not animated — see the companion thread's onChange
-                        proxy.scrollTo("end", anchor: .bottom)
-                    }
                 }
             }
             .transition(.opacity)
@@ -850,14 +907,6 @@ private struct WorkStage: View {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let path = session.config.cwd.path
         return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
-    }
-
-    private func kind(of entry: ClaudeSession.Entry) -> ClaudeBridge.Turn.Kind {
-        switch entry.role {
-        case .you: return .you
-        case .bob: return .bob
-        case .notice: return .notice
-        }
     }
 
     // MARK: input
@@ -977,13 +1026,15 @@ private func routeDispatch(_ raw: String, via manager: SessionManager) -> String
 /// The whisper strip — while a surface holds the stage, bob's reply stays
 /// audible here: dim, two lines, notice-styled, right above the input bar.
 /// The dot warms to accent while he's still talking. Click it to put the
-/// conversation back on stage.
+/// conversation back on stage. Takes the live entry, not its text: this leaf
+/// is the only thing over a surface that re-renders per streamed flush.
 private struct SurfaceReplyStrip: View {
-    let text: String
+    let entry: TranscriptEntry?
     let streaming: Bool
     let onTap: () -> Void
 
     var body: some View {
+        let text = entry?.text ?? ""
         Button(action: onTap) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("⏺")

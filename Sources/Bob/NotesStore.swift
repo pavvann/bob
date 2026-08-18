@@ -2,12 +2,16 @@ import Foundation
 
 /// pawan's own scratch notes — one markdown file per note in `~/bob/notes/`.
 /// Same shape as TodoService: the file on disk is the truth, the swift layer
-/// polls it (700ms) and writes back. bob appends to a note mid-conversation by
-/// editing the file; the poll picks it up with no extra plumbing.
+/// watches the directory and writes back. bob appends to a note mid-conversation
+/// by editing the file; the watcher picks it up with no extra plumbing.
 ///
-/// The one hard rule: **a poll never eats an unsaved edit.** While the buffer
+/// The one hard rule: **a scan never eats an unsaved edit.** While the buffer
 /// is dirty an external change only raises `conflict` — the surface whispers
 /// it, and the next save wins.
+///
+/// The open note is re-read only when its mtime has actually moved. The old
+/// 700ms poll re-read it unconditionally, which made an untouched notes surface
+/// the app's busiest reader for no information at all.
 @MainActor
 final class NotesStore: ObservableObject {
     static let shared = NotesStore()
@@ -37,24 +41,46 @@ final class NotesStore: ObservableObject {
     /// What we last read from — or wrote to — disk for the open note. The
     /// difference between this and the file is what "changed on disk" means.
     private var diskText: String = ""
-    private var titles: [String: (mtime: Date, title: String)] = [:]
-    private var pollTask: Task<Void, Never>?
+    /// The mtime `diskText` came from — the gate on re-reading the open note.
+    private var diskMtime: Date?
+    private var titles: [String: TitleCache] = [:]
+    /// Bumped per scan, so a scan that lands after a newer one started can tell
+    /// it is stale and stand down.
+    private var scanEpoch = 0
     private var saveTask: Task<Void, Never>?
 
-    private static let pollInterval: UInt64 = 700_000_000
+    private struct TitleCache: Sendable {
+        let mtime: Date
+        let title: String
+    }
+
+    /// One pass over the directory, plus the open note if and only if it moved.
+    private struct Scan: Sendable {
+        var notes: [Note]
+        var titles: [String: TitleCache]
+        /// Which note the scan was aimed at — a switch mid-scan invalidates it.
+        var open: String?
+        /// nil when the mtime hadn't moved, so there was nothing to read.
+        var openText: String?
+        var openMtime: Date?
+        var openGone = false
+    }
+
     private static let saveDelay: UInt64 = 500_000_000
 
     /// `dir` is an override for tests; production is `~/bob/notes/`.
     init(dir: URL? = nil) {
         self.dir = dir ?? BobHome.shared.notesDir
         try? FileManager.default.createDirectory(at: self.dir, withIntermediateDirectories: true)
+        DirWatcher.shared.acquire(path: self.dir.path, id: "notes-\(self.dir.path)") { [weak self] _ in
+            Task { @MainActor in self?.reload() }
+        }
         reload()
-        startPolling()
     }
 
     deinit {
-        pollTask?.cancel()
         saveTask?.cancel()
+        DirWatcher.shared.release(id: "notes-\(dir.path)")
     }
 
     // MARK: api
@@ -99,31 +125,55 @@ final class NotesStore: ObservableObject {
         saveTask?.cancel()
         saveTask = nil
         guard isDirty, let id = openID, let data = text.data(using: .utf8) else { return }
+        let url = dir.appendingPathComponent(id)
         // did the file move under us while the buffer was dirty? his version
         // still wins — but he gets told, rather than losing bob's line silently.
-        let drifted = (read(id) ?? diskText) != diskText
+        let drifted = (Self.read(url) ?? diskText) != diskText
         do {
-            try data.write(to: dir.appendingPathComponent(id), options: .atomic)
+            try data.write(to: url, options: .atomic)
         } catch {
             return                              // stays dirty; the next edit retries
         }
         diskText = text
+        // our own write moved the mtime — record it, or the next scan re-reads a
+        // file it already has
+        diskMtime = Self.mtime(url)
         isDirty = false
         conflict = drifted ? "\(id) had changed on disk — your version won" : nil
         reload()
     }
 
-    /// One pass over the directory and the open note. The poll calls this every
-    /// 700ms; the surface can force it on appear.
+    /// One pass over the directory and, if it moved, the open note. The watcher
+    /// calls this on a change; the surface can force it on appear.
     func reload() {
-        let listed = list()
-        if listed != notes { notes = listed }
+        scanEpoch += 1
+        let epoch = scanEpoch
+        let dir = self.dir
+        let titles = self.titles
+        let open = openID
+        let known = diskMtime
+        Task.detached(priority: .utility) { [weak self] in
+            let scan = Self.scan(dir: dir, titles: titles, open: open, knownMtime: known)
+            await self?.apply(scan, epoch: epoch)
+        }
+    }
+
+    private func apply(_ scan: Scan, epoch: Int) {
+        // two rapid external edits are enough for two detached scans to finish
+        // out of order, and the loser would write its older listing, mtime and
+        // text over the winner's. Only the newest scan gets to land.
+        guard epoch == scanEpoch else { return }
+        titles = scan.titles
+        if scan.notes != notes { notes = scan.notes }
 
         guard let id = openID else {
             if let first = notes.first { adopt(first.id) }
             return
         }
-        guard let disk = read(id) else {
+        // a note switch landed while the scan was in flight — it read the wrong
+        // file, and the switch already adopted the right one
+        guard scan.open == id else { return }
+        if scan.openGone {
             // the file went away under us — bob renamed it, or finder did
             if isDirty {
                 conflict = "\(id) is gone from disk — saving puts it back"
@@ -133,6 +183,8 @@ final class NotesStore: ObservableObject {
             }
             return
         }
+        guard let disk = scan.openText else { return }  // mtime hadn't moved
+        diskMtime = scan.openMtime
         guard disk != diskText else { return }  // nothing new on disk
         if isDirty {
             conflict = "\(id) changed on disk — yours wins on save"
@@ -146,7 +198,7 @@ final class NotesStore: ObservableObject {
 
     /// Title = the first `# ` heading, else the filename. Frontmatter isn't
     /// required, but if bob or pawan wrote some it's skipped, not rendered.
-    static func title(of contents: String, filename: String) -> String {
+    nonisolated static func title(of contents: String, filename: String) -> String {
         var lines = contents.components(separatedBy: "\n")
         if lines.first?.trimmingCharacters(in: .whitespaces) == "---",
            let close = lines.dropFirst().firstIndex(where: {
@@ -164,7 +216,7 @@ final class NotesStore: ObservableObject {
     }
 
     /// "Bob's Canvas Ideas!" → "bobs-canvas-ideas". Empty → "note".
-    static func kebab(_ title: String) -> String {
+    nonisolated static func kebab(_ title: String) -> String {
         var out = ""
         for ch in title.lowercased() {
             if ch.isLetter || ch.isNumber {
@@ -182,40 +234,69 @@ final class NotesStore: ObservableObject {
 
     // MARK: disk
 
-    private func list() -> [Note] {
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
-        ) else { return [] }
-
+    /// The whole disk pass, off the main actor: list the directory, and read the
+    /// open note only when `knownMtime` disagrees with what's on disk.
+    private nonisolated static func scan(
+        dir: URL, titles: [String: TitleCache], open: String?, knownMtime: Date?
+    ) -> Scan {
+        var cache = titles
         var out: [Note] = []
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+        )) ?? []
+
+        var openMtime: Date?
         for url in urls where url.pathExtension == "md" {
             let name = url.lastPathComponent
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate ?? .distantPast
-            // titles are cached by mtime — the poll shouldn't re-read every
-            // note every 700ms just to find its heading.
+            if name == open { openMtime = mtime }
+            // titles are cached by mtime — a scan shouldn't re-read every note
+            // just to find its heading.
             let title: String
-            if let hit = titles[name], hit.mtime == mtime {
+            if let hit = cache[name], hit.mtime == mtime {
                 title = hit.title
             } else {
                 title = Self.title(of: (try? String(contentsOf: url, encoding: .utf8)) ?? "", filename: name)
-                titles[name] = (mtime, title)
+                cache[name] = TitleCache(mtime: mtime, title: title)
             }
             out.append(Note(id: name, title: title, modified: mtime))
         }
-        return out.sorted { $0.modified == $1.modified ? $0.id < $1.id : $0.modified > $1.modified }
+
+        var scan = Scan(
+            notes: out.sorted { $0.modified == $1.modified ? $0.id < $1.id : $0.modified > $1.modified },
+            titles: cache,
+            open: open
+        )
+        guard let open else { return scan }
+        guard let openMtime else {
+            scan.openGone = true
+            return scan
+        }
+        guard openMtime != knownMtime else { return scan }
+        scan.openMtime = openMtime
+        scan.openText = read(dir.appendingPathComponent(open))
+        if scan.openText == nil { scan.openGone = true }
+        return scan
     }
 
-    private func read(_ id: String) -> String? {
-        try? String(contentsOf: dir.appendingPathComponent(id), encoding: .utf8)
+    private nonisolated static func read(_ url: URL) -> String? {
+        try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// A stat, not a read — what the open-note gate compares against.
+    private nonisolated static func mtime(_ url: URL) -> Date? {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
     }
 
     /// Take a note as the open one, buffer clean. No flush — callers do that.
     private func adopt(_ id: String) {
-        guard let disk = read(id) else { return }
+        let url = dir.appendingPathComponent(id)
+        guard let disk = Self.read(url) else { return }
         openID = id
         text = disk
         diskText = disk
+        diskMtime = Self.mtime(url)
         isDirty = false
         conflict = nil
     }
@@ -233,15 +314,6 @@ final class NotesStore: ObservableObject {
     }
 
     // MARK: timing
-
-    private func startPolling() {
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: Self.pollInterval)
-                self?.reload()
-            }
-        }
-    }
 
     /// Typing shouldn't hit the disk on every keystroke — one write, half a
     /// second after you stop.

@@ -25,7 +25,7 @@ final class AttentionCenter {
 
     private let manager: SessionManager
     private var registryWatch: AnyCancellable?
-    private var sessionWatches: [UUID: AnyCancellable] = [:]
+    private var sessionWatches: [UUID: Task<Void, Never>] = [:]
     /// Last seen machine state / derived status per session — transitions are
     /// the signal, standing states are not (a session that IS broken shouldn't
     /// re-announce itself every delta).
@@ -52,25 +52,26 @@ final class AttentionCenter {
     }
 
     /// One watch per live session, dropped when the session leaves the
-    /// registry. The hop through the main queue matters: objectWillChange
-    /// fires *before* a mutation lands, so the sink must run after the current
-    /// main-actor job finishes — by then every property reads post-change.
+    /// registry. Sessions speak in `notes` — turn boundaries and health
+    /// flips, never per delta — emitted after the mutation they describe, so
+    /// every property reads post-change by the time the loop wakes.
     private func resubscribe() {
         let live = manager.sessions
         let liveIDs = Set(live.map(\.id))
         for id in sessionWatches.keys where !liveIDs.contains(id) {
-            sessionWatches[id] = nil
+            sessionWatches.removeValue(forKey: id)?.cancel()
             lastState[id] = nil
             lastStatus[id] = nil
             pending.removeAll { $0.id == id }
         }
         for session in live where sessionWatches[session.id] == nil {
-            sessionWatches[session.id] = session.objectWillChange
-                .receive(on: DispatchQueue.main)
-                .sink { [weak self, weak session] _ in
-                    guard let session else { return }
-                    MainActor.assumeIsolated { self?.observe(session) }
+            let notes = session.notes
+            sessionWatches[session.id] = Task { [weak self, weak session] in
+                for await _ in notes {
+                    guard let self, let session else { return }
+                    self.observe(session)
                 }
+            }
             observe(session)   // prime: current state is baseline, not news
         }
     }
@@ -112,7 +113,7 @@ final class AttentionCenter {
     /// What flipped it — the same evidence status derivation used, as words.
     private func badReason(_ session: ClaudeSession, status: SessionStatus) -> String {
         if status == .error { return session.lastError ?? "the session is down" }
-        if let last = session.entries.last, last.role == .notice, last.taskId == nil {
+        if let last = session.transcript.entries.last, last.role == .notice, last.taskId == nil {
             return last.text   // "session dropped — reconnecting" and kin
         }
         if let r = session.lastResult, r.isError {
@@ -135,8 +136,8 @@ final class AttentionCenter {
             cwdTail: Self.cwdTail(session.config.cwd),
             digest: Self.digest(
                 reason: reason,
-                lastPrompt: session.entries.last(where: { $0.role == .you && !$0.hidden })?.text,
-                lastReply: session.entries.last(where: { $0.role == .bob && !$0.text.isEmpty })?.text
+                lastPrompt: session.transcript.entries.last(where: { $0.role == .you && !$0.hidden })?.text,
+                lastReply: session.transcript.entries.last(where: { $0.role == .bob && !$0.text.isEmpty })?.text
             )
         )
         if let i = pending.firstIndex(where: { $0.id == session.id }) {

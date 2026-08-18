@@ -54,14 +54,16 @@ struct ContentView: View {
                     // centred whether or not the rail is there — a stage that
                     // slid sideways every time you changed tabs would be worse
                     // than no rail at all.
-                    // Gutters only when the window can spare them: the first
-                    // arrangement declares a minimum for the stage, so a narrow
-                    // window falls through to the second and the conversation
-                    // keeps its full column instead of being squeezed to make
-                    // room for chrome.
-                    ViewThatFits(in: .horizontal) {
-                        stageRow(withGutters: true)
-                        stageRow(withGutters: false)
+                    // Gutters only when the window can spare them. A width
+                    // check, not ViewThatFits: VTF re-measures every candidate
+                    // on every layout pass, which laid out the whole mounted
+                    // transcript twice per frame whenever anything moved — half
+                    // of the idle-transcript CPU storm. The threshold is the
+                    // guttered row's own declared minimum, so the breakpoint is
+                    // identical to what VTF chose.
+                    GeometryReader { geo in
+                        stageRow(withGutters: geo.size.width >= Self.gutteredMinWidth)
+                            .frame(width: geo.size.width, height: geo.size.height)
                     }
                     .frame(maxHeight: .infinity)
                     .animation(.easeInOut(duration: 0.2), value: activeSession?.id)
@@ -185,9 +187,15 @@ struct ContentView: View {
         NotificationCenter.default.post(name: HotKeyManager.didSummon, object: nil)
     }
 
+    /// The narrowest window that fits the guttered arrangement: the stage's
+    /// declared minimum plus both gutter ghosts and the four flexible spacers
+    /// at their floor. Matches what ViewThatFits used to conclude, without
+    /// paying for a second full layout of the transcript to conclude it.
+    private static let gutteredMinWidth: CGFloat = 560 + FileTree.width + SessionRail.width + 4 * 10
+
     /// The stage, optionally flanked: a ghost holding the left gutter so the
     /// conversation stays centred, and the rail on the right when a work session
-    /// is on stage. `minWidth` is what makes ViewThatFits able to say no.
+    /// is on stage. `minWidth` is what keeps the width branch above honest.
     @ViewBuilder
     private func stageRow(withGutters: Bool) -> some View {
         // Four equal flexible spacers: the tree and the rail float in the
@@ -843,9 +851,7 @@ private struct CalendarTileContent: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-            Text(timingText(event: event, isInProgress: isInProgress))
-                .font(.system(size: 11, weight: .regular, design: .rounded))
-                .foregroundStyle(.secondary.opacity(0.75))
+            EventTiming(event: event, isInProgress: isInProgress)
             if !event.calendarTitle.isEmpty {
                 Text(event.calendarTitle)
                     .font(.system(size: 9, weight: .regular, design: .rounded))
@@ -876,17 +882,32 @@ private struct CalendarTileContent: View {
             Spacer(minLength: 0)
         }
     }
+}
 
-    private func timingText(event: CalendarService.Event, isInProgress: Bool) -> String {
-        if isInProgress {
-            return "ends \(humanInterval(from: Date(), to: event.endDate))"
-        } else {
-            return "starts \(humanInterval(from: Date(), to: event.startDate)) · \(absoluteTime(event.startDate))"
+/// One line of countdown, and the only thing in the calendar tile that needs a
+/// clock. It owns its own minute tick so the service doesn't have to publish
+/// (and invalidate the window) just to move "in 12m" to "in 11m".
+private struct EventTiming: View {
+    let event: CalendarService.Event
+    let isInProgress: Bool
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { ctx in
+            Text(text(at: ctx.date))
+                .font(.system(size: 11, weight: .regular, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.75))
         }
     }
 
+    private func text(at now: Date) -> String {
+        if isInProgress {
+            return "ends \(Self.humanInterval(from: now, to: event.endDate))"
+        }
+        return "starts \(Self.humanInterval(from: now, to: event.startDate)) · \(Self.absoluteTime(event.startDate))"
+    }
+
     /// "in 12m" / "in 1h 5m" / "in 2d 3h" etc.
-    private func humanInterval(from start: Date, to end: Date) -> String {
+    private static func humanInterval(from start: Date, to end: Date) -> String {
         let interval = max(0, end.timeIntervalSince(start))
         if interval < 60 { return "now" }
         if interval < 3600 {
@@ -902,7 +923,7 @@ private struct CalendarTileContent: View {
         return hours > 0 ? "in \(days)d \(hours)h" : "in \(days)d"
     }
 
-    private func absoluteTime(_ date: Date) -> String {
+    private static func absoluteTime(_ date: Date) -> String {
         let cal = Calendar.current
         if cal.isDateInToday(date) {
             let f = DateFormatter(); f.dateFormat = "h:mm a"
