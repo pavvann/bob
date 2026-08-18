@@ -614,6 +614,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
                 transcript.append(text: tail, to: entry)
                 if config.voiced { unspoken += tail }
                 flushSpeakable(final: true)
+                transcript.finalize(entry)
             }
             currentBob = nil
             unspoken = ""
@@ -817,6 +818,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
                 if config.voiced { unspoken += tail }
             }
             flushSpeakable(final: true)
+            transcript.finalize(entry)
         }
         if r.isError && !interrupted {
             lastError = r.text ?? "claude returned \(r.subtype ?? "an error")"

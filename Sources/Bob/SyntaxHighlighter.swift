@@ -143,8 +143,9 @@ struct SyntaxSpan: Sendable, Equatable {
 ///
 /// An actor for two reasons: a 400KB file must not parse on the main thread, and
 /// serialising the work means a streaming transcript that re-renders on every
-/// token can't start a stampede of parallel parses. Results are cached by
-/// content, so that re-render is free after the first pass.
+/// token can't start a stampede of parallel parses. Results are cached per
+/// caller-named slot and verified against the actual source, so a re-render of
+/// an unchanged block is free after the first pass.
 actor SyntaxHighlighter {
     static let shared = SyntaxHighlighter()
 
@@ -152,40 +153,52 @@ actor SyntaxHighlighter {
     /// prove the cache is doing its job.
     private(set) var parses = 0
 
-    private struct Key: Hashable {
-        let content: Int
+    /// One cached result: whose slot, of what source, read as which language.
+    /// The slot is the caller's stable identity — an entry/block pair, a file
+    /// path — so a fence growing through fifty drafts overwrites one entry
+    /// instead of retiring everyone else's. A hit must match the actual
+    /// source, not a hash of it: a collision costs a re-parse here, never the
+    /// wrong colours.
+    private struct Cached {
+        let source: String
         let language: String
+        let spans: [SyntaxSpan]
     }
 
     /// Small on purpose. A reader looks at one file and a handful of fenced
     /// blocks at a time; holding more spans than that is just retained memory.
     private static let capacity = 24
 
-    private var cache: [Key: [SyntaxSpan]] = [:]
-    private var recency: [Key] = []      // oldest first
+    private var cache: [String: Cached] = [:]
+    private var recency: [String] = []      // oldest first
 
     /// Compiled queries, kept for the life of the process. There are only ten of
     /// them and compiling one is far dearer than parsing a small file.
     private var queries: [String: Query] = [:]
 
-    /// Spans for `source` read as `language`. Cached — calling this on every
-    /// frame of a streaming transcript costs one parse, not one per frame.
-    func spans(for source: String, language: SyntaxLanguage) -> [SyntaxSpan] {
-        let key = Key(content: source.hashValue, language: language.id)
-        if let hit = cache[key] {
-            recency.removeAll { $0 == key }
-            recency.append(key)
-            return hit
+    /// Spans for `source` read as `language`, remembered under `slot` —
+    /// re-rendering a block that hasn't changed costs a lookup, not a parse.
+    func spans(for source: String, language: SyntaxLanguage, slot: String) -> [SyntaxSpan] {
+        recency.removeAll { $0 == slot }
+        recency.append(slot)
+        if let hit = cache[slot], hit.language == language.id, hit.source == source {
+            return hit.spans
         }
 
         let spans = parse(source, language)
 
-        cache[key] = spans
-        recency.append(key)
+        cache[slot] = Cached(source: source, language: language.id, spans: spans)
         if recency.count > Self.capacity {
             cache.removeValue(forKey: recency.removeFirst())
         }
         return spans
+    }
+
+    /// `source` with its spans applied — the paint happens here, off the main
+    /// actor, so the transcript is handed a finished string instead of work.
+    func painted(_ source: String, language: SyntaxLanguage, slot: String) -> AttributedString {
+        AttributedString(painting: source,
+                         spans: spans(for: source, language: language, slot: slot))
     }
 
     private func parse(_ source: String, _ language: SyntaxLanguage) -> [SyntaxSpan] {

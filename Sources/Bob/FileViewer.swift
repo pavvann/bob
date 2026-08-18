@@ -341,7 +341,8 @@ struct FileViewerView: View {
             var spans: [SyntaxSpan] = []
             if slice.count <= paintCap,
                let language = SyntaxHighlighter.language(for: target.lastPathComponent) {
-                spans = await SyntaxHighlighter.shared.spans(for: text, language: language)
+                spans = await SyntaxHighlighter.shared.spans(for: text, language: language,
+                                                             slot: target.path)
             }
             // A blank line still needs a row's worth of height.
             return .text(lines: zip(lines, SyntaxSpan.perLine(lines, of: spans)).map {

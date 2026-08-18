@@ -434,6 +434,7 @@ final class ClaudeBridge: ObservableObject {
                 // speak any trailing fragment that never got a terminator
                 if let entry = self.transcript.entries.last(where: { $0.role == .bob }) {
                     self.flushSpeakable(entry.text, final: true)
+                    self.transcript.finalize(entry)
                 }
                 self.isStreaming = false
                 self.currentProcess = nil
@@ -513,6 +514,7 @@ final class ClaudeBridge: ObservableObject {
     private func setReply(_ text: String) {
         guard let entry = transcript.entries.last(where: { $0.role == .bob }) else { return }
         transcript.set(text: text, of: entry)
+        transcript.finalize(entry)   // error text is terminal — freeze it
     }
 
     // MARK: - shared plumbing
