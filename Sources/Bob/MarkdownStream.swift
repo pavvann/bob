@@ -19,16 +19,19 @@ import SwiftUI
 ///   fence swallows lines until it closes, and the last line has no newline;
 /// - ``finalize()`` commits the remaining tail through the normal parse, so
 ///   a finished message is block-for-block what a cold parse would produce.
+///
+/// Committed blocks are handed out exactly once and not retained: the caller
+/// keeps its own rendered form, and holding the raw strings here as well
+/// would duplicate most of a long transcript's text for its lifetime. All
+/// this keeps is the tail — the only region the commit scan re-reads.
 struct IncrementalBlocks {
-    private(set) var committed: [Markdown.Block] = []
-
     /// Text past the last stable boundary, newline-normalized. It always
     /// starts at a block boundary, so parsing it alone parses it correctly.
     private(set) var tail = ""
 
     /// The blocks this delta just made final.
     @discardableResult
-    mutating func append(_ delta: String) -> ArraySlice<Markdown.Block> {
+    mutating func append(_ delta: String) -> [Markdown.Block] {
         // normalize \r\n only when one could exist — a pair can arrive split
         // across two deltas, visible only once both halves share the buffer
         if delta.contains("\r") || (delta.hasPrefix("\n") && tail.hasSuffix("\r")) {
@@ -40,26 +43,22 @@ struct IncrementalBlocks {
     }
 
     mutating func reset(_ text: String) {
-        committed = []
         tail = text.replacingOccurrences(of: "\r\n", with: "\n")
     }
 
     /// The message is done — nothing can reinterpret the tail any more.
     @discardableResult
-    mutating func finalize() -> ArraySlice<Markdown.Block> {
-        let before = committed.count
-        if !tail.isEmpty {
-            committed += Markdown.parse(tail)
-            tail = ""
-        }
-        return committed[before...]
+    mutating func finalize() -> [Markdown.Block] {
+        guard !tail.isEmpty else { return [] }
+        defer { tail = "" }
+        return Markdown.parse(tail)
     }
 
-    /// The unstable region, parsed. What a renderer draws after `committed`.
+    /// The unstable region, parsed. What a renderer draws after the blocks
+    /// it has already been handed.
     var tailBlocks: [Markdown.Block] { Markdown.parse(tail) }
 
-    private mutating func commitStablePrefix() -> ArraySlice<Markdown.Block> {
-        let before = committed.count
+    private mutating func commitStablePrefix() -> [Markdown.Block] {
         let lines = tail.components(separatedBy: "\n")
         var inFence = false
         var cut: Int?
@@ -72,11 +71,10 @@ struct IncrementalBlocks {
                 cut = index                    // ends every open block above it
             }
         }
-        if let cut {
-            committed += Markdown.parse(lines[...cut].joined(separator: "\n"))
-            tail = lines[(cut + 1)...].joined(separator: "\n")
-        }
-        return committed[before...]
+        guard let cut else { return [] }
+        let fresh = Markdown.parse(lines[...cut].joined(separator: "\n"))
+        tail = lines[(cut + 1)...].joined(separator: "\n")
+        return fresh
     }
 }
 
@@ -213,14 +211,17 @@ final class MarkdownRenderModel {
     }
 
     /// Turn over: commit the tail through the normal parse, so the finished
-    /// message is exactly what a cold parse would have rendered.
+    /// message is exactly what a cold parse would have rendered. Idempotent —
+    /// a second finalize (a superseded legacy child, say) changes nothing.
     func finalize() {
-        freeze(parser.finalize())
+        let fresh = parser.finalize()
+        guard !fresh.isEmpty || blocks.count != frozen.count else { return }
+        freeze(fresh)
         memo = [:]
         blocks = frozen
     }
 
-    private func freeze(_ fresh: ArraySlice<Markdown.Block>) {
+    private func freeze(_ fresh: [Markdown.Block]) {
         for block in fresh {
             frozen.append(RenderedBlock(id: nextId, live: false, block: block,
                                         size: Self.size, inline: bakeFrozen))
