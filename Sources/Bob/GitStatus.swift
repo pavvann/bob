@@ -5,6 +5,12 @@ import Foundation
 /// Read straight out of the repo rather than shelled out for: `.git/HEAD` is one
 /// small file, so this can poll often enough to feel live without paying for a
 /// process each time — and bob spawns quite enough processes already.
+///
+/// The one surviving clock among the file watchers, and deliberately: a session's
+/// `.git` directory sits outside the two roots the FSEvents stream covers (a
+/// session can be anywhere on disk), and a third stream per session cwd is a
+/// worse trade than one small read. Branches change rarely, so ten seconds is
+/// plenty — it used to be three.
 @MainActor
 final class GitStatus: ObservableObject {
     static let shared = GitStatus()
@@ -13,12 +19,32 @@ final class GitStatus: ObservableObject {
     @Published private(set) var branches: [URL: String] = [:]
 
     private var watching: URL?
+    private var holders = 0
     private var poll: Task<Void, Never>?
+
+    private static let interval: UInt64 = 10_000_000_000
+
+    /// Ref-counted, and released when the rail's `.task` is cancelled — the old
+    /// `watch(_:)` had no release at all, so the poll outlived every rail that
+    /// started it.
+    func acquire(_ directory: URL?) {
+        holders += 1
+        retarget(directory)
+    }
+
+    func release() {
+        holders -= 1
+        guard holders <= 0 else { return }
+        holders = 0
+        poll?.cancel()
+        poll = nil
+        watching = nil
+    }
 
     /// Follow one directory — whichever session is on stage. Switching targets
     /// cancels the previous watch, so the timer count stays at one no matter how
     /// many tabs are open.
-    func watch(_ directory: URL?) {
+    func retarget(_ directory: URL?) {
         let target = directory?.standardizedFileURL
         guard target != watching else { return }
         watching = target
@@ -27,7 +53,7 @@ final class GitStatus: ObservableObject {
         poll = Task { [weak self] in
             await self?.refresh(target)
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                try? await Task.sleep(nanoseconds: Self.interval)
                 guard !Task.isCancelled else { return }
                 await self?.refresh(target)
             }
