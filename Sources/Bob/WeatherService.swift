@@ -139,15 +139,7 @@ final class WeatherService: NSObject, ObservableObject {
     // MARK: state file
 
     private func writeState(_ state: State) {
-        let snapshot = Snapshot(state: state, updatedAt: Date())
-        let file = stateFile
-        Task.detached(priority: .utility) {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            guard let data = try? encoder.encode(snapshot) else { return }
-            try? data.write(to: file, options: .atomic)
-        }
+        StateMirror.write(Snapshot(state: state, updatedAt: Date()), to: stateFile)
     }
 
     private func loadCached() {

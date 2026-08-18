@@ -165,15 +165,7 @@ final class GitHubService: ObservableObject {
     /// still says when we last actually asked github. It goes off-main either way.
     private func update(_ new: State) {
         if new != state { state = new }
-        let snapshot = Snapshot(state: new, updatedAt: Date())
-        let file = stateFile
-        Task.detached(priority: .utility) {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            guard let data = try? encoder.encode(snapshot) else { return }
-            try? data.write(to: file, options: .atomic)
-        }
+        StateMirror.write(Snapshot(state: new, updatedAt: Date()), to: stateFile)
     }
 
     private func loadCached() {

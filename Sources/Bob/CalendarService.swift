@@ -68,6 +68,7 @@ final class CalendarService: ObservableObject {
     private let store = EKEventStore()
     private let stateFile: URL
     private var changeObserver: NSObjectProtocol?
+    private var activationObserver: NSObjectProtocol?
     private var tickerTask: Task<Void, Never>?
 
     /// The 7-day window as last fetched, so the minute tick can re-derive now/next
@@ -95,6 +96,18 @@ final class CalendarService: ObservableObject {
             Task { @MainActor in await self?.refresh() }
         }
 
+        // Granting calendar access in System Settings does NOT reliably post
+        // EKEventStoreChanged, so a denied tile would stay denied until the next
+        // launch. Coming back to bob is the moment that matters — and `roll()`
+        // starts with the authorization check, which is cheap.
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.roll() }
+        }
+
         // Tick every 60s so an event that has just begun or just ended moves from
         // `next` to `now` to gone. Not an EventKit query, and not a disk write.
         tickerTask = Task { [weak self] in
@@ -110,7 +123,7 @@ final class CalendarService: ObservableObject {
     }
 
     deinit {
-        if let obs = changeObserver {
+        for obs in [changeObserver, activationObserver].compactMap({ $0 }) {
             NotificationCenter.default.removeObserver(obs)
         }
         tickerTask?.cancel()
@@ -169,8 +182,19 @@ final class CalendarService: ObservableObject {
 
     /// The minute tick: whose turn is it now, given the window we already have.
     /// Costs nothing when the answer hasn't changed, which is almost always.
+    ///
+    /// Authorization is rechecked *before* the access guard, not after it. The
+    /// other way round is a one-way door: a tile that went denied would keep
+    /// early-returning on `authorization`, never ask the system again, and stay
+    /// denied for the life of the process even after the user granted access.
+    /// The check is a cheap system call; the EventKit query behind it stays gated.
     private func roll() async {
-        guard authorization == .fullAccess else { return }
+        let granted = Self.currentAuthorization()
+        if granted != authorization {
+            await refresh()             // adopts the new authorization, queries if it can
+            return
+        }
+        guard granted == .fullAccess else { return }
         if Date().timeIntervalSince(lastQuery) > Self.requeryAfter {
             await refresh()
             return
@@ -244,15 +268,7 @@ final class CalendarService: ObservableObject {
     // MARK: state file
 
     private func writeState(_ state: State) {
-        let snapshot = Snapshot(state: state, updatedAt: Date())
-        let file = stateFile
-        Task.detached(priority: .utility) {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            guard let data = try? encoder.encode(snapshot) else { return }
-            try? data.write(to: file, options: .atomic)
-        }
+        StateMirror.write(Snapshot(state: state, updatedAt: Date()), to: stateFile)
     }
 
     private func loadCached() {

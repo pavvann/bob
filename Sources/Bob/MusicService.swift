@@ -88,15 +88,7 @@ final class MusicService: ObservableObject {
     /// mirror is written off-main whenever the player has spoken.
     private func adopt(_ playback: Playback) {
         if playback != current { current = playback }
-        let snapshot = Snapshot(playback: playback, updatedAt: Date())
-        let file = stateFile
-        Task.detached(priority: .utility) {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            guard let data = try? encoder.encode(snapshot) else { return }
-            try? data.write(to: file, options: .atomic)
-        }
+        StateMirror.write(Snapshot(playback: playback, updatedAt: Date()), to: stateFile)
     }
 
     // MARK: album-art palette

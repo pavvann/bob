@@ -44,6 +44,9 @@ final class NotesStore: ObservableObject {
     /// The mtime `diskText` came from — the gate on re-reading the open note.
     private var diskMtime: Date?
     private var titles: [String: TitleCache] = [:]
+    /// Bumped per scan, so a scan that lands after a newer one started can tell
+    /// it is stale and stand down.
+    private var scanEpoch = 0
     private var saveTask: Task<Void, Never>?
 
     private struct TitleCache: Sendable {
@@ -143,17 +146,23 @@ final class NotesStore: ObservableObject {
     /// One pass over the directory and, if it moved, the open note. The watcher
     /// calls this on a change; the surface can force it on appear.
     func reload() {
+        scanEpoch += 1
+        let epoch = scanEpoch
         let dir = self.dir
         let titles = self.titles
         let open = openID
         let known = diskMtime
         Task.detached(priority: .utility) { [weak self] in
             let scan = Self.scan(dir: dir, titles: titles, open: open, knownMtime: known)
-            await self?.apply(scan)
+            await self?.apply(scan, epoch: epoch)
         }
     }
 
-    private func apply(_ scan: Scan) {
+    private func apply(_ scan: Scan, epoch: Int) {
+        // two rapid external edits are enough for two detached scans to finish
+        // out of order, and the loser would write its older listing, mtime and
+        // text over the winner's. Only the newest scan gets to land.
+        guard epoch == scanEpoch else { return }
         titles = scan.titles
         if scan.notes != notes { notes = scan.notes }
 
