@@ -5,6 +5,9 @@ import ApplicationServices
 @main
 struct BobApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    /// The main window's visibility — every always-on animation below reads
+    /// it from the environment and pauses when bob isn't on glass.
+    @State private var windowActivity = WindowActivity()
 
     var body: some Scene {
         // `Window` (not `WindowGroup`) is a single-instance scene — URL events
@@ -16,7 +19,9 @@ struct BobApp: App {
                        minHeight: 540, idealHeight: 680, maxHeight: 1000)
                 .background(WindowAccessor { window in
                     Self.style(window)
+                    windowActivity.bind(to: window)
                 })
+                .environment(\.windowActivity, windowActivity)
                 .onOpenURL { url in
                     BobURLHandler.handle(url, source: "onOpenURL")
                 }

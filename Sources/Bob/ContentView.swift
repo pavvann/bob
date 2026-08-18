@@ -10,6 +10,7 @@ struct ContentView: View {
     @ObservedObject private var sessions = SessionWatcher.shared
     @ObservedObject private var music = MusicService.shared
     @ObservedObject private var sessionManager = SessionManager.shared
+    @ObservedObject private var router = SurfaceRouter.shared
     @State private var showMemory = false
     @State private var showProjectPicker = false
     @ObservedObject private var resume = ResumeStore.shared
@@ -76,9 +77,12 @@ struct ContentView: View {
                 }
             }
             .padding(20)
-            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: minions.active)
-            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.live)
-            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.parked)
+            // keyed on ids, not whole records: these springs exist for cards
+            // arriving and leaving, and a status flip re-animating the layout
+            // is pure invalidation noise
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: minions.active.map(\.id))
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.live.map(\.id))
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.parked.map(\.id))
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessionManager.workSessions.map(\.id))
             .animation(.easeInOut(duration: 0.2), value: sessionManager.activeID)
 
@@ -244,7 +248,9 @@ struct ContentView: View {
     /// The rail's cards are individually conditional, so bob simply shows fewer
     /// of them (no branch: ~/bob keeps no git).
     private var activeSession: ClaudeSession? {
-        guard SurfaceRouter.shared.active == nil, let id = sessionManager.activeID else { return nil }
+        // read through the observed router: without the subscription this only
+        // looked right because streaming invalidated the window constantly
+        guard router.active == nil, let id = sessionManager.activeID else { return nil }
         return sessionManager.sessions.first { $0.id == id }
     }
 

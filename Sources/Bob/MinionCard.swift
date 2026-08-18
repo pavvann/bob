@@ -838,21 +838,57 @@ struct ParkedDisclosure: View {
     }
 }
 
-/// The little breathing dot that means "alive right now".
+/// The little breathing dot that means "alive right now". The dot can't stop
+/// beating (it would read as "done"), and a SwiftUI repeatForever pumps a
+/// view-graph transaction plus a whole-window layout every frame — so the
+/// beat is a Core Animation animation on a bare layer instead: the render
+/// server carries it, the app pays nothing, and it still stops with the
+/// window's visibility.
 struct PulseDot: View {
     let color: Color
-    @State private var pulse = false
+    @Environment(\.windowActivity) private var activity
 
     var body: some View {
-        Circle()
-            .fill(color.opacity(0.9))
+        PulseDotLayer(color: NSColor(color), beating: activity.isVisible)
             .frame(width: 7, height: 7)
-            .scaleEffect(pulse ? 1.0 : 0.5)
-            .opacity(pulse ? 1.0 : 0.4)
-            .onAppear {
-                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
-                    pulse = true
-                }
-            }
+    }
+}
+
+private struct PulseDotLayer: NSViewRepresentable {
+    let color: NSColor
+    let beating: Bool
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        let dot = CALayer()
+        dot.opacity = 0.9
+        view.layer?.addSublayer(dot)
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        guard let dot = view.layer?.sublayers?.first else { return }
+        dot.frame = view.bounds
+        dot.cornerRadius = view.bounds.width / 2
+        dot.backgroundColor = color.cgColor
+        if beating {
+            guard dot.animation(forKey: "beat") == nil else { return }
+            let scale = CABasicAnimation(keyPath: "transform.scale")
+            scale.fromValue = 0.5
+            scale.toValue = 1.0
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.4
+            fade.toValue = 0.9
+            let beat = CAAnimationGroup()
+            beat.animations = [scale, fade]
+            beat.duration = 0.8
+            beat.autoreverses = true
+            beat.repeatCount = .infinity
+            beat.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            dot.add(beat, forKey: "beat")
+        } else {
+            dot.removeAnimation(forKey: "beat")
+        }
     }
 }

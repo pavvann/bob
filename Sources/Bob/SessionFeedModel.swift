@@ -154,11 +154,16 @@ final class SessionFeedModel: ObservableObject {
             activity = tool
             if tool != nil { lastActivity = Date() }
         }
-        liveStatus = SessionManager.status(of: session)
-        isCold = session.state == .unspawned
+        // equality-gated like everything above: this runs per streamed delta,
+        // and an unchanged publish still invalidates the whole panel
+        let status = SessionManager.status(of: session)
+        if status != liveStatus { liveStatus = status }
+        let cold = session.state == .unspawned
+        if cold != isCold { isCold = cold }
         // the closing numbers belong to a turn that's over; mid-turn they'd be
         // last turn's, pretending to be this one's
-        final = streaming ? nil : session.lastResult.map(Self.numbers)
+        let numbers = streaming ? nil : session.lastResult.map(Self.numbers)
+        if numbers != final { final = numbers }
     }
 
     private static func kind(_ role: ClaudeSession.Role) -> FeedEvent.Kind {
@@ -218,15 +223,17 @@ final class SessionFeedModel: ObservableObject {
             if events.count > 400 { events.removeFirst(events.count - 400) }
         }
         if let f = out.update.final { final = f }
+        // every write below is guarded: this ticks at 1Hz per open panel, and
+        // re-publishing an identical value still redraws the panel
         if let rec = out.record {
-            minion = rec
-            title = rec.task
-            if let w = rec.workdir { cwd = w }
+            if rec != minion { minion = rec }
+            if rec.task != title { title = rec.task }
+            if let w = rec.workdir, w != cwd { cwd = w }
         }
-        if let t = out.update.title { title = t }
+        if let t = out.update.title, t != title { title = t }
         if cwd == nil, let c = out.update.cwd { cwd = c }
-        if let b = out.update.gitBranch { gitBranch = b }
-        if let m = out.update.model { model = m }
+        if let b = out.update.gitBranch, b != gitBranch { gitBranch = b }
+        if let m = out.update.model, m != model { model = m }
         switch flavor {
         case .cliTranscript:
             // mtime moves when claude rewrites an idle transcript's metadata —
@@ -234,7 +241,7 @@ final class SessionFeedModel: ObservableObject {
             // real event advances the clock; silence leaves it where it was.
             if let at = out.update.lastEventAt, at > (lastActivity ?? .distantPast) { lastActivity = at }
         case .minionStream:
-            if let mt = out.mtime { lastActivity = mt }
+            if let mt = out.mtime, mt != lastActivity { lastActivity = mt }
         }
     }
 

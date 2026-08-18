@@ -8,8 +8,12 @@ struct WaveformView: View {
     /// Rolling recent amplitudes 0...1 (oldest → newest), from VoiceInput.
     let levels: [CGFloat]
 
+    @Environment(\.windowActivity) private var activity
+
     var body: some View {
-        TimelineView(.animation) { timeline in
+        // `levels` drives the real redraw rate; the clock only feeds the hour
+        // tint, so cap it and pause it with the window
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !activity.isVisible)) { timeline in
             let accent = Circadian.accent(timeline.date)
             Canvas { ctx, size in
                 let count = levels.count

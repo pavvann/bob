@@ -28,7 +28,6 @@ struct CenterStage: View {
     @ObservedObject private var router = SurfaceRouter.shared
 
     @State private var input: String = ""
-    @State private var breath = PhaseClock(period: 5.2)
     @State private var slashSelection = 0
     @State private var slashDismissed = false
     /// The dispatch acknowledgment — "→ webapp: fix the failing test" — shown
@@ -152,18 +151,11 @@ struct CenterStage: View {
     private var stage: some View {
         if isIdle {
             VStack(spacing: 8) {
-                TimelineView(.animation) { timeline in
-                    // breath rate follows bob's pulse — calm at rest, quicker
-                    // awake. Integrated, not `t / period`: dividing absolute
-                    // time by a period that moves snaps the breath mid-inhale.
-                    let wave = sin(breath.tick(timeline.date, period: pulse.breathPeriod) * 2 * .pi)
-                    Text(greeting)
-                        .font(.system(size: 38, weight: .light, design: .rounded))
-                        .foregroundStyle(.primary.opacity(0.88))
-                        .scaleEffect(1.0 + wave * 0.012)
-                        .opacity(0.92 + wave * 0.08)
-                }
-                .fixedSize()
+                BreathingGreeting(text: greeting, period: pulse.breathPeriod)
+                    // retempo = recreate: energy moves in rare, discrete steps,
+                    // and one clean restart beats display-rate body evals
+                    .id(pulse.breathPeriod)
+                    .fixedSize()
                 // bob's own line about your day — picks up where you left off
                 if home.status == .ready, let line = openLine.line, home.welcomeNote == nil {
                     Text(line)
@@ -217,9 +209,9 @@ struct CenterStage: View {
                 .defaultScrollAnchor(.bottom)
                 .scrollIndicators(.never)
                 .onChange(of: bridge.turns) { _, _ in
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo("end", anchor: .bottom)
-                    }
+                    // not animated: this fires per streamed delta, and an
+                    // animated scroll restarted 30×/sec is pure churn
+                    proxy.scrollTo("end", anchor: .bottom)
                 }
             }
             .transition(.opacity)
@@ -346,7 +338,7 @@ struct CenterStage: View {
         }
         .overlay {
             // No padding here — AnimatedBorder owns its own bleed, so the
-            // canvas and the stroke can never drift out of agreement again.
+            // surface and the stroke can never drift out of agreement again.
             AnimatedBorder(
                 cornerRadius: 26,
                 voiceLevel: Double(voiceIn.level),
@@ -621,6 +613,35 @@ struct CenterStage: View {
     }
 }
 
+/// The idle greeting's breath — a few settling breaths, then stillness. It
+/// must not breathe forever: any SwiftUI-driven animation pumps a view-graph
+/// transaction per frame, and each transaction re-runs layout for the whole
+/// window — profiled at a full core once a transcript was on stage. So the
+/// rule every idle flourish follows: ease in, breathe briefly, hold. The odd
+/// repeat count ends the reversing ease exactly on the model value, so the
+/// freeze lands without a snap; the caller keys this view's identity on
+/// `period`, so a tempo change replays the settling breaths once.
+private struct BreathingGreeting: View {
+    let text: String
+    /// Full breath cycle in seconds (`BobPulse.breathPeriod`).
+    let period: Double
+
+    @State private var inhale = false
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 38, weight: .light, design: .rounded))
+            .foregroundStyle(.primary.opacity(0.88))
+            .scaleEffect(inhale ? 1.012 : 0.988)
+            .opacity(inhale ? 1.0 : 0.84)
+            .onAppear {
+                withAnimation(.easeInOut(duration: period / 2).repeatCount(5, autoreverses: true)) {
+                    inhale = true
+                }
+            }
+    }
+}
+
 // MARK: - one turn, either stage
 
 /// One turn in a running conversation. Your turns sit right-aligned and muted
@@ -785,9 +806,8 @@ private struct WorkStage: View {
                     .defaultScrollAnchor(.bottom)
                     .scrollIndicators(.never)
                     .onChange(of: rows) { _, _ in
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo("end", anchor: .bottom)
-                        }
+                        // not animated — see the companion thread's onChange
+                        proxy.scrollTo("end", anchor: .bottom)
                     }
                 }
             }
