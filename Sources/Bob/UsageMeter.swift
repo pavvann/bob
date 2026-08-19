@@ -262,19 +262,20 @@ final class UsageMeter: ObservableObject {
 /// denominator lives here and nowhere else. Every tier is 200k today; the table
 /// exists so that when one of them isn't, exactly one number changes.
 ///
-/// Measured rather than guessed: fable sessions on this account run the 1M
-/// window — one thread sat at 426k, and another read 44% on the CLI's own
-/// meter while holding ~440k, both impossible at 200k. The CLI never names
-/// the window on the wire (the id is `claude-fable-5` or the bare alias,
-/// no `[1m]` marker), so fable's row says 1M outright. If a 200k fable ever
-/// appears, its meter reads low — the honest direction to be wrong in.
+/// Measured rather than guessed: on this account both fable and opus sessions
+/// hold more than 200k (fable threads at 426k and ~440k; an opus thread past
+/// 200k the same day), which only a 1M window allows. The CLI never names the
+/// window on the wire (ids arrive as `claude-opus-5` or a bare alias, no
+/// `[1m]` marker), so those rows say 1M outright, and `publishContextUse`
+/// ratchets any session that outgrows its assumed window. A hypothetical
+/// 200k session on these tiers reads low — the honest direction to be wrong in.
 enum ContextWindow {
     static let fallback = 200_000
 
     /// Ordered, not a dictionary: a model id containing two tier words must
     /// resolve the same way every time.
     private static let tiers: [(name: String, window: Int)] = [
-        ("opus", 200_000),
+        ("opus", 1_000_000),
         ("sonnet", 200_000),
         ("haiku", 200_000),
         ("fable", 1_000_000),

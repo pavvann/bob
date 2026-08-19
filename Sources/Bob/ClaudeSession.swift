@@ -927,6 +927,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
               latest.conversation == config.sessionId,
               contextWindow > 0
         else { return }
+        // A session holding more than its assumed window IS a long-context
+        // session — the API would have refused the prompt otherwise. Promote
+        // the denominator; never demote.
+        if latest.tokens.contextInUse > contextWindow { contextWindow = 1_000_000 }
         let pct = min(100, Double(latest.tokens.contextInUse) / Double(contextWindow) * 100)
         if contextUsedPct != pct { contextUsedPct = pct }
     }
