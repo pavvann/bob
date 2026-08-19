@@ -380,13 +380,24 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// disk is already older than whatever was just said. A reload the owner
     /// asked for by picking this thread in `/resume` overwrites, because they can
     /// see what's there and asked for the file's version anyway.
+    ///
+    /// Success says nothing. A trailing notice is how this session reports its
+    /// own *health* — `SessionManager.status` reads one as `.needsAttention`
+    /// before it looks at anything else, and AttentionCenter turns that into a
+    /// digest — so announcing a routine load would have flagged every restored
+    /// tab as a session that needs the owner. The thread arriving on screen is
+    /// the only receipt a successful read needs. Failure still speaks, but only
+    /// when someone asked and got nothing back.
     func reload(history: [TranscriptEntry], deliberate: Bool = false) {
-        guard !history.isEmpty, !isStreaming else { return }
+        guard !isStreaming else { return }
         if !deliberate, transcript.entries.contains(where: { $0.role != .notice }) { return }
+        guard !history.isEmpty else {
+            if deliberate {
+                appendNotice("nothing readable on disk for this conversation — the model still has it")
+            }
+            return
+        }
         transcript.replaceAll(history)
-        transcript.append(TranscriptEntry(
-            role: .notice,
-            text: "the last \(history.count) turns of this conversation, read from disk"))
     }
 
     /// Graceful goodbye: close stdin, the process exits on its own (probe
@@ -722,7 +733,18 @@ final class ClaudeSession: ObservableObject, Identifiable {
         case .initialized(let reported, _):
             // init arrives at the start of EVERY turn (never spontaneously at
             // spawn) — it confirms the session file exists, and doubles as a
-            // readiness fallback should a future CLI drop the handshake
+            // readiness fallback should a future CLI drop the handshake.
+            //
+            // Unless it came from a process we already walked away from. `/resume`
+            // and `reset` change the conversation and terminate mid-turn, and the
+            // dying process's last events still arrive after that — carrying the
+            // OLD id, and an "it's on disk" that is true of a conversation this
+            // session no longer is. Every one of those lands before the
+            // replacement process exists (terminationHandler awaits the reader
+            // before processExited clears `process`), so `.draining` is exactly
+            // the corpse's window. Nothing in here has a legitimate effect during
+            // it: becomeReadyIfSpawning already no-ops off `.spawning`.
+            guard state != .draining else { break }
             sessionOnDisk = true
             confirmedOnDisk = true
             adopt(reportedSessionId: reported)
