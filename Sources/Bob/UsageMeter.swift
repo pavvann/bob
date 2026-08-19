@@ -262,14 +262,12 @@ final class UsageMeter: ObservableObject {
 /// denominator lives here and nowhere else. Every tier is 200k today; the table
 /// exists so that when one of them isn't, exactly one number changes.
 ///
-/// KNOWN GAP, measured rather than guessed: a long-context session really does
-/// run past 200k (a fable thread on this machine sat at 426k), and the CLI does
-/// not say so anywhere bob can see — the id it reports is `claude-fable-5`, or
-/// just the alias `fable`, with no marker for the wider window. Those sessions
-/// therefore read a pinned `ctx 100%` (see the clamp in ClaudeSession).
-/// `longContextMarker` below catches the case where the marker *is* in the id;
-/// the rest waits on the CLI naming the window it gave the session, and until
-/// then the fix is one number in this table.
+/// Measured rather than guessed: fable sessions on this account run the 1M
+/// window — one thread sat at 426k, and another read 44% on the CLI's own
+/// meter while holding ~440k, both impossible at 200k. The CLI never names
+/// the window on the wire (the id is `claude-fable-5` or the bare alias,
+/// no `[1m]` marker), so fable's row says 1M outright. If a 200k fable ever
+/// appears, its meter reads low — the honest direction to be wrong in.
 enum ContextWindow {
     static let fallback = 200_000
 
@@ -279,7 +277,7 @@ enum ContextWindow {
         ("opus", 200_000),
         ("sonnet", 200_000),
         ("haiku", 200_000),
-        ("fable", 200_000),
+        ("fable", 1_000_000),
     ]
 
     /// The suffix a long-context variant carries when the id has one at all —
