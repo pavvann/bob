@@ -76,12 +76,29 @@ final class SlashCommandService: ObservableObject {
     nonisolated private static func assemble(root: URL) -> [SlashCommand] {
         var byName: [String: SlashCommand] = [:]
         let home = FileManager.default.homeDirectoryForCurrentUser
-        // user first, project after — project wins a name collision, like the CLI
-        scanSkills(home.appendingPathComponent(".claude/skills"), source: .user, into: &byName)
-        scanCommands(home.appendingPathComponent(".claude/commands"), source: .user, into: &byName)
+        let userSkills = home.appendingPathComponent(".claude/skills")
+        let userCommands = home.appendingPathComponent(".claude/commands")
+        // The palette sends into bob's own session, so it may only offer what
+        // that session can run. The companion's loadout drops the `user` settings
+        // source (CompanionLoadout), which takes ~/.claude's skills and every
+        // plugin's with it — offering `/ship` there would be offering a dead key.
+        let carriesUserSkills = Self.companionCarriesUserSkills
+
+        if carriesUserSkills {
+            // user first, project after — project wins a name collision, like the CLI
+            scanSkills(userSkills, source: .user, into: &byName)
+            scanCommands(userCommands, source: .user, into: &byName)
+        }
         scanSkills(root.appendingPathComponent(".claude/skills"), source: .project, into: &byName)
         scanCommands(root.appendingPathComponent(".claude/commands"), source: .project, into: &byName)
+        // The harvest comes off a MINION's init event, and minions still carry
+        // the whole machine — so when the companion doesn't, subtract exactly the
+        // names it lost: what lives under ~/.claude, and every plugin's `ns:cmd`.
+        let unreachable = carriesUserSkills
+            ? []
+            : Set(names(in: userSkills, dir: true) + names(in: userCommands, dir: false))
         for name in harvestNames(root: root) where byName[name] == nil {
+            if !carriesUserSkills, name.contains(":") || unreachable.contains(name) { continue }
             byName[name] = SlashCommand(
                 name: name, detail: "",
                 source: name.contains(":") ? .plugin : .builtIn
@@ -90,6 +107,29 @@ final class SlashCommandService: ObservableObject {
         return byName.values
             .filter { !excluded($0.name) }
             .sorted { $0.name < $1.name }
+    }
+
+    /// Whether bob's companion still reads `~/.claude`'s settings — and so its
+    /// skills and plugins. An empty source list is the CLI's default: everything.
+    nonisolated static var companionCarriesUserSkills: Bool {
+        let sources = CompanionLoadout.current.settingSources
+        return sources.isEmpty || sources.contains("user")
+    }
+
+    /// Bare names in a skills dir (`<name>/SKILL.md`) or a commands dir
+    /// (`<name>.md`) — no descriptions read, this is only ever a subtraction set.
+    nonisolated private static func names(in dir: URL, dir isSkillDir: Bool) -> [String] {
+        let items = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        return items.compactMap { item in
+            if isSkillDir {
+                let skill = item.appendingPathComponent("SKILL.md")
+                guard FileManager.default.fileExists(atPath: skill.path) else { return nil }
+                return item.lastPathComponent
+            }
+            guard item.pathExtension == "md" else { return nil }
+            return item.deletingPathExtension().lastPathComponent
+        }
     }
 
     /// `<dir>/<name>/SKILL.md` — skills invokable as `/name`.
