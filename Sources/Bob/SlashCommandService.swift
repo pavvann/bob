@@ -94,9 +94,9 @@ final class SlashCommandService: ObservableObject {
         // The harvest comes off a MINION's init event, and minions still carry
         // the whole machine — so when the companion doesn't, subtract exactly the
         // names it lost: what lives under ~/.claude, and every plugin's `ns:cmd`.
-        let unreachable = carriesUserSkills
+        let unreachable: Set<String> = carriesUserSkills
             ? []
-            : Set(names(in: userSkills, dir: true) + names(in: userCommands, dir: false))
+            : Set(skillNames(in: userSkills) + commandNames(in: userCommands))
         for name in harvestNames(root: root) where byName[name] == nil {
             if !carriesUserSkills, name.contains(":") || unreachable.contains(name) { continue }
             byName[name] = SlashCommand(
@@ -116,20 +116,26 @@ final class SlashCommandService: ObservableObject {
         return sources.isEmpty || sources.contains("user")
     }
 
-    /// Bare names in a skills dir (`<name>/SKILL.md`) or a commands dir
-    /// (`<name>.md`) — no descriptions read, this is only ever a subtraction set.
-    nonisolated private static func names(in dir: URL, dir isSkillDir: Bool) -> [String] {
-        let items = (try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
-        return items.compactMap { item in
-            if isSkillDir {
-                let skill = item.appendingPathComponent("SKILL.md")
-                guard FileManager.default.fileExists(atPath: skill.path) else { return nil }
-                return item.lastPathComponent
-            }
-            guard item.pathExtension == "md" else { return nil }
-            return item.deletingPathExtension().lastPathComponent
+    /// Bare `<name>` for every `<name>/SKILL.md` in a skills dir. No descriptions
+    /// read — these two only ever build a subtraction set.
+    nonisolated private static func skillNames(in dir: URL) -> [String] {
+        contents(of: dir).compactMap { item in
+            let skill = item.appendingPathComponent("SKILL.md")
+            guard FileManager.default.fileExists(atPath: skill.path) else { return nil }
+            return item.lastPathComponent
         }
+    }
+
+    /// Bare `<name>` for every `<name>.md` in a commands dir.
+    nonisolated private static func commandNames(in dir: URL) -> [String] {
+        contents(of: dir)
+            .filter { $0.pathExtension == "md" }
+            .map { $0.deletingPathExtension().lastPathComponent }
+    }
+
+    nonisolated private static func contents(of dir: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
     }
 
     /// `<dir>/<name>/SKILL.md` — skills invokable as `/name`.
