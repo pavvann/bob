@@ -21,6 +21,12 @@ enum ResumeIndex {
         let fileURL: URL
         /// The CLI's own summary when it wrote one, else the first thing said.
         let title: String
+        /// When this conversation last *said* something — the newest `timestamp`
+        /// in the file, not the file's mtime. The CLI appends untimestamped
+        /// heartbeat lines (`last-prompt`, `mode`, `ai-title`, `bridge-session`)
+        /// to an idle transcript, so mtime moves without a message being added:
+        /// measured 8.4 days of drift on one transcript here. A row that says
+        /// "3m ago" about a week-old thread is the whole bug (see EventClock).
         let lastActivity: Date
         /// Prompts, not messages — the unit a person counts a conversation in.
         /// A coding session's transcript is mostly tool traffic; counting that
@@ -122,9 +128,16 @@ enum ResumeIndex {
     /// This project's conversations, newest first. `limit` bounds the work: a
     /// project with a hundred old threads shouldn't cost a hundred file reads
     /// to show you the handful you might actually want.
+    ///
+    /// mtime picks the candidates — it's free from the directory read, and it is
+    /// never *earlier* than a real message, so that cut can only be generous.
+    /// The honest clock then decides what the list actually looks like.
     static func conversations(for cwd: URL, root: URL? = nil, limit: Int = 40) -> [Conversation] {
         guard let dir = projectDirectory(for: cwd, root: root) else { return [] }
-        return transcripts(in: dir).prefix(limit).compactMap { conversation(at: $0) }
+        return transcripts(in: dir)
+            .prefix(limit)
+            .compactMap { conversation(at: $0) }
+            .sorted { $0.lastActivity > $1.lastActivity }
     }
 
     /// One row's worth of metadata without parsing the whole file: the head
@@ -138,8 +151,13 @@ enum ResumeIndex {
         var fromBob = false
         var firstPrompt: String?
         var headPrompts = 0
+        /// The newest real event time seen anywhere we read. A small transcript is
+        /// covered entirely by these two bounded reads; a large one has its newest
+        /// events in the tail by construction, which is the read that matters.
+        var spoke: Date?
         for line in headLines(of: url, bytes: headBytes) {
             guard let obj = json(line) else { continue }
+            EventClock.advance(&spoke, with: obj)
             // "HEAD" is what the CLI records outside a repo (~/bob keeps no git
             // by design) — that's an absence, not a branch name
             if branch == nil, let b = obj["gitBranch"] as? String, !b.isEmpty, b != "HEAD" { branch = b }
@@ -167,6 +185,7 @@ enum ResumeIndex {
         var summary: String?
         for line in tailLines(of: url, bytes: 128 * 1024) {
             guard let obj = json(line) else { continue }
+            EventClock.advance(&spoke, with: obj)
             // the branch a long session ENDED on is the one you'd recognize it
             // by — sessions outlive the branch they were opened on
             if let b = obj["gitBranch"] as? String, !b.isEmpty, b != "HEAD" { branch = b }
@@ -184,7 +203,9 @@ enum ResumeIndex {
         return Conversation(id: id,
                             fileURL: url,
                             title: String(title.prefix(120)),
-                            lastActivity: modified(url),
+                            // mtime only when the file never stamped a single
+                            // event — an empty or all-heartbeat transcript
+                            lastActivity: spoke ?? modified(url),
                             prompts: counted.prompts,
                             humanTyped: counted.human > 0,
                             gitBranch: branch,
@@ -243,6 +264,20 @@ enum ResumeIndex {
     }
 
     // MARK: - reading one back
+
+    /// Where one conversation of a project lives, if it's on disk at all.
+    ///
+    /// The CLI names a transcript after the conversation and keeps appending to
+    /// it across every `--resume`, so this is one lookup rather than a walk. It
+    /// is still the one place that answers "which file *is* this conversation",
+    /// which is where a chain would be followed if a future CLI ever forked a
+    /// resumed thread onto a new id (ClaudeSession.adopt covers bob's side of
+    /// that).
+    static func transcript(of conversation: UUID, cwd: URL, root: URL? = nil) -> URL? {
+        guard let dir = projectDirectory(for: cwd, root: root) else { return nil }
+        let url = dir.appendingPathComponent("\(conversation.uuidString.lowercased()).jsonl")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
 
     /// The chosen conversation as transcript rows. Bounded from the end: a long
     /// conversation shows its recent shape, which is what you need to recognize
@@ -345,8 +380,15 @@ enum ResumeIndex {
         return split(data)
     }
 
+    /// Decoded LOSSILY on purpose. Every window above starts or ends at an
+    /// arbitrary byte offset, so it can cut a multi-byte character in half — and
+    /// `String(data:encoding:.utf8)` answers nil for the *whole* slice when that
+    /// happens, not just the bad bytes. That turned one split emoji into an empty
+    /// transcript ("nothing readable on disk") and a titleless picker row; 5 of
+    /// the 563 transcripts on the author's machine hit it. Lossily, the damage is
+    /// one replacement character in the fragment we were dropping anyway.
     private static func split(_ data: Data) -> [String] {
-        (String(data: data, encoding: .utf8) ?? "")
+        String(decoding: data, as: UTF8.self)
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map(String.init)
     }

@@ -108,6 +108,12 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// Called with each completed sentence as the reply streams (D5). Only
     /// fires when `config.voiced`. Wired to VoiceOutput by the view layer.
     var onSentence: ((String) -> Void)?
+    /// This session now names a different conversation than the registry has on
+    /// disk — either because `/resume` repointed it or because the CLI answered
+    /// init with an id bob didn't ask for. Whoever owns the state file wires this
+    /// to its write; without it the next launch restores the conversation you
+    /// just left.
+    var onConversationChanged: (() -> Void)?
     /// Who answers can_use_tool. Ask-first sessions get the UI broker at init
     /// (the approval card is the whole point of the mode); `.auto` sessions keep
     /// the no-op one, which nothing ever calls.
@@ -327,6 +333,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
     func resume(conversationId: UUID, history: [TranscriptEntry]) {
         guard conversationId != config.sessionId else { return }
         config.sessionId = conversationId
+        onConversationChanged?()
         sessionOnDisk = true            // it exists: --resume, not --session-id
         confirmedOnDisk = false         // this process hasn't confirmed it yet
         resumeFallbackUsed = false      // a new id earns its own single retry
@@ -355,6 +362,31 @@ final class ClaudeSession: ObservableObject, Identifiable {
             state = .draining
             process?.terminate()
         }
+    }
+
+    /// Put this conversation's own history back on screen without moving the
+    /// session: same id, same process, same turn if one is in flight. The
+    /// conversation a tab is already on is the one case `resume` can't serve —
+    /// it guards against repointing a session at itself, correctly — and it is
+    /// also the case that matters most, because a restored tab comes back holding
+    /// the right conversation and an empty transcript.
+    ///
+    /// Never while a reply is streaming, whoever asked: `replaceAll` would drop
+    /// the in-flight row out of `entries` while the pump kept appending to the
+    /// object, and the rest of that answer would go nowhere.
+    ///
+    /// An *automatic* reload (a tab waking up from the state file) also declines
+    /// the moment the session has anything of its own on screen — a snapshot of
+    /// disk is already older than whatever was just said. A reload the owner
+    /// asked for by picking this thread in `/resume` overwrites, because they can
+    /// see what's there and asked for the file's version anyway.
+    func reload(history: [TranscriptEntry], deliberate: Bool = false) {
+        guard !history.isEmpty, !isStreaming else { return }
+        if !deliberate, transcript.entries.contains(where: { $0.role != .notice }) { return }
+        transcript.replaceAll(history)
+        transcript.append(TranscriptEntry(
+            role: .notice,
+            text: "the last \(history.count) turns of this conversation, read from disk"))
     }
 
     /// Graceful goodbye: close stdin, the process exits on its own (probe
@@ -687,12 +719,13 @@ final class ClaudeSession: ObservableObject, Identifiable {
     private func handle(_ event: StreamEvent) {
         broadcast(event)
         switch event {
-        case .initialized:
+        case .initialized(let reported, _):
             // init arrives at the start of EVERY turn (never spontaneously at
             // spawn) — it confirms the session file exists, and doubles as a
             // readiness fallback should a future CLI drop the handshake
             sessionOnDisk = true
             confirmedOnDisk = true
+            adopt(reportedSessionId: reported)
             becomeReadyIfSpawning()
         case .status:
             spontaneousIfIdle()
@@ -772,6 +805,23 @@ final class ClaudeSession: ObservableObject, Identifiable {
         case .ignored:
             break
         }
+    }
+
+    /// The id the CLI says this process is on, which bob follows if it isn't the
+    /// one bob asked for.
+    ///
+    /// Today it always is: `--resume <id>` appends to that same conversation, and
+    /// three transcripts here — 40 days, 9 days, 3 days — were resumed many times
+    /// over with the id and the `parentUuid` chain intact. But a CLI that *forked*
+    /// a resumed conversation onto a fresh id would leave bob holding the pre-fork
+    /// one: the tab's turns would land in a file bob never names again, the state
+    /// file would restore the stale head, and the conversation would come back
+    /// missing everything said after the first resume. One assignment, and that
+    /// whole class of bug can't happen — a session is whatever the CLI says it is.
+    private func adopt(reportedSessionId reported: String) {
+        guard let id = UUID(uuidString: reported), id != config.sessionId else { return }
+        config.sessionId = id
+        onConversationChanged?()
     }
 
     private func becomeReadyIfSpawning() {
