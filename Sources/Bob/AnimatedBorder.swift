@@ -10,10 +10,10 @@ import SwiftUI
 /// rotation of a conic gradient (the tail), clipped to the bar's outline by a
 /// stroke mask: the render server runs it alone, zero per-frame main-thread
 /// work. Tempo and thickness land as layer-speed and line-width writes, and
-/// CA's implicit easing makes them glide. Known tradeoff: an angular sweep
-/// isn't arc-length-uniform on a wide bar — the head crosses the short ends a
-/// touch slower than the long edges. It pauses whenever the window isn't on
-/// glass.
+/// CA's implicit easing makes them glide. The rotation is keyframed to uniform
+/// arc length (see `pacedLap`) — spun at constant angular rate the head all
+/// but stopped mid-edge on a bar this wide. It pauses whenever the window
+/// isn't on glass.
 struct AnimatedBorder: View {
     let cornerRadius: CGFloat
     /// Slack around the bar so the stroke isn't clipped at its widest. The
@@ -96,6 +96,11 @@ final class CometView: NSView {
     private var trailLength: Double = 0.30
     private var lastAccent: Color?
     private var lastDrive: Double = -1
+    /// The size the lap keyframes were computed for, and the layer-local time
+    /// the lap notionally started — so a resize re-keys the pacing without
+    /// teleporting the head.
+    private var lapSize: CGSize = .zero
+    private var lapEpoch: CFTimeInterval = 0
 
     /// The lap the spin is authored at; real tempo is a speed multiplier on
     /// the layer, so it can change without restarting the animation.
@@ -116,7 +121,7 @@ final class CometView: NSView {
         ring.lineWidth = 0.5
         layer?.addSublayer(cometClip)
         layer?.addSublayer(ring)
-        spin()
+        // no spin here: the keyframes need real bounds, so layout starts it
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
@@ -166,6 +171,10 @@ final class CometView: NSView {
         let scale = window?.backingScaleFactor ?? 2
         for l in [cometClip, cometMask, ring, tail] { l.contentsScale = scale }
         CATransaction.commit()
+        if bounds.size != lapSize {
+            lapSize = bounds.size
+            spin()
+        }
     }
 
     override func viewDidChangeBackingProperties() {
@@ -174,13 +183,81 @@ final class CometView: NSView {
     }
 
     private func spin() {
-        let lap = CABasicAnimation(keyPath: "transform.rotation.z")
-        lap.fromValue = 0.0
-        lap.toValue = 2.0 * Double.pi
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        // resume mid-flight: a respin (resize, dropped animation) must not
+        // teleport the head, so the phase rides the layer's own clock
+        let local = tail.convertTime(CACurrentMediaTime(), from: nil)
+        let phase = ((local - lapEpoch) / Self.basePeriod)
+            .truncatingRemainder(dividingBy: 1)
+        lapEpoch = local - phase * Self.basePeriod
+        let (values, keyTimes) = pacedLap()
+        let lap = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+        lap.values = values
+        lap.keyTimes = keyTimes
+        lap.calculationMode = .linear
         lap.duration = Self.basePeriod
         lap.repeatCount = .infinity
         lap.isRemovedOnCompletion = false
+        lap.timeOffset = phase * Self.basePeriod
         tail.add(lap, forKey: "lap")
+    }
+
+    /// Keyframes that hold the head at constant speed along the outline. A
+    /// conic gradient spun at constant angular rate is arc-length-uniform only
+    /// on a circle; on a bar this wide the head crawled through the long
+    /// edges' middles and sprinted around the ends. Sampling the outline at
+    /// uniform arc length and keying the rotation to each sample's
+    /// angle-from-center makes the render server hold perimeter speed
+    /// instead. The tail still spans a fixed slice of the conic, so its drawn
+    /// length breathes a little with position — the one residual.
+    private func pacedLap() -> (values: [NSNumber], keyTimes: [NSNumber]) {
+        let rect = bounds.insetBy(dx: bleed, dy: bleed)
+        let r = min(cornerRadius, rect.width / 2, rect.height / 2)
+        let cx = rect.midX, cy = rect.midY
+        let (x0, x1, y0, y1) = (rect.minX, rect.maxX, rect.minY, rect.maxY)
+        let quarter = r * .pi / 2
+        let arc: (CGFloat, CGFloat, CGFloat, CGFloat) -> CGPoint = { acx, acy, a0, t in
+            CGPoint(x: acx + r * cos(a0 + t / r), y: acy + r * sin(a0 + t / r))
+        }
+        // counterclockwise from the middle of the right edge — the head's
+        // authored angle, so the first keyframe is rotation zero
+        let segs: [(len: CGFloat, at: (CGFloat) -> CGPoint)] = [
+            (max(0, y1 - r - cy), { CGPoint(x: x1, y: cy + $0) }),
+            (quarter, { arc(x1 - r, y1 - r, 0, $0) }),
+            (max(0, x1 - x0 - 2 * r), { CGPoint(x: x1 - r - $0, y: y1) }),
+            (quarter, { arc(x0 + r, y1 - r, .pi / 2, $0) }),
+            (max(0, y1 - y0 - 2 * r), { CGPoint(x: x0, y: y1 - r - $0) }),
+            (quarter, { arc(x0 + r, y0 + r, .pi, $0) }),
+            (max(0, x1 - x0 - 2 * r), { CGPoint(x: x0 + r + $0, y: y0) }),
+            (quarter, { arc(x1 - r, y0 + r, 3 * .pi / 2, $0) }),
+            (max(0, cy - y0 - r), { CGPoint(x: x1, y: y0 + r + $0) }),
+        ]
+        let total = segs.reduce(CGFloat(0)) { $0 + $1.len }
+        guard total > 0 else { return ([0, 2 * Double.pi as NSNumber], [0, 1]) }
+        let n = 144
+        var values: [NSNumber] = []
+        var seg = 0
+        var consumed: CGFloat = 0
+        var prev = 0.0
+        var offset = 0.0
+        for i in 0...n {
+            let s = total * CGFloat(i) / CGFloat(n)
+            while seg < segs.count - 1, s - consumed > segs[seg].len {
+                consumed += segs[seg].len
+                seg += 1
+            }
+            let p = segs[seg].at(min(max(0, s - consumed), segs[seg].len))
+            var a = Double(atan2(p.y - cy, p.x - cx)) + offset
+            if a < prev - 0.001 {
+                offset += 2 * .pi
+                a += 2 * .pi
+            }
+            prev = a
+            values.append(a as NSNumber)
+        }
+        values[n] = 2 * Double.pi as NSNumber
+        let keyTimes = (0...n).map { NSNumber(value: Double($0) / Double(n)) }
+        return (values, keyTimes)
     }
 
     /// Change the lap tempo (or freeze it) without teleporting the phase:
