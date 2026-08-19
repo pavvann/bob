@@ -85,7 +85,11 @@ final class SessionManager: ObservableObject {
                 permissions: .auto,         // behavior parity with today's bridge (edge 11)
                 model: Self.preferredCompanionModel(),
                 name: "bob",
-                voiced: true
+                voiced: true,
+                // bob's chat isn't a coding terminal: no global MCP servers, no
+                // ~/.claude skill catalogue, only the tools his manual asks for
+                // (~54k of prompt down to ~32k). state/companion-loadout.json.
+                extraArguments: CompanionLoadout.current.spawnArguments()
             ))
         }
         restoreWorkSessions()
