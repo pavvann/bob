@@ -73,8 +73,10 @@ enum StreamEvent: Equatable, Sendable {
     case status(String?)
     /// partial-message events (only with `--include-partial-messages`).
     case streamEvent(Partial)
-    /// `assistant` — emitted once per completed content block.
-    case assistant([AssistantBlock])
+    /// `assistant` — emitted once per completed content block. `usage` is the
+    /// token count that message ran with; the last one of a turn is what the
+    /// model had in front of it when the turn ended.
+    case assistant([AssistantBlock], usage: TokenUsage?)
     /// `user` carrying tool_result blocks — a tool finished.
     case toolResult(isError: Bool)
     case taskStarted(id: String, description: String?, subagentType: String?, taskType: String?)
@@ -94,8 +96,12 @@ enum StreamEvent: Equatable, Sendable {
                         requiresUserInteraction: Bool, rawJSON: String)
     /// ack for a control_request bob sent (interrupt).
     case controlResponse(id: String?, ok: Bool)
-    /// hooks, rate limits, thinking meters, unknown shapes. `forensic` is
-    /// non-nil only when the line didn't decode at all — callers log those.
+    /// `rate_limit_event` — the CLI's own read on the subscription block.
+    /// Session metadata, not transcript: it says nothing about the conversation
+    /// and only ever moves the global meter.
+    case rateLimit(type: String?, resetsAt: Date?, isUsingOverage: Bool)
+    /// hooks, thinking meters, unknown shapes. `forensic` is non-nil only when
+    /// the line didn't decode at all — callers log those.
     case ignored(forensic: String?)
 
     enum Partial: Equatable, Sendable {
@@ -114,6 +120,19 @@ enum StreamEvent: Equatable, Sendable {
         /// live-activity row, built by TranscriptParser's shared vocabulary.
         case toolUse(name: String, activity: String)
     }
+}
+
+/// The token counts riding one assistant message. `contextInUse` is what the
+/// model actually had in front of it — fresh input plus both halves of the
+/// cache, because a cached token occupies the window exactly as much as a new
+/// one does. Output stays out: it's what the model wrote, not what it read.
+struct TokenUsage: Equatable, Sendable {
+    var inputTokens = 0
+    var cacheReadTokens = 0
+    var cacheCreationTokens = 0
+    var outputTokens = 0
+
+    var contextInUse: Int { inputTokens + cacheReadTokens + cacheCreationTokens }
 }
 
 /// The closing record of a turn (`type: result`).
@@ -165,7 +184,7 @@ enum StreamJSON {
                 ok: (response?["subtype"] as? String) == "success"
             )
         case "rate_limit_event":
-            return .ignored(forensic: nil)
+            return rateLimit(obj)
         default:
             // a shape the probes never saw — keep the evidence (risk #2)
             return .ignored(forensic: line)
@@ -261,7 +280,37 @@ enum StreamJSON {
                 break
             }
         }
-        return .assistant(blocks)
+        return .assistant(blocks, usage: usage(message["usage"] as? [String: Any]))
+    }
+
+    /// `{"input_tokens":4,"cache_read_input_tokens":38102,
+    /// "cache_creation_input_tokens":1291,"output_tokens":118}`. A message whose
+    /// counts are all zero (or absent) reports nothing rather than a confident 0%
+    /// — the meter would rather stay dark than lie about an empty window.
+    private static func usage(_ obj: [String: Any]?) -> TokenUsage? {
+        guard let obj else { return nil }
+        var u = TokenUsage()
+        u.inputTokens = (obj["input_tokens"] as? Int) ?? 0
+        u.cacheReadTokens = (obj["cache_read_input_tokens"] as? Int) ?? 0
+        u.cacheCreationTokens = (obj["cache_creation_input_tokens"] as? Int) ?? 0
+        u.outputTokens = (obj["output_tokens"] as? Int) ?? 0
+        return u.contextInUse > 0 ? u : nil
+    }
+
+    /// `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
+    /// "resetsAt":1787104800,"rateLimitType":"five_hour",
+    /// "isUsingOverage":false}}` — camelCase and a unix stamp here, snake_case
+    /// and ISO-8601 on the HTTP endpoint. The CLI's two mouths don't agree, so
+    /// both shapes get their own reader.
+    private static func rateLimit(_ obj: [String: Any]) -> StreamEvent {
+        guard let info = obj["rate_limit_info"] as? [String: Any] else {
+            return .ignored(forensic: nil)
+        }
+        return .rateLimit(
+            type: info["rateLimitType"] as? String,
+            resetsAt: (info["resetsAt"] as? Double).map { Date(timeIntervalSince1970: $0) },
+            isUsingOverage: (info["isUsingOverage"] as? Bool) ?? false
+        )
     }
 
     private static func user(_ obj: [String: Any]) -> StreamEvent {

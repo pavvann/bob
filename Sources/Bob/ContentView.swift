@@ -88,7 +88,7 @@ struct ContentView: View {
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessionManager.workSessions.map(\.id))
             .animation(.easeInOut(duration: 0.2), value: sessionManager.activeID)
 
-            memoryToggle
+            topRight
             projectPickerOverlay
             resumePickerOverlay
         }
@@ -279,6 +279,20 @@ struct ContentView: View {
         return URL(fileURLWithPath: cwd)
     }
 
+    /// The window's top-right corner: the subscription readout, then the memory
+    /// toggle. Floating here rather than inside the ambient row is what keeps the
+    /// tiles at full width — and it's the one position that survives the band
+    /// collapsing to icons, so the numbers never move between bob's stage and a
+    /// session page.
+    private var topRight: some View {
+        HStack(spacing: 10) {
+            RateLimitStrip()
+            memoryToggle
+        }
+        .padding(.top, 12)
+        .padding(.trailing, 14)
+    }
+
     private var memoryToggle: some View {
         Button {
             withAnimation(.easeInOut(duration: 0.22)) { showMemory.toggle() }
@@ -291,8 +305,6 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .help(showMemory ? "hide memory" : "show memory")
-        .padding(.top, 12)
-        .padding(.trailing, 14)
     }
 }
 
