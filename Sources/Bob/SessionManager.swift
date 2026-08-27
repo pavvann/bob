@@ -108,12 +108,43 @@ final class SessionManager: ObservableObject {
 
         let split = Self.prune(Self.decodeRecords(data), exists: Self.isDirectory)
         for record in split.kept where !hasWorkSession(cwd: record.cwd) {
-            sessions.append(makeSession(record.config))
+            let session = makeSession(record.config)
+            sessions.append(session)
+            hydrate(session)
         }
         for record in split.gone {
             note("dropped restored session '\(record.name)' — \(record.cwd) is gone")
         }
         if !split.gone.isEmpty { save() }   // the file forgets what disk forgot
+    }
+
+    /// Put a restored tab's conversation back on screen.
+    ///
+    /// The record carries the conversation, so the CLI comes back holding the
+    /// whole thread — but the transcript is a fresh empty store, and until now
+    /// nothing ever read the thread back. The tab said the project's name over an
+    /// empty stage and `/resume` couldn't help, because it hides the conversation
+    /// you're already in. So the only way to see your own history was to pick a
+    /// *different*, older thread — which repointed the tab and took the newest
+    /// turns off both the screen and the model.
+    ///
+    /// One bounded read per restored tab, off the main actor, at restore. Not a
+    /// watcher and not a poll: `reload` declines the moment the session has
+    /// anything of its own to say, so a tab that wakes up and starts talking
+    /// while this read is in flight keeps what it said.
+    private func hydrate(_ session: ClaudeSession) {
+        let conversation = session.config.sessionId
+        let cwd = session.config.cwd
+        Task { [weak session] in
+            let turns = await Task.detached(priority: .utility) { () -> [ResumeIndex.Turn] in
+                guard let url = ResumeIndex.transcript(of: conversation, cwd: cwd) else { return [] }
+                return ResumeIndex.history(of: url)
+            }.value
+            guard let session, session.config.sessionId == conversation else { return }
+            session.reload(history: turns.map {
+                TranscriptEntry(role: $0.fromYou ? .you : .bob, text: $0.text)
+            })
+        }
     }
 
     // MARK: - spawn / activate / close
@@ -422,10 +453,10 @@ final class SessionManager: ObservableObject {
         return last.isEmpty || last == "/" ? "session" : last
     }
 
-    /// Write the registry now. Callers that change a session's config out from
-    /// under the manager — `/resume` repointing a tab at a different conversation
-    /// — have to say so, or the next launch restores the old one and the resume
-    /// quietly never happened.
+    /// Write the registry now. A session that repoints itself no longer has to
+    /// remember to ask — `onConversationChanged`, wired in `makeSession`, does it
+    /// for every path including the ones nobody thought of. This stays as the
+    /// door for anything that edits a config field the manager doesn't own.
     func persist() { save() }
 
     private func save() {
@@ -448,11 +479,16 @@ final class SessionManager: ObservableObject {
     // MARK: - plumbing
 
     private func makeSession(_ config: SessionConfig) -> ClaudeSession {
-        ClaudeSession(
+        let session = ClaudeSession(
             config: config,
             claudePath: ClaudeBridge.claudePath,
             stderrSink: ClaudeBridge.stderrSink(root: BobHome.shared.root)
         )
+        // whenever a session stops being the conversation the file says it is —
+        // `/resume`, or a CLI that answered init with a different id — the
+        // registry writes, or the next launch restores the thread just left
+        session.onConversationChanged = { [weak self] in self?.save() }
+        return session
     }
 
     private func hasWorkSession(cwd: String) -> Bool {

@@ -18,6 +18,10 @@ final class ResumeStore: ObservableObject {
     @Published private(set) var rows: [ResumeIndex.Conversation] = []
     @Published private(set) var loading = false
     @Published var query = ""
+    /// The conversation the target session is already in. It stays in the list —
+    /// picking it re-reads the thread instead of switching threads, which is the
+    /// only way to get a restored tab's own history back on screen.
+    @Published private(set) var currentID: UUID?
 
     /// The project whose history is on screen — shown in the header so a
     /// picker raised from the wrong tab is obvious before you click.
@@ -43,14 +47,18 @@ final class ResumeStore: ObservableObject {
         projectName = session.config.name
         let cwd = session.config.cwd
         let current = session.config.sessionId
+        currentID = current
         Task {
             let found = await Task.detached(priority: .userInitiated) {
                 ResumeIndex.conversations(for: cwd)
             }.value
             guard self.target === session else { return }   // you moved on; drop it
-            // the thread you're already in isn't a destination, and neither is
-            // a one-prompt errand bob ran for itself
-            self.rows = found.filter { $0.id != current && !$0.isOneShot }
+            // A one-prompt errand bob ran for itself is not a destination. The
+            // thread you're already in is: after a relaunch the tab holds the
+            // right conversation and an empty stage, and this row is what puts it
+            // back — the newest messages you have are in there, not in the
+            // older thread you'd otherwise settle for.
+            self.rows = found.filter { $0.id == current || !$0.isOneShot }
             self.loading = false
         }
     }
@@ -60,27 +68,33 @@ final class ResumeStore: ObservableObject {
         rows = []
         query = ""
         loading = false
+        currentID = nil
     }
 
     /// Read the conversation off disk, then hand it to the session. The read is
     /// off-actor because a long transcript is real work, and the session is only
     /// touched once there's something to show.
+    ///
+    /// Picking the conversation you're already in is a *reload*, not a resume:
+    /// the id doesn't move, the process isn't torn down, and the thread you were
+    /// having comes back on screen. Picking any other one repoints the tab, and
+    /// the registry is told so the next launch doesn't undo it.
     func pick(_ conversation: ResumeIndex.Conversation) {
         guard let session = target else { return }
+        let reloading = conversation.id == session.config.sessionId
         close()
         Task {
             let turns = await Task.detached(priority: .userInitiated) {
                 ResumeIndex.history(of: conversation.fileURL)
             }.value
-            session.resume(
-                conversationId: conversation.id,
-                history: turns.map {
-                    TranscriptEntry(role: $0.fromYou ? .you : .bob, text: $0.text)
-                }
-            )
-            // the tab now points somewhere else — the registry has to know, or the
-            // next launch brings back the conversation you just left
-            SessionManager.shared.persist()
+            let history = turns.map {
+                TranscriptEntry(role: $0.fromYou ? .you : .bob, text: $0.text)
+            }
+            if reloading {
+                session.reload(history: history, deliberate: true)
+            } else {
+                session.resume(conversationId: conversation.id, history: history)
+            }
         }
     }
 }
@@ -127,7 +141,8 @@ struct ResumePicker: View {
                         hint("nothing matches")
                     }
                     ForEach(store.matches) { row in
-                        ResumeRow(conversation: row) { store.pick(row) }
+                        ResumeRow(conversation: row,
+                                  isCurrent: row.id == store.currentID) { store.pick(row) }
                     }
                 }
                 .padding(6)
@@ -153,13 +168,17 @@ struct ResumePicker: View {
 
 private struct ResumeRow: View {
     let conversation: ResumeIndex.Conversation
+    /// The thread this tab is already in — picking it re-reads rather than
+    /// switches, and the row says so rather than looking like a duplicate.
+    var isCurrent = false
     let action: () -> Void
     @State private var hover = false
 
     var body: some View {
         Button(action: action) {
             HStack(alignment: .top, spacing: 8) {
-                Image(systemName: conversation.fromBob ? "bubble.left" : "terminal")
+                Image(systemName: isCurrent ? "arrow.clockwise"
+                                            : (conversation.fromBob ? "bubble.left" : "terminal"))
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary.opacity(0.55))
                     .frame(width: 14)
@@ -170,6 +189,10 @@ private struct ResumeRow: View {
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                     HStack(spacing: 6) {
+                        if isCurrent {
+                            Text("this thread")
+                            Text("·")
+                        }
                         Text(Self.ago(conversation.lastActivity))
                         if conversation.prompts > 0 {
                             Text("·")
