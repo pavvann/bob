@@ -246,11 +246,28 @@ enum CodexJSON {
     }
 
     private static func item(_ params: [String: Any]) -> CodexItem? {
-        guard let obj = params["item"] as? [String: Any],
-              let id = obj["id"] as? String,
+        guard let obj = params["item"] as? [String: Any] else { return nil }
+        return item(obj, turnId: (params["turnId"] as? String) ?? "")
+    }
+
+    /// The turns `thread/resume` hands back inside its Thread — the only
+    /// response that carries them populated. Nothing replays them as
+    /// notifications, so this is where a resumed conversation's history comes
+    /// from or it doesn't come at all. Flattened in order: a transcript is one
+    /// column, and the turn boundaries are already visible in who is speaking.
+    static func history(of thread: [String: Any]) -> [CodexItem] {
+        (thread["turns"] as? [[String: Any]] ?? []).flatMap { turn -> [CodexItem] in
+            let turnId = (turn["id"] as? String) ?? ""
+            return (turn["items"] as? [[String: Any]] ?? []).compactMap {
+                item($0, turnId: turnId)
+            }
+        }
+    }
+
+    static func item(_ obj: [String: Any], turnId: String) -> CodexItem? {
+        guard let id = obj["id"] as? String,
               let type = obj["type"] as? String
         else { return nil }
-        let turnId = (params["turnId"] as? String) ?? ""
         switch type {
         case "userMessage":
             let text = ((obj["content"] as? [[String: Any]]) ?? [])

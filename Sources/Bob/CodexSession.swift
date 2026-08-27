@@ -92,6 +92,8 @@ final class CodexSession: ObservableObject, Identifiable {
     /// there is nothing to steer against and a second `turn/start` would be
     /// the exact mistake above.
     private var turnStarting = false
+    /// A `turn/steer` is on the wire and its message is out of the queue.
+    private var steerInFlight = false
     private var wantsInterrupt = false
     private var lastCompletedTurnId: String?
 
@@ -213,9 +215,22 @@ final class CodexSession: ObservableObject, Identifiable {
                                         timeout: CodexServer.quiesceTimeout)
     }
 
-    /// This tab is going away: push the pump's tail out and stop receiving.
-    /// The thread itself survives on disk — that's what makes it resumable.
+    /// This tab is going away: leave nothing of it running, push the pump's
+    /// tail out, and stop receiving. The thread itself survives on disk —
+    /// that's what makes it resumable.
+    ///
+    /// Detaching alone would strand it: the shared server keeps executing the
+    /// turn, and its next approval arrives at a route nobody owns, which parks
+    /// that thread for good. So the open asks are refused and the live turn is
+    /// stopped first, on the same leash shutdown uses.
     func close() async {
+        let asks = openRequests
+        openRequests.removeAll()
+        if blockedOn != nil { blockedOn = nil }
+        for ask in asks {
+            await server.respond(to: ask.id, code: -32800, message: "bob closed this session")
+        }
+        await quiesce()
         await pump.finish()
         if let thread = threadId { await server.detach(threadId: thread) }
     }
@@ -226,21 +241,58 @@ final class CodexSession: ObservableObject, Identifiable {
         do {
             _ = try await server.start()
             let route = CodexThreadRoute(pump: pump, quiesce: { [weak self] in await self?.quiesce() })
-            let opened: (threadId: String, model: String?)
-            if let resume = config.resumeThreadId {
+            let opened: (threadId: String, model: String?, history: [CodexItem])
+            // `threadId` first: when app-server dies this session keeps its
+            // thread and its transcript, and `open()` is the retry. Starting a
+            // fresh thread there would leave the conversation on screen while
+            // the model had none of it.
+            if let resume = threadId ?? config.resumeThreadId {
                 opened = try await server.resumeThread(
                     resume, approvalPolicy: config.approvalPolicy, route: route)
             } else {
-                opened = try await server.startThread(
+                let started = try await server.startThread(
                     cwd: config.cwd, approvalPolicy: config.approvalPolicy, route: route)
+                opened = (started.threadId, started.model, [])
             }
             threadId = opened.threadId
             if model != opened.model { model = opened.model }
+            hydrate(opened.history)
             state = .idle
             drain()
         } catch {
             fail(error)
         }
+    }
+
+    /// Put a resumed thread's own history on screen. Codex sends it once, in
+    /// `thread/resume`'s reply, and never again as notifications — so without
+    /// this the model remembers a conversation the transcript can't show, the
+    /// same seam the claude side closed in #30.
+    ///
+    /// Only onto an empty transcript. Recovery after a server death resumes
+    /// the same thread with bob's own rows already up, and those are what the
+    /// owner actually watched — replaying over them would double every line.
+    private func hydrate(_ history: [CodexItem]) {
+        guard transcript.entries.isEmpty, !history.isEmpty else { return }
+        var rows: [TranscriptEntry] = []
+        for item in history {
+            let row: TranscriptEntry
+            switch item.content {
+            case .userMessage(let text, _): row = TranscriptEntry(role: .you, text: text)
+            case .agentMessage(let text): row = TranscriptEntry(role: .bob, text: text)
+            case .other: continue
+            }
+            rows.append(row)
+            itemRows[item.id] = ItemRow(entry: row, turnId: item.turnId)
+        }
+        guard !rows.isEmpty else { return }
+        transcript.replaceAll(rows)
+        for row in rows { transcript.finalize(row) }
+        transcript.append(TranscriptEntry(role: .notice,
+            text: "resumed this thread — the last \(rows.count) messages, read from codex"))
+        // so the first new turn prunes these the way it prunes any other
+        // turn's rows, instead of holding them forever
+        lastCompletedTurnId = history.last?.turnId
     }
 
     /// Name the thread so `thread/list` (phase 1b's resume picker) has
@@ -260,9 +312,17 @@ final class CodexSession: ObservableObject, Identifiable {
         guard !queue.isEmpty else { return }
         switch state {
         case .idle:
+            // a steer still in flight may yet come back and requeue its
+            // message at the head; starting the next one now would send the
+            // two in the wrong order
+            guard !steerInFlight else { return }
             beginTurn(queue.removeFirst())
         case .turnActive:
-            guard let turn = liveTurnId else { return }   // id still in flight
+            // one steer at a time. Two in flight can reach app-server in
+            // either order, and two failures both reinsert at index 0 —
+            // which reverses the order they were typed in.
+            guard !steerInFlight, let turn = liveTurnId, threadId != nil else { return }
+            steerInFlight = true
             steer(queue.removeFirst(), expecting: turn)
         case .interrupting, .unspawned, .spawning, .failed:
             return
@@ -287,6 +347,13 @@ final class CodexSession: ObservableObject, Identifiable {
                 // nothing left to stop; left armed it would take the *next*
                 // turn the moment adoptTurn sees it
                 self.wantsInterrupt = false
+                // the row bob opened for this turn was never written into and
+                // never will be: left up, the NEXT turn reuses it and prints
+                // its reply above both the failure and the prompt that earned
+                // it. The echo that would have claimed the user's row isn't
+                // coming either, and a stale one binds the wrong row later.
+                self.closeAgentRow(stopped: false)
+                self.pendingUserRows.removeAll { $0.clientId == out.clientId }
                 self.lastError = Self.reason(error)
                 self.appendNotice("codex couldn't start that turn — \(Self.reason(error))")
                 // deliberately not re-draining: a queue that retries itself
@@ -297,15 +364,18 @@ final class CodexSession: ObservableObject, Identifiable {
     }
 
     private func steer(_ out: Outbound, expecting turn: String) {
+        guard let thread = threadId else { return }
         Task { [weak self] in
-            guard let self, let thread = self.threadId else { return }
+            guard let self else { return }
+            var holdForTurnEnd = false
             do {
                 _ = try await self.server.steerTurn(
                     threadId: thread, expectedTurnId: turn, text: out.text,
                     clientMessageId: out.clientId)
             } catch {
                 // the turn ended under us — the precondition is exactly what
-                // makes that loud. Put the send back for the next idle.
+                // makes that loud. Put the send back at the head, where it
+                // still sits in front of anything typed after it.
                 self.queue.insert(out, at: 0)
                 self.lastError = Self.reason(error)
                 // …but if that turn is *still* the live one, it refused the
@@ -313,9 +383,10 @@ final class CodexSession: ObservableObject, Identifiable {
                 // approval is the case — and will refuse an identical one
                 // just as fast. Wait for `turn/completed` to drain the queue
                 // rather than spinning RPCs against it.
-                if self.liveTurnId == turn { return }
+                holdForTurnEnd = self.liveTurnId == turn
             }
-            self.drain()
+            self.steerInFlight = false
+            if !holdForTurnEnd { self.drain() }
         }
     }
 
@@ -382,6 +453,7 @@ final class CodexSession: ObservableObject, Identifiable {
     private func serverDied(_ message: String) {
         liveTurnId = nil
         turnStarting = false
+        steerInFlight = false
         wantsInterrupt = false
         closeAgentRow(stopped: true)
         // nothing can answer these any more, and phase 2 must not draw a card

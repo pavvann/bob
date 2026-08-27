@@ -500,16 +500,23 @@ actor CodexServer {
         return (id, result["model"] as? String)
     }
 
+    /// The response carries the thread's existing turns — `thread/resume` is
+    /// one of the few that populate them — and nothing ever replays them as
+    /// notifications, so a caller that drops them has a model remembering a
+    /// conversation the screen can't show.
     func resumeThread(_ threadId: String, approvalPolicy: CodexApprovalPolicy,
-                      route: CodexThreadRoute) async throws -> (threadId: String, model: String?) {
+                      route: CodexThreadRoute) async throws
+        -> (threadId: String, model: String?, history: [CodexItem]) {
         let result = try await call("thread/resume", params: [
             "threadId": threadId,
             "approvalPolicy": approvalPolicy.rawValue,
         ], claiming: route)
-        guard let id = (result["thread"] as? [String: Any])?["id"] as? String else {
+        guard let thread = result["thread"] as? [String: Any],
+              let id = thread["id"] as? String
+        else {
             throw CodexServerError.malformed(method: "thread/resume")
         }
-        return (id, result["model"] as? String)
+        return (id, result["model"] as? String, CodexJSON.history(of: thread))
     }
 
     func startTurn(threadId: String, text: String, clientMessageId: String,
