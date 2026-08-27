@@ -27,6 +27,13 @@ actor StreamPump {
             return .drop
         case .ignored:
             return .drop            // the reader already logged the forensics
+        case .rateLimit:
+            // session metadata, and rare: the CLI emits one per turn at most, so
+            // it rides the boundary lane like every other state event. Spelled
+            // out rather than left to `default` because the one thing it must
+            // never become is a per-token hop — that lane is `coalesce`, above,
+            // and nothing else may join it.
+            return .boundary
         default:
             return .boundary
         }
