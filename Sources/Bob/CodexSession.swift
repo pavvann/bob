@@ -209,7 +209,8 @@ final class CodexSession: ObservableObject, Identifiable {
     /// the reply to this interrupt can still be dispatched while it waits.
     func quiesce() async {
         guard let thread = threadId, let turn = liveTurnId else { return }
-        try? await server.interruptTurn(threadId: thread, turnId: turn)
+        try? await server.interruptTurn(threadId: thread, turnId: turn,
+                                        timeout: CodexServer.quiesceTimeout)
     }
 
     /// This tab is going away: push the pump's tail out and stop receiving.
@@ -282,6 +283,10 @@ final class CodexSession: ObservableObject, Identifiable {
                 self.adoptTurn(turnId)
             } catch {
                 self.turnStarting = false
+                // the stop the owner asked for during the id's window has
+                // nothing left to stop; left armed it would take the *next*
+                // turn the moment adoptTurn sees it
+                self.wantsInterrupt = false
                 self.lastError = Self.reason(error)
                 self.appendNotice("codex couldn't start that turn — \(Self.reason(error))")
                 // deliberately not re-draining: a queue that retries itself
@@ -303,6 +308,12 @@ final class CodexSession: ObservableObject, Identifiable {
                 // makes that loud. Put the send back for the next idle.
                 self.queue.insert(out, at: 0)
                 self.lastError = Self.reason(error)
+                // …but if that turn is *still* the live one, it refused the
+                // steer on its own account — a turn parked on an unanswered
+                // approval is the case — and will refuse an identical one
+                // just as fast. Wait for `turn/completed` to drain the queue
+                // rather than spinning RPCs against it.
+                if self.liveTurnId == turn { return }
             }
             self.drain()
         }
@@ -332,9 +343,25 @@ final class CodexSession: ObservableObject, Identifiable {
         guard liveTurnId == nil || liveTurnId == turnId else { return }
         lastCompletedTurnId = turnId
         lastTurn = CodexTurnOutcome(status: status, durationMs: durationMs, error: error)
+        closeAgentRow(stopped: status == .interrupted)
+        if status == .failed, let error {
+            lastError = error
+            appendNotice("codex: \(error)")
+        }
+        discardRequests(ofTurn: turnId)
+        publishContextUse()
+        liveTurnId = nil
+        state = .idle
+        drain()
+    }
+
+    /// Settle the row the live turn was writing into. `stopped` appends the
+    /// marker; a row bob opened on send that the turn never said a word in is
+    /// removed instead of left blank.
+    private func closeAgentRow(stopped: Bool) {
         if let row = currentAgentRow {
             transcript.set(activity: nil, of: row)
-            if status == .interrupted {
+            if stopped {
                 // interrupted is not an error — the owner asked for it
                 transcript.append(text: row.text.isEmpty ? "(interrupted)" : " (interrupted)", to: row)
             } else if row.text.isEmpty, row === unclaimedAgentRow {
@@ -345,14 +372,24 @@ final class CodexSession: ObservableObject, Identifiable {
         }
         unclaimedAgentRow = nil
         currentAgentRow = nil
-        if status == .failed, let error {
-            lastError = error
-            appendNotice("codex: \(error)")
-        }
-        publishContextUse()
+    }
+
+    /// app-server is gone. Every turn it was running died with it, so the state
+    /// has to go terminal here: an active session would otherwise stay
+    /// `turnActive` and `isStreaming` forever, and an idle one would look fine
+    /// until its next send. `.failed` is the retryable state — `open()` starts
+    /// clean from it, and the server relaunches on the next `start()`.
+    private func serverDied(_ message: String) {
         liveTurnId = nil
-        state = .idle
-        drain()
+        turnStarting = false
+        wantsInterrupt = false
+        closeAgentRow(stopped: true)
+        // nothing can answer these any more, and phase 2 must not draw a card
+        // whose reply would go nowhere
+        openRequests.removeAll()
+        if blockedOn != nil { blockedOn = nil }
+        if !activeFlags.isEmpty { activeFlags = [] }
+        fail(reason: message)
     }
 
     // MARK: - the stream
@@ -386,6 +423,8 @@ final class CodexSession: ObservableObject, Identifiable {
         case .turnFailed(let message, let willRetry):
             lastError = message
             if !willRetry { appendNotice("codex: \(message)") }
+        case .serverExited(let message):
+            serverDied(message)
         case .serverRequest(let request):
             park(request)
         case .agentMessageDelta, .unmodeled:
@@ -499,6 +538,15 @@ final class CodexSession: ObservableObject, Identifiable {
         if blockedOn?.id == request.id { blockedOn = openRequests.first }
     }
 
+    /// A turn that ended while parked leaves its asks unanswerable: app-server
+    /// has stopped waiting on them, so a card drawn from one would be stale and
+    /// an answer sent for one would name a dead turn.
+    private func discardRequests(ofTurn turnId: String) {
+        guard openRequests.contains(where: { $0.turnId == turnId }) else { return }
+        openRequests.removeAll { $0.turnId == turnId }
+        if blockedOn?.turnId == turnId { blockedOn = openRequests.first }
+    }
+
     private static func ask(for method: String) -> String {
         switch method {
         case "item/commandExecution/requestApproval": return "permission to run a command"
@@ -525,7 +573,10 @@ final class CodexSession: ObservableObject, Identifiable {
     }
 
     private func fail(_ error: Error) {
-        let why = Self.reason(error)
+        fail(reason: Self.reason(error))
+    }
+
+    private func fail(reason why: String) {
         lastError = why
         state = .failed(why)
         appendNotice("codex session is down — \(why)")

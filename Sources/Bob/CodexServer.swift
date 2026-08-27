@@ -164,7 +164,7 @@ actor CodexServer {
             }
         }
         let sink = stderrSink
-        reader = Task.detached(priority: .userInitiated) { [weak self] in
+        let readerTask = Task.detached(priority: .userInitiated) { [weak self] in
             var framer = LineFramer()
             var dropped = 0
             for await chunk in bytes {
@@ -188,8 +188,17 @@ actor CodexServer {
             }
         }
 
-        proc.terminationHandler = { [weak self] _ in
-            Task { await self?.processDidExit() }
+        reader = readerTask
+
+        // Exit runs strictly after the reader has routed every trailing line —
+        // an interrupted item's `item/completed` arrives *after*
+        // `turn/completed`, and exit handling drops the very routes it needs.
+        // Same discipline as ClaudeSession's own exit handler.
+        proc.terminationHandler = { [weak self] exited in
+            Task {
+                _ = await readerTask.value
+                await self?.processDidExit(exited)
+            }
         }
 
         do {
@@ -201,24 +210,49 @@ actor CodexServer {
         }
         process = proc
         stdin = stdinPipe
+        hasExited = false
 
-        let result = try await call("initialize", params: [
-            "clientInfo": ["name": "bob", "title": "bob", "version": Self.bobVersion],
-        ])
-        guard let userAgent = result["userAgent"] as? String,
-              let home = result["codexHome"] as? String
-        else { throw CodexServerError.malformed(method: "initialize") }
-        // no `capabilities`: experimental methods are not something bob wants
-        // arriving on a stream it decodes defensively
-        notify("initialized", params: [:])
+        do {
+            let result = try await call("initialize", params: [
+                "clientInfo": ["name": "bob", "title": "bob", "version": Self.bobVersion],
+            ])
+            guard let userAgent = result["userAgent"] as? String,
+                  let home = result["codexHome"] as? String
+            else { throw CodexServerError.malformed(method: "initialize") }
+            // no `capabilities`: experimental methods are not something bob wants
+            // arriving on a stream it decodes defensively
+            notify("initialized", params: [:])
 
-        return CodexHandshake(
-            userAgent: userAgent,
-            codexHome: home,
-            platformOs: (result["platformOs"] as? String) ?? "?",
-            cliVersion: Self.recordedVersion(of: path),
-            executablePath: path
-        )
+            return CodexHandshake(
+                userAgent: userAgent,
+                codexHome: home,
+                platformOs: (result["platformOs"] as? String) ?? "?",
+                cliVersion: Self.recordedVersion(of: path),
+                executablePath: path
+            )
+        } catch {
+            // a handshake that never landed leaves a live app-server nobody is
+            // talking to: the retry this throw invites would spawn a second one
+            // and overwrite the handles, while this process's reader and
+            // termination handler stayed alive to clobber the replacement.
+            discard(proc, stdinPipe: stdinPipe, stdoutPipe: stdoutPipe)
+            throw error
+        }
+    }
+
+    /// Walk away from a process this actor is giving up on. Clearing `process`
+    /// first is what makes the corpse's termination handler a no-op, so the
+    /// cleanup happens exactly once and never against a successor.
+    private func discard(_ proc: Process, stdinPipe: Pipe, stdoutPipe: Pipe) {
+        if proc === process {
+            process = nil
+            stdin = nil
+        }
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        reader?.cancel()
+        reader = nil
+        try? stdinPipe.fileHandleForWriting.close()
+        if proc.isRunning { kill(group: proc) }
     }
 
     /// Interrupt whatever is live, close stdin, give app-server the ten
@@ -228,9 +262,20 @@ actor CodexServer {
     /// is an RPC whose reply the reader has to dispatch — holding the actor
     /// across them would deadlock on the very answers they wait for.
     nonisolated func shutdown() async {
-        for quiesce in await quiesceHooks() { await quiesce() }
+        // Concurrently, and each hook's `turn/interrupt` on a short leash: a
+        // quit may not cost the RPC default once per live session on top of
+        // the ten-second stdin wait below.
+        await withTaskGroup(of: Void.self) { group in
+            for quiesce in await quiesceHooks() { group.addTask { await quiesce() } }
+        }
         await finishShutdown()
     }
+
+    /// What one quiesce hook may spend waiting for its interrupt's reply.
+    /// `turn/interrupt` answers `{}` in milliseconds when app-server is
+    /// healthy; when it isn't, shutdown's own ten seconds are the real bound
+    /// and this must not eat them.
+    static let quiesceTimeout: Duration = .seconds(3)
 
     private func quiesceHooks() -> [@Sendable () async -> Void] {
         routes.values.map(\.quiesce)
@@ -284,7 +329,8 @@ actor CodexServer {
         continuation.resume(returning: false)
     }
 
-    private func processDidExit() {
+    private func processDidExit(_ exited: Process) {
+        guard exited === process else { return }   // a corpse `discard` already buried
         hasExited = true
         exitDeadline?.cancel()
         exitDeadline = nil
@@ -294,6 +340,11 @@ actor CodexServer {
         }
         process = nil
         stdin = nil
+        reader = nil
+        // the cached handshake is per-process: leaving it would make every
+        // later start() hand back a handshake for a process that is gone and
+        // answer nothing, so nothing would ever relaunch
+        handshake = nil
         for waiter in pending.values {
             waiter.deadline.cancel()
             waiter.continuation.resume(throwing: CodexServerError.notRunning)
@@ -303,7 +354,7 @@ actor CodexServer {
         // hear about it the same way they hear about everything else
         let orphaned = routes.values.map(\.pump)
         routes.removeAll()
-        let event = CodexEvent.turnFailed(message: "codex app-server exited", willRetry: false)
+        let event = CodexEvent.serverExited("codex app-server exited")
         Task { for pump in orphaned { await pump.ingest(event) } }
         for tap in taps.values { tap.yield(event) }
     }
@@ -491,8 +542,11 @@ actor CodexServer {
         return (result["turnId"] as? String) ?? expectedTurnId
     }
 
-    func interruptTurn(threadId: String, turnId: String) async throws {
-        _ = try await call("turn/interrupt", params: ["threadId": threadId, "turnId": turnId])
+    func interruptTurn(threadId: String, turnId: String,
+                       timeout: Duration = .seconds(120)) async throws {
+        _ = try await call("turn/interrupt",
+                           params: ["threadId": threadId, "turnId": turnId],
+                           timeout: timeout)
     }
 
     func setThreadName(_ name: String, threadId: String) async throws {

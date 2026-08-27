@@ -109,6 +109,10 @@ enum CodexEvent: Sendable {
     /// `error` — a turn failed. `willRetry` means app-server is having another
     /// go on its own and no `turn/completed` follows yet.
     case turnFailed(message: String, willRetry: Bool)
+    /// The process itself is gone. Distinct from `turnFailed` because that one
+    /// is survivable — the thread lives and the next turn works — and this one
+    /// takes every turn, every pending answer and the thread's route with it.
+    case serverExited(String)
     case serverRequest(CodexServerRequest)
     /// Decoded fine, not modelled here. Forward-compatible on purpose: a new
     /// method must be able to say less, never to break the stream.
