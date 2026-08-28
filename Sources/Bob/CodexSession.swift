@@ -88,6 +88,11 @@ final class CodexSession: ObservableObject, Identifiable {
     /// sessions do it: a streamed token wakes the one row reading it and the
     /// @Published surface below speaks only at boundaries.
     let transcript = TranscriptStore()
+    /// The typed work codex reports — commands, tools, searches, file changes
+    /// and reasoning (#38 T2.3/T2.4). Its own store for the same reason the
+    /// transcript has one: a command's output is a firehose, and it must not
+    /// come through this object's `objectWillChange`.
+    let activity: CodexActivityStore
 
     @Published private(set) var state: State = .unspawned
     @Published private(set) var lastError: String? = nil
@@ -185,6 +190,7 @@ final class CodexSession: ObservableObject, Identifiable {
     init(config: CodexSessionConfig, server: CodexServer) {
         self.config = config
         self.server = server
+        self.activity = CodexActivityStore(scope: config.cwd.path)
     }
 
     /// Sane GUI default (#37 T1.5): writes scoped to the session's own cwd and
@@ -416,7 +422,10 @@ final class CodexSession: ObservableObject, Identifiable {
             switch item.content {
             case .userMessage(let text, _): row = TranscriptEntry(role: .you, text: text)
             case .agentMessage(let text): row = TranscriptEntry(role: .bob, text: text)
-            case .other: continue
+            // a resumed thread's commands and file changes are history, not
+            // activity: the gutter answers "what is happening now", and rows for
+            // work that finished yesterday would read as if it just ran
+            default: continue
             }
             rows.append(row)
             itemRows[item.id] = ItemRow(entry: row, turnId: item.turnId)
@@ -618,6 +627,9 @@ final class CodexSession: ObservableObject, Identifiable {
         lastCompletedTurnId = turnId
         lastTurn = CodexTurnOutcome(status: status, durationMs: durationMs, error: error)
         closeAgentRow(stopped: status == .interrupted)
+        // the thinking row stops saying "thinking" — it keeps what it said, so
+        // the fold is still worth opening after the turn
+        activity.endReasoning()
         if status == .failed, let error {
             lastError = error
             appendNotice("codex: \(error)")
@@ -662,6 +674,8 @@ final class CodexSession: ObservableObject, Identifiable {
         // its exit is exactly what reaps the children a `turn/interrupt` never
         // could, so nothing this session started is running any more
         liveCommands.removeAll()
+        activity.endRunning(reason: "app-server died")
+        activity.endReasoning()
         // nothing can answer these any more, and a card whose reply would go
         // nowhere is worse than no card
         openRequests.removeAll()
@@ -677,9 +691,26 @@ final class CodexSession: ObservableObject, Identifiable {
     /// then the boundary that flushed it — so a window's worth of deltas costs
     /// one transcript mutation, and every item completion, server request,
     /// error and turn end is guaranteed to see the text that preceded it.
-    func applyPump(text: String?, boundary: CodexEvent?) {
+    func applyPump(text: String?, keyed: [StreamChunk], boundary: CodexEvent?) {
         if let text { appendDelta(text) }
+        for chunk in keyed { route(chunk) }
         if let boundary { handle(boundary) }
+    }
+
+    /// One window's coalesced output or reasoning, put where it belongs. The
+    /// relative order of reply text and a command's output inside a window is
+    /// unobservable — they are different surfaces — so only each key's own
+    /// order has to hold, and the pump preserves that.
+    private func route(_ chunk: StreamChunk) {
+        guard let target = CodexStreamTarget(key: chunk.key) else { return }
+        switch target {
+        case .commandOutput(let item):
+            activity.append(output: chunk.text, toCommand: item)
+        case .reasoningSummary(let item, let part):
+            activity.append(reasoning: chunk.text, part: part, item: item)
+        case .reasoningText(let item):
+            activity.append(reasoningText: chunk.text, item: item)
+        }
     }
 
     private func handle(_ event: CodexEvent) {
@@ -708,12 +739,17 @@ final class CodexSession: ObservableObject, Identifiable {
             park(request)
         case .requestResolved(let requestId):
             resolved(requestId)
-        case .agentMessageDelta, .unmodeled:
+        case .reasoningPartAdded(let itemId, let part):
+            activity.reserveReasoning(part: part, item: itemId)
+        case .turnDiff(let turnId, let tally):
+            activity.note(diff: tally, turnId: turnId)
+        case .agentMessageDelta, .commandOutputDelta, .reasoningDelta, .unmodeled:
             break   // the classifier already coalesced or dropped these
         }
     }
 
     private func began(_ item: CodexItem) {
+        activity.record(item, done: false)
         switch item.content {
         case .userMessage(let text, let clientId):
             bindUserRow(item, text: text, clientId: clientId)
@@ -729,9 +765,11 @@ final class CodexSession: ObservableObject, Identifiable {
             }
             itemRows[item.id] = ItemRow(entry: row, turnId: item.turnId)
             currentAgentRow = row
-        case .other(let type):
+        case .commandExecution:
             // the one item kind whose life outlasts bob's interest in it
-            if type == "commandExecution" { liveCommands.insert(item.id) }
+            liveCommands.insert(item.id)
+        case .mcpToolCall, .webSearch, .fileChange, .reasoning, .other:
+            break   // the activity store above owns these
         }
     }
 
@@ -744,6 +782,7 @@ final class CodexSession: ObservableObject, Identifiable {
     }
 
     private func completed(_ item: CodexItem) {
+        activity.record(item, done: true)
         switch item.content {
         case .userMessage(let text, let clientId):
             bindUserRow(item, text: text, clientId: clientId)
@@ -755,8 +794,10 @@ final class CodexSession: ObservableObject, Identifiable {
             if row.text != text { transcript.set(text: text, of: row) }
             transcript.finalize(row)
             if currentAgentRow === row { currentAgentRow = nil }
-        case .other(let type):
-            if type == "commandExecution" { liveCommands.remove(item.id) }
+        case .commandExecution:
+            liveCommands.remove(item.id)
+        case .mcpToolCall, .webSearch, .fileChange, .reasoning, .other:
+            break
         }
     }
 
@@ -910,20 +951,34 @@ final class CodexSession: ObservableObject, Identifiable {
 
 extension StreamPump where Event == CodexEvent {
     static func codex(session: CodexSession) -> StreamPump<CodexEvent> {
-        StreamPump(classify: { Self.lane(for: $0) }, deliver: { [weak session] text, boundary in
-            await session?.applyPump(text: text, boundary: boundary)
+        StreamPump(classify: { Self.lane(for: $0) }, deliver: { [weak session] text, keyed, boundary in
+            await session?.applyPump(text: text, keyed: keyed, boundary: boundary)
         })
     }
 
-    /// Only assistant text is a firehose; everything the state machine acts on
-    /// is a boundary, which is what guarantees pending text lands before an
-    /// item completes, before a server request, before an error and before the
-    /// turn ends. Reasoning deltas are phase 2's — until then they're chatter
-    /// that dies here, off-main.
+    /// Three firehoses now, not one: the reply text, a command's output and a
+    /// model's reasoning. All three ride the same 16ms window, and everything
+    /// the state machine acts on is still a boundary — which is what guarantees
+    /// pending text and pending output land before an item completes, before a
+    /// server request, before an error and before the turn ends.
+    ///
+    /// Output and reasoning are keyed rather than joined into the reply: they
+    /// land on different surfaces, and one pile would lose which was which.
     static func lane(for event: CodexEvent) -> Lane {
         switch event {
         case .agentMessageDelta(_, let text):
             return text.isEmpty ? .drop : .coalesce(text)
+        case .commandOutputDelta(let itemId, let chunk):
+            guard !chunk.isEmpty else { return .drop }
+            return .coalesceKeyed(key: CodexStreamTarget.commandOutput(item: itemId).key, text: chunk)
+        case .reasoningDelta(let itemId, let text, let lane):
+            guard !text.isEmpty else { return .drop }
+            let target: CodexStreamTarget
+            switch lane {
+            case .summary(let part): target = .reasoningSummary(item: itemId, part: part)
+            case .raw: target = .reasoningText(item: itemId)
+            }
+            return .coalesceKeyed(key: target.key, text: text)
         case .unmodeled:
             return .drop
         default:

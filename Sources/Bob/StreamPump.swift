@@ -14,14 +14,24 @@ import Foundation
 actor StreamPump<Event: Sendable> {
     enum Lane {
         case coalesce(String)   // text delta — accumulate for the window
+        /// A second firehose with its own destination — codex's command output
+        /// and reasoning deltas. Same window, same flush, but kept apart from
+        /// the reply text because they land on different surfaces, and joining
+        /// them would lose which was which.
+        case coalesceKeyed(key: String, text: String)
         case nudge              // thinking chatter — one idle check per window
         case drop               // non-visual; nothing downstream needs it
         case boundary           // ordering-sensitive — flush text, then deliver
     }
 
     private let classify: @Sendable (Event) -> Lane
-    private let deliver: @Sendable (String?, Event?) async -> Void
+    private let deliver: @Sendable (String?, [StreamChunk], Event?) async -> Void
     private var pending: [String] = []
+    /// Insertion-ordered runs, merged when consecutive fragments share a key —
+    /// which is the common case, one command printing. Order within a key is
+    /// what has to survive; order *between* keys is unobservable, since each
+    /// key is a different row.
+    private var keyed: [(key: String, parts: [String])] = []
     /// Thinking chatter wants a spontaneous-turn check — delivered at most
     /// once per boundary window, so a long think costs one hop, not sixty.
     private var nudgePending = false
@@ -32,7 +42,7 @@ actor StreamPump<Event: Sendable> {
     private var generation = 0
 
     init(classify: @escaping @Sendable (Event) -> Lane,
-         deliver: @escaping @Sendable (String?, Event?) async -> Void) {
+         deliver: @escaping @Sendable (String?, [StreamChunk], Event?) async -> Void) {
         self.classify = classify
         self.deliver = deliver
     }
@@ -43,6 +53,13 @@ actor StreamPump<Event: Sendable> {
             return
         case .coalesce(let text):
             pending.append(text)
+            armIfNeeded()
+        case .coalesceKeyed(let key, let text):
+            if let last = keyed.indices.last, keyed[last].key == key {
+                keyed[last].parts.append(text)
+            } else {
+                keyed.append((key, [text]))
+            }
             armIfNeeded()
         case .nudge:
             guard !nudgeDelivered else { return }
@@ -61,7 +78,7 @@ actor StreamPump<Event: Sendable> {
     func finish() async {
         generation += 1
         if let d = deadline { d.cancel(); await d.value; deadline = nil }
-        if !pending.isEmpty { await send(boundary: nil) }
+        if !pending.isEmpty || !keyed.isEmpty { await send(boundary: nil) }
     }
 
     private func armIfNeeded() {
@@ -80,22 +97,33 @@ actor StreamPump<Event: Sendable> {
         guard gen == generation else { return }   // a boundary crossed mid-flush and owns `deadline`
         deadline = nil
         // fragments that landed while the flush was crossing get a new window
-        if !pending.isEmpty || nudgePending { armIfNeeded() }
+        if !pending.isEmpty || !keyed.isEmpty || nudgePending { armIfNeeded() }
     }
 
     private func send(boundary: Event?) async {
         let text = pending.isEmpty ? nil : pending.joined()
         pending.removeAll(keepingCapacity: true)
+        let chunks = keyed.map { StreamChunk(key: $0.key, text: $0.parts.joined()) }
+        keyed.removeAll(keepingCapacity: true)
         if nudgePending { nudgePending = false; nudgeDelivered = true }
-        await deliver(text, boundary)
+        await deliver(text, chunks, boundary)
     }
+}
+
+/// One window's worth of coalesced fragments, and where they go. The key is
+/// opaque here on purpose: the pump owns the *timing*, and a provider owns what
+/// its own destinations are called.
+struct StreamChunk: Sendable {
+    let key: String
+    let text: String
 }
 
 // MARK: - claude
 
 extension StreamPump where Event == StreamEvent {
     static func claude(session: ClaudeSession) -> StreamPump<StreamEvent> {
-        StreamPump(classify: { Self.lane(for: $0) }, deliver: { [weak session] text, boundary in
+        // claude has one firehose, so the keyed pile is always empty here
+        StreamPump(classify: { Self.lane(for: $0) }, deliver: { [weak session] text, _, boundary in
             await session?.applyPump(text: text, boundary: boundary)
         })
     }

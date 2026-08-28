@@ -241,14 +241,19 @@ struct ContentView: View {
             .frame(maxHeight: .infinity)
             if withGutters {
                 Spacer(minLength: 10)
-                // the rail is still claude-shaped — its cards are the question
-                // chooser and this conversation's agents, neither of which codex
-                // reports in phase 1. A codex tab gets the ghost, so the stage
-                // stays centred either way.
-                if case .claude(let staged)? = activeSession {
+                // the gutter follows the provider: claude's cards are the
+                // question chooser and this conversation's agents; codex reports
+                // its work as typed items instead, so its rail is those plus the
+                // thinking row (#38 T2.3/T2.4). Same width either way, so the
+                // stage stays centred.
+                switch activeSession {
+                case .claude(let staged)?:
                     SessionRail(session: staged)
                         .transition(.opacity.combined(with: .move(edge: .trailing)))
-                } else {
+                case .codex(let staged)?:
+                    CodexRail(session: staged)
+                        .transition(.opacity.combined(with: .move(edge: .trailing)))
+                case nil:
                     Color.clear.frame(width: SessionRail.width, height: 1)
                 }
                 Spacer(minLength: 10)

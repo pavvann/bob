@@ -68,12 +68,143 @@ struct CodexItem: Sendable {
         /// the only honest way to recognise bob's own prompt coming back.
         case userMessage(text: String, clientId: String?)
         case agentMessage(String)
+        /// The one thing claude cannot report: a real command, its live output
+        /// and its exit code (#38 T2.3).
+        case commandExecution(CodexCommandRun)
+        case mcpToolCall(server: String, tool: String, status: CodexWorkStatus)
+        case webSearch(query: String)
+        case fileChange(changes: [CodexFileEdit], status: CodexWorkStatus)
+        /// Both halves arrive empty on `item/started` and populated on
+        /// completion; many models never populate either (#38 T2.4).
+        case reasoning(summary: [String], content: [String])
         case other(type: String)
     }
 
     let id: String
     let turnId: String
     let content: Content
+}
+
+/// The four item states, one enum. `CommandExecutionStatus` and
+/// `PatchApplyStatus` are the same four words and `McpToolCallStatus` is three
+/// of them, so nothing is gained by keeping them apart.
+enum CodexWorkStatus: String, Sendable, Equatable {
+    case inProgress, completed, failed, declined
+}
+
+/// A `commandExecution` item. `aggregatedOutput` is reduced to a bounded tail
+/// **here**, in the decoder — off the main actor, before the full string can
+/// reach anything that retains it.
+struct CodexCommandRun: Sendable, Equatable {
+    var command: String
+    var cwd: String
+    var status: CodexWorkStatus
+    var exitCode: Int?
+    var durationMs: Int?
+    var processId: String?
+    var output: CodexOutputTail?
+}
+
+struct CodexFileEdit: Sendable, Equatable {
+    enum Kind: String, Sendable, Equatable, CaseIterable {
+        case add, update, delete
+
+        var word: String {
+            switch self {
+            case .add: return "added"
+            case .update: return "edited"
+            case .delete: return "deleted"
+            }
+        }
+    }
+
+    var path: String
+    var kind: Kind
+}
+
+/// What bob keeps of `turn/diff/updated`: three integers.
+///
+/// The notification carries the whole aggregated unified diff and fires on every
+/// file change, so a turn that rewrites a large file pushes megabytes through it.
+/// A count is all the gutter shows (a diff view is not in scope), so the tally is
+/// computed in the decoder — one pass over the UTF-8 view, no per-line
+/// allocation, because splitting a megabyte diff into lines to count them would
+/// materialise a substring per line — and the diff itself is dropped on the spot.
+struct CodexDiffTally: Sendable, Equatable {
+    var files = 0
+    var added = 0
+    var removed = 0
+
+    var isEmpty: Bool { files == 0 && added == 0 && removed == 0 }
+
+    static func tally(unifiedDiff diff: String) -> CodexDiffTally {
+        var files = 0, added = 0, removed = 0
+        var column = 0
+        var first: UInt8 = 0
+        var repeated = 0        // how many leading bytes equal the first one
+        func settle() {
+            guard column > 0 else { return }
+            let tripled = repeated >= 3
+            switch first {
+            case 0x2B: if tripled { files += 1 } else { added += 1 }     // '+' / '+++'
+            case 0x2D: if !tripled { removed += 1 }                      // '-' (and '---' is a header)
+            default: break
+            }
+        }
+        for byte in diff.utf8 {
+            if byte == 0x0A {
+                settle()
+                column = 0
+                repeated = 0
+                continue
+            }
+            if column == 0 {
+                first = byte
+                repeated = 1
+            } else if repeated == column, byte == first {
+                repeated += 1
+            }
+            column += 1
+        }
+        settle()
+        return CodexDiffTally(files: files, added: added, removed: removed)
+    }
+}
+
+/// Which coalesced pile a codex fragment belongs to.
+///
+/// `StreamPump` keys its non-text piles by an opaque string — it is generic over
+/// providers and has no business learning codex's item vocabulary — so this is
+/// how that key is spelled, in one place, with the item id last so the split can
+/// never be ambiguous.
+enum CodexStreamTarget: Sendable, Equatable {
+    case commandOutput(item: String)
+    case reasoningSummary(item: String, part: Int)
+    case reasoningText(item: String)
+
+    var key: String {
+        switch self {
+        case .commandOutput(let item): return "cmd:\(item)"
+        case .reasoningSummary(let item, let part): return "rsum:\(part):\(item)"
+        case .reasoningText(let item): return "rtext:\(item)"
+        }
+    }
+
+    init?(key: String) {
+        if key.hasPrefix("cmd:") {
+            self = .commandOutput(item: String(key.dropFirst(4)))
+        } else if key.hasPrefix("rtext:") {
+            self = .reasoningText(item: String(key.dropFirst(6)))
+        } else if key.hasPrefix("rsum:") {
+            let rest = key.dropFirst(5)
+            guard let split = rest.firstIndex(of: ":"),
+                  let part = Int(rest[rest.startIndex..<split])
+            else { return nil }
+            self = .reasoningSummary(item: String(rest[rest.index(after: split)...]), part: part)
+        } else {
+            return nil
+        }
+    }
 }
 
 /// `thread/tokenUsage/updated`. `modelContextWindow` is the whole reason the
@@ -104,6 +235,17 @@ enum CodexEvent: Sendable {
     case itemStarted(CodexItem)
     case itemCompleted(CodexItem)
     case agentMessageDelta(itemId: String, text: String)
+    /// `item/commandExecution/outputDelta` — a firehose with no ceiling, so it
+    /// rides the coalescer keyed by item and is retained only as a tail.
+    ///
+    /// There is no sibling for file changes: `item/fileChange/outputDelta` is
+    /// deprecated and 0.149.0's own schema says the server no longer emits it,
+    /// so nothing here waits on one.
+    case commandOutputDelta(itemId: String, chunk: String)
+    case reasoningDelta(itemId: String, text: String, lane: CodexReasoningLane)
+    /// `item/reasoning/summaryPartAdded` — a paragraph break, not content.
+    case reasoningPartAdded(itemId: String, part: Int)
+    case turnDiff(turnId: String, tally: CodexDiffTally)
     case tokenUsage(CodexTokenUsage)
     case threadStatus(kind: String, activeFlags: [String])
     /// `error` — a turn failed. `willRetry` means app-server is having another
@@ -126,6 +268,14 @@ enum CodexEvent: Sendable {
 
 enum CodexTurnStatus: String, Sendable {
     case completed, interrupted, failed, inProgress
+}
+
+/// Which half of a reasoning item a delta belongs to. The summary is the thing
+/// worth reading; raw `textDelta` is model-dependent — most emit none — so it is
+/// optional detail behind it, never the row's content.
+enum CodexReasoningLane: Sendable, Equatable {
+    case summary(part: Int)
+    case raw
 }
 
 // MARK: - outbound policy
@@ -225,6 +375,32 @@ enum CodexJSON {
                   let text = params["delta"] as? String
             else { break }
             return .agentMessageDelta(itemId: itemId, text: text)
+        case "item/commandExecution/outputDelta":
+            guard let itemId = params["itemId"] as? String,
+                  let delta = params["delta"] as? String
+            else { break }
+            return .commandOutputDelta(itemId: itemId, chunk: delta)
+        case "item/reasoning/summaryTextDelta":
+            guard let itemId = params["itemId"] as? String,
+                  let delta = params["delta"] as? String
+            else { break }
+            return .reasoningDelta(itemId: itemId, text: delta,
+                                   lane: .summary(part: (params["summaryIndex"] as? Int) ?? 0))
+        case "item/reasoning/textDelta":
+            guard let itemId = params["itemId"] as? String,
+                  let delta = params["delta"] as? String
+            else { break }
+            return .reasoningDelta(itemId: itemId, text: delta, lane: .raw)
+        case "item/reasoning/summaryPartAdded":
+            guard let itemId = params["itemId"] as? String else { break }
+            return .reasoningPartAdded(itemId: itemId,
+                                       part: (params["summaryIndex"] as? Int) ?? 0)
+        case "turn/diff/updated":
+            guard let turnId = params["turnId"] as? String,
+                  let diff = params["diff"] as? String
+            else { break }
+            // counted here and thrown away here — see CodexDiffTally
+            return .turnDiff(turnId: turnId, tally: .tally(unifiedDiff: diff))
         case "thread/tokenUsage/updated":
             guard let usage = tokenUsage(params) else { break }
             return .tokenUsage(usage)
@@ -286,9 +462,50 @@ enum CodexJSON {
         case "agentMessage":
             return CodexItem(id: id, turnId: turnId,
                              content: .agentMessage((obj["text"] as? String) ?? ""))
+        case "commandExecution":
+            let run = CodexCommandRun(
+                command: (obj["command"] as? String) ?? "",
+                cwd: (obj["cwd"] as? String) ?? "",
+                status: status(obj["status"]),
+                exitCode: obj["exitCode"] as? Int,
+                durationMs: obj["durationMs"] as? Int,
+                processId: obj["processId"] as? String,
+                // the tail is taken now, off the main actor, and the full
+                // aggregate is released with this dictionary
+                output: (obj["aggregatedOutput"] as? String).map(CodexOutputTail.tail(of:))
+            )
+            return CodexItem(id: id, turnId: turnId, content: .commandExecution(run))
+        case "mcpToolCall":
+            return CodexItem(id: id, turnId: turnId, content: .mcpToolCall(
+                server: (obj["server"] as? String) ?? "?",
+                tool: (obj["tool"] as? String) ?? "?",
+                status: status(obj["status"])))
+        case "webSearch":
+            return CodexItem(id: id, turnId: turnId,
+                             content: .webSearch(query: (obj["query"] as? String) ?? ""))
+        case "fileChange":
+            let changes = (obj["changes"] as? [[String: Any]] ?? []).compactMap { change -> CodexFileEdit? in
+                guard let path = change["path"] as? String else { return nil }
+                // `kind` is a tagged union, not a bare string — an unnamed one
+                // is still a change, so it reads as an edit rather than vanishing
+                let raw = (change["kind"] as? [String: Any])?["type"] as? String
+                return CodexFileEdit(path: path, kind: CodexFileEdit.Kind(rawValue: raw ?? "") ?? .update)
+            }
+            return CodexItem(id: id, turnId: turnId,
+                             content: .fileChange(changes: changes, status: status(obj["status"])))
+        case "reasoning":
+            return CodexItem(id: id, turnId: turnId, content: .reasoning(
+                summary: (obj["summary"] as? [String]) ?? [],
+                content: (obj["content"] as? [String]) ?? []))
         default:
             return CodexItem(id: id, turnId: turnId, content: .other(type: type))
         }
+    }
+
+    /// An unknown or absent status reads as still running: a row that claims to
+    /// have finished when nothing said so is the one wrong answer here.
+    private static func status(_ raw: Any?) -> CodexWorkStatus {
+        CodexWorkStatus(rawValue: (raw as? String) ?? "") ?? .inProgress
     }
 
     private static func tokenUsage(_ params: [String: Any]) -> CodexTokenUsage? {

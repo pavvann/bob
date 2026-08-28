@@ -77,6 +77,22 @@ struct SessionRail: View {
     }
 }
 
+/// The rail's card chrome, in one place. The cards here and codex's activity
+/// rows are the same piece of furniture, and a second copy of these four numbers
+/// is exactly how two gutters drift apart.
+extension View {
+    func railCard() -> some View {
+        self
+            .background {
+                RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.ultraThinMaterial)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(.white.opacity(0.06), lineWidth: 0.5)
+            }
+    }
+}
+
 /// Where this session is standing — shaped like the session tabs along the
 /// bottom, because it belongs to the same family of "what am I looking at"
 /// furniture. No label: a branch icon and a branch name need no caption.
@@ -106,13 +122,7 @@ struct BranchChip: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.ultraThinMaterial)
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(.white.opacity(0.06), lineWidth: 0.5)
-        }
+        .railCard()
     }
 }
 
@@ -187,13 +197,7 @@ struct AgentRows: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.ultraThinMaterial)
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(.white.opacity(0.06), lineWidth: 0.5)
-        }
+        .railCard()
     }
 
     private func row(_ agent: SessionAgent) -> some View {
