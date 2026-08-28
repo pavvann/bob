@@ -1154,34 +1154,6 @@ private func routeDispatch(_ raw: String, via manager: SessionManager) -> String
     return "→ \(name)\(bang ? " (stopped)" : ""): \(text)"
 }
 
-/// What `>` can address, and nothing it can address twice.
-///
-/// A claude tab and a codex tab in the same directory get the same default
-/// name, and `>project` taking the first of them means the other is
-/// unreachable and `>project!` may stop the wrong one — a silently wrong target
-/// is the worst outcome this feature has. So a name shared by two tabs is
-/// replaced by `name/claude` and `name/codex`, which leaves the bare name
-/// matching neither exactly and both by prefix: ambiguous, which the parser
-/// already handles by declining. A unique name is untouched, so `>web` and
-/// `>we` stay as terse as they were. Two tabs that still collide after
-/// qualification (two claude tabs in same-named directories — true before codex
-/// existed) drop out entirely rather than being guessed at.
-/// Internal rather than private so the rule can be checked directly, the same
-/// reason `SessionDispatch` beside it is.
-@MainActor
-func dispatchKeys(_ tabs: [SessionRef]) -> [String: SessionRef] {
-    var counts: [String: Int] = [:]
-    for tab in tabs { counts[tab.name, default: 0] += 1 }
-    var keyed: [String: SessionRef] = [:]
-    var collided: Set<String> = []
-    for tab in tabs {
-        let key = counts[tab.name] == 1 ? tab.name : "\(tab.name)/\(tab.provider.rawValue)"
-        if keyed[key] != nil { collided.insert(key) } else { keyed[key] = tab }
-    }
-    for key in collided { keyed[key] = nil }
-    return keyed
-}
-
 /// The whisper strip — while a surface holds the stage, bob's reply stays
 /// audible here: dim, two lines, notice-styled, right above the input bar.
 /// The dot warms to accent while he's still talking. Click it to put the
@@ -1233,53 +1205,5 @@ private struct DispatchWhisper: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .transition(.opacity)
-    }
-}
-
-/// The `>` command grammar, mirroring the @lens parse: `>webapp fix the test`
-/// sends into the session called webapp, `>webapp! stop, run the tests` stops
-/// it first (the ONLY road to an interrupt — never implicit). Names match by
-/// unambiguous case-insensitive prefix; an exact name beats a longer cousin.
-/// Pure, so the harness can table-test every verdict.
-enum SessionDispatch {
-    enum Verdict: Equatable {
-        /// Not a dispatch at all — no `>` head, `> quoted text`, or a name
-        /// with nothing to say after it.
-        case none
-        /// `>web …` with webapp AND webapi alive — the message travels
-        /// verbatim; bob can list what was close.
-        case ambiguous([String])
-        /// `>zzz …` — no session answers to that; verbatim again.
-        case noMatch(String)
-        /// The one clean verdict: a full session name, the text, and whether
-        /// the bang (stop-first) was on it.
-        case send(name: String, text: String, bang: Bool)
-    }
-
-    static func parse(_ raw: String, names: [String]) -> Verdict {
-        guard raw.hasPrefix(">") else { return .none }
-        let body = raw.dropFirst()
-        let token = String(body.prefix { !$0.isWhitespace })
-        guard !token.isEmpty else { return .none }   // "> a quote" — just words
-        let text = String(body.dropFirst(token.count))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return .none }    // nothing to deliver — words for bob
-        var name = token
-        var bang = false
-        if name.hasSuffix("!") {
-            bang = true
-            name.removeLast()
-        }
-        guard !name.isEmpty else { return .none }
-        let query = name.lowercased()
-        if let exact = names.first(where: { $0.lowercased() == query }) {
-            return .send(name: exact, text: text, bang: bang)
-        }
-        let hits = names.filter { $0.lowercased().hasPrefix(query) }
-        switch hits.count {
-        case 0: return .noMatch(name)
-        case 1: return .send(name: hits[0], text: text, bang: bang)
-        default: return .ambiguous(hits)
-        }
     }
 }

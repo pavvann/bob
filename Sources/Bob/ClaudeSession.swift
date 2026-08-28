@@ -470,16 +470,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
     }
 
     /// The semantic beat: turn boundaries and health flips, nothing per-token.
-    /// AttentionCenter listens here instead of objectWillChange, so a
-    /// streaming turn wakes it a handful of times, not once per delta. Emitted
-    /// after the mutation they describe — a consumer always reads post-change.
-    enum SessionNote: Sendable {
-        case turnBegan
-        case activityChanged   // a notice landed / readiness moved — status may have changed
-        case turnEnded
-        case sessionFailed
-    }
-
+    /// `SessionNote` itself lives in SessionKind.swift — codex sessions speak the
+    /// same four words, and the ear that listens must not know which of the two
+    /// it is hearing.
     var notes: AsyncStream<SessionNote> {
         AsyncStream(bufferingPolicy: .bufferingNewest(16)) { continuation in
             let key = UUID()

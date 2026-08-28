@@ -194,6 +194,7 @@ final class CodexSession: ObservableObject, Identifiable {
     private var openRequests: [CodexServerRequest] = []
     private var latestUsage: CodexTokenUsage?
     private var contextWindow: Int?
+    private var noteTaps: [UUID: AsyncStream<SessionNote>.Continuation] = [:]
 
     init(config: CodexSessionConfig, server: CodexServer) {
         self.config = config
@@ -255,6 +256,7 @@ final class CodexSession: ObservableObject, Identifiable {
             return
         }
         state = .interrupting
+        note(.activityChanged)   // listeners record it: this stop is the owner's, not news
         Task { [weak self] in
             guard let self else { return }
             do {
@@ -768,6 +770,7 @@ final class CodexSession: ObservableObject, Identifiable {
             activity.beginTurn(turnId)
             if case .turnActive = state {} else { state = .turnActive(.user) }
             openAgentRow()
+            note(.turnBegan)
         }
         if wantsInterrupt { wantsInterrupt = false; interrupt() }
         drain()
@@ -793,6 +796,7 @@ final class CodexSession: ObservableObject, Identifiable {
         publishContextUse()
         liveTurnId = nil
         state = .idle
+        note(.turnEnded)   // after the state, so the ear reads the settled session
         drain()
     }
 
@@ -838,6 +842,25 @@ final class CodexSession: ObservableObject, Identifiable {
         if blockedOn != nil { blockedOn = nil }
         if !activeFlags.isEmpty { activeFlags = [] }
         fail(reason: message)
+    }
+
+    // MARK: - the semantic beat (what the ambient layer listens to)
+
+    /// The peer of `ClaudeSession.notes`, word for word: turn boundaries and
+    /// health flips, never a delta. Bounded — a tap that stops draining loses
+    /// its oldest notes rather than growing a queue forever.
+    var notes: AsyncStream<SessionNote> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(16)) { continuation in
+            let key = UUID()
+            noteTaps[key] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.noteTaps[key] = nil }
+            }
+        }
+    }
+
+    private func note(_ n: SessionNote) {
+        for tap in noteTaps.values { tap.yield(n) }
     }
 
     // MARK: - the stream
@@ -1095,6 +1118,7 @@ final class CodexSession: ObservableObject, Identifiable {
         lastError = why
         state = .failed(why)
         appendNotice("codex session is down — \(why)")
+        note(.sessionFailed)
     }
 
     private static func reason(_ error: Error) -> String {
