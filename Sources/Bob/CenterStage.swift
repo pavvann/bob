@@ -424,7 +424,7 @@ struct CenterStage: View {
 
     private var slashMatches: [SlashCommand] {
         guard !slashDismissed, let q = slashQuery else { return [] }
-        return slash.matches(q)
+        return slash.matches(q, in: .companion)
     }
 
     /// Selection clamped to the live match list — arrows move it, every
@@ -600,6 +600,19 @@ struct CenterStage: View {
     /// guessed at — the list is the interface.
     static func isResumeCommand(_ raw: String) -> Bool {
         raw.trimmingCharacters(in: .whitespaces).lowercased() == "/resume"
+    }
+
+    /// The claude command a message *is* — `/ship`, `/vercel:deploy args` — and
+    /// nil for everything else. The name has to be one the palette really
+    /// carries, which is what keeps a message that merely starts with a slash
+    /// (a path, a regex) travelling as the words it is rather than being read
+    /// as a command nobody typed.
+    static func claudeCommandName(_ raw: String) -> String? {
+        let head = String(raw.split(separator: " ", maxSplits: 1).first ?? "")
+        guard head.hasPrefix("/"), head.count > 1 else { return nil }
+        let name = String(head.dropFirst())
+        guard !name.contains("/") else { return nil }
+        return SlashCommandService.shared.isClaudeCommand(name) ? name : nil
     }
 
     /// `/model` → whisper the current model; `/model opus|sonnet|haiku|fable`
@@ -799,19 +812,32 @@ private struct FollowTail: View {
 
 /// Center stage for a WORK session — a raw claude or a codex thread living in a
 /// project directory. Same thread visuals as the companion (TurnRowView), none
-/// of the persona: no greeting face, no voice, no lens chip, no @lens parsing,
-/// no slash palette — everything in the box goes to the session verbatim (slash
-/// commands included; claude expands them in-session). Input routes through
-/// the manager so a cold restored tab wakes on first send.
+/// of the persona: no greeting face, no voice, no lens chip, no @lens parsing.
+/// Everything else in the box goes to the session verbatim (slash commands
+/// included; claude expands them in-session). Input routes through the manager
+/// so a cold restored tab wakes on first send.
+///
+/// The `/` palette is here too, and it is scoped to the provider: claude's tabs
+/// get claude's commands because the CLI really does expand them in `-p`, codex
+/// tabs get only the ones bob runs itself — see `SlashCommandService.Scope`.
 private struct WorkStage<S: StageSession>: View {
     @ObservedObject var session: S
     var interceptHide: () -> Bool = { false }
 
     @State private var input = ""
+    @State private var palette = SlashPaletteState()
     @State private var whisper: String?
     @State private var whisperSweep: Task<Void, Never>?
     @FocusState private var inputFocused: Bool
     @ObservedObject private var broker = UIPermissionBroker.shared
+    @ObservedObject private var slash = SlashCommandService.shared
+
+    /// The palette's question carries both halves: which agent is behind this
+    /// tab, and which project it runs in. A work tab is rarely `~/bob`, so the
+    /// second half is what stops the palette offering the companion's commands.
+    private var slashScope: SlashCommandService.Scope {
+        .work(provider: session.provider, cwd: session.cwd)
+    }
 
     /// Nothing is hidden in a work session today, but the filter keeps parity
     /// with the companion thread if P3 ever injects into one.
@@ -844,7 +870,12 @@ private struct WorkStage<S: StageSession>: View {
             .animation(.easeInOut(duration: 0.25), value: whisper)
             .animation(.easeInOut(duration: 0.2), value: broker.ask(for: session.id)?.id)
         }
-        .onAppear { inputFocused = true }
+        .onAppear {
+            inputFocused = true
+            // scan this project's commands now, not on the first keystroke, so
+            // the first `/` is already complete. Once per launch per project.
+            slash.warm(slashScope)
+        }
         .onReceive(NotificationCenter.default.publisher(for: HotKeyManager.didSummon)) { _ in
             inputFocused = true
         }
@@ -995,13 +1026,15 @@ private struct WorkStage<S: StageSession>: View {
             .onSubmit(send)
             .submitLabel(.send)
             .onKeyPress(.escape) {
-                // same layer-peel as the companion, minus palette and voice:
+                // same layer-peel as the companion, minus voice: palette →
                 // text in the box → the session mid-reply → the container's
                 // picker → back to bob → the whole app. Interrupt goes to THIS
                 // session. A work tab gets that one extra layer the companion
                 // doesn't need: esc steps off this session before it means
                 // "hide bob", so leaving a tab never costs you the window.
-                if !input.isEmpty {
+                if palette.dismissOnEscape(input, scope: slashScope) {
+                    // the sheet was up — this press closed it and nothing else
+                } else if !input.isEmpty {
                     input = ""
                 } else if session.isStreaming {
                     session.interrupt()
@@ -1014,6 +1047,7 @@ private struct WorkStage<S: StageSession>: View {
                 }
                 return .handled
             }
+            .slashPaletteKeys($palette, input: $input, scope: slashScope)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 13)
@@ -1028,6 +1062,7 @@ private struct WorkStage<S: StageSession>: View {
                 energy: session.isStreaming ? 0.7 : 0.2
             )
         }
+        .slashPaletteSheet($palette, input: $input, scope: slashScope)
     }
 
     private var placeholder: String {
@@ -1040,35 +1075,60 @@ private struct WorkStage<S: StageSession>: View {
     }
 
     private func send() {
+        // Enter with the palette up completes the highlighted name; Enter on a
+        // name that's already complete falls through and sends.
+        if palette.completeOnEnter(&input, scope: slashScope) { return }
         let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
         // `>name …` works from any stage — commanding a sibling session (or
         // this one) without walking back to the companion first.
         if let ack = routeDispatch(prompt, via: SessionManager.shared) {
             input = ""
-            whisper = ack
-            whisperSweep?.cancel()
-            whisperSweep = Task {
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
-                guard !Task.isCancelled else { return }
-                whisper = nil
-            }
+            showWhisper(ack)
             return
         }
         // this tab's own history — the picker resumes into this session, not
         // into bob's thread (same command, whichever stage you're standing on).
-        // Codex has its own thread list and its own picker (phase 2); until
-        // then the word travels as words rather than opening claude's.
-        if CenterStage.isResumeCommand(prompt), let claude = session.claudeSession {
+        // One store, one overlay, either provider: claude's rows come off disk,
+        // codex's out of `thread/list`.
+        if CenterStage.isResumeCommand(prompt) {
+            if let claude = session.claudeSession {
+                input = ""
+                ResumeStore.shared.open(for: claude)
+                return
+            }
+            if let codex = session.codexSession {
+                input = ""
+                ResumeStore.shared.open(for: codex)
+                return
+            }
+        }
+        // A claude command typed on a codex tab, from muscle memory. It is not
+        // in this tab's palette, and sending it would make codex answer a
+        // question about a command it has never heard of — so say so once
+        // instead. Gated on the name really being one of claude's, which is
+        // what keeps a message that merely starts with a slash (`/tmp/x`, a
+        // path, a regex) travelling as the words it is.
+        if session.provider == .codex, let name = CenterStage.claudeCommandName(prompt) {
             input = ""
-            ResumeStore.shared.open(for: claude)
+            showWhisper("/\(name) is claude's — codex tabs run /resume and codex's own tools")
             return
         }
         input = ""
-        // verbatim — no @lens parsing, no palette. A `/command` rides as a
-        // plain message and the CLI expands it in-session. Routed through the
-        // manager so a cold tab spawns before the text would be lost.
+        // verbatim — no @lens parsing. A `/command` rides as a plain message and
+        // claude expands it in-session. Routed through the manager so a cold tab
+        // spawns before the text would be lost.
         SessionManager.shared.send(prompt, to: session.id)
+    }
+
+    private func showWhisper(_ line: String) {
+        whisper = line
+        whisperSweep?.cancel()
+        whisperSweep = Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            whisper = nil
+        }
     }
 }
 

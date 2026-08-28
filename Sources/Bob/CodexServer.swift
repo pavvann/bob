@@ -447,6 +447,13 @@ actor CodexServer {
         abandonedThreads.insert(threadId)
     }
 
+    /// Whether bob has stopped owning this thread — anything it asks from here
+    /// is refused on arrival rather than parking it. A read rather than an
+    /// inference: `detach` and `abandon` both clear the route, and the whole
+    /// difference between letting a thread go safely and stranding it lives in
+    /// this set, so it has to be answerable from outside.
+    func hasAbandoned(_ threadId: String) -> Bool { abandonedThreads.contains(threadId) }
+
     // MARK: - requests
 
     /// One outbound request. The timeout exists so a reply that never comes

@@ -143,6 +143,14 @@ final class CodexSession: ObservableObject, Identifiable {
     /// prompt queued while it was waking runs for a session the manager and the
     /// UI have already dropped — an invisible turn, with invisible approvals.
     private var isClosed = false
+    /// Which thread transition is the live one. Bumped *synchronously* by every
+    /// caller that moves this tab between threads — `open`, `retry`, `repoint` —
+    /// so anything already in flight learns it has been superseded at its very
+    /// next await, instead of finishing and writing its answer over the newer
+    /// one. `isClosed` is the same idea with only one destination; this is the
+    /// generalisation the resume picker needs, because a `/resume` pick can land
+    /// while a restored tab is still booting and both paths write `threadId`.
+    private var transition = 0
     /// What app-server resolved for this thread when it opened — the honest
     /// meaning of "auto" once a per-turn override has been applied.
     private var threadDefaultModel: String?
@@ -208,7 +216,9 @@ final class CodexSession: ObservableObject, Identifiable {
         switch state {
         case .unspawned, .failed:
             state = .spawning
-            Task { await boot() }
+            transition += 1
+            let mine = transition
+            Task { await boot(generation: mine) }
         default:
             break
         }
@@ -301,8 +311,40 @@ final class CodexSession: ObservableObject, Identifiable {
     @discardableResult
     func close() async -> CloseOutcome {
         isClosed = true
-        // a prompt still waiting for the thread to open must never leave: the
-        // tab that typed it is gone
+        let (settled, commands) = await standDown(refusing: "bob closed this session")
+        await pump.finish()
+        guard let thread = threadId else { return .clean }
+        await release(thread, settled: settled, commands: commands)
+        if commands.isEmpty, settled { return .clean }
+        return commands.isEmpty ? .turnDidNotConfirm : .leftCommandRunning
+    }
+
+    /// Everything a tab does on its way *off* a thread — whether it is closing or
+    /// moving to another one. Both leave a thread app-server keeps executing, and
+    /// both have to leave it unable to ask a question nobody will answer. Shared
+    /// because it was written twice and the second copy got two of these wrong.
+    ///
+    /// The order is the whole content of it:
+    ///
+    ///  - the asks leave `openRequests` **before** the broker is told, which is
+    ///    what stops a resumed continuation putting a second answer on the wire.
+    ///    `answer(_:choosing:)` proves it by membership, so that removal is the
+    ///    proof rather than a courtesy.
+    ///  - the broker is told **at all** because the card lives in
+    ///    `UIPermissionBroker`, keyed by *session* — and a repoint does not
+    ///    change the session. Leaving it there leaves a card for a conversation
+    ///    the tab has left, and that card would mask the next approval from the
+    ///    thread it moved to. The blanket ("always allow") goes with it: it was
+    ///    granted inside a conversation this tab is no longer in.
+    ///  - `liveCommands` is snapshotted **before** the interrupt, because an
+    ///    interrupted command's item goes terminal within milliseconds while the
+    ///    process it spawned keeps running.
+    ///
+    /// Returns what the caller needs in order to let the thread go safely.
+    private func standDown(refusing reason: String) async
+        -> (settled: Bool, commands: Set<String>) {
+        // a prompt still waiting for the thread to open must never leave: it was
+        // typed for the conversation this tab is walking away from
         queue.removeAll()
         pendingUserRows.removeAll()
         let asks = openRequests
@@ -310,31 +352,36 @@ final class CodexSession: ObservableObject, Identifiable {
         broker.abandon(sessionId: id)
         if blockedOn != nil { blockedOn = nil }
         for ask in asks {
-            await server.respond(to: ask.id, code: -32800, message: "bob closed this session")
+            await server.respond(to: ask.id, code: -32800, message: reason)
         }
-        // snapshot BEFORE the interrupt: an interrupted command's item goes
-        // terminal within milliseconds while the process it spawned keeps
-        // running, so after the interrupt this set is empty and tells us nothing
-        let commandsAtClose = liveCommands
+        let commands = liveCommands
         await quiesce()
-        let settled = await waitForTurnEnd()
-        await pump.finish()
-        guard let thread = threadId else { return .clean }
-        if commandsAtClose.isEmpty, settled {
+        return (await waitForTurnEnd(), commands)
+    }
+
+    /// How a tab lets go of a thread it is leaving.
+    ///
+    /// Detach only when the turn is known to have stopped **and** nothing it
+    /// spawned is still running. Otherwise the thread is *marked* instead: bob
+    /// has stopped owning it, so anything it asks from here is refused on
+    /// arrival — an approval delivered to a route nobody owns parks that thread
+    /// for good, and phase 0 measured that park as permanent.
+    ///
+    /// An interrupt that never confirmed is exactly as unsafe as a command still
+    /// running, and for the same reason: bob does not know the turn stopped, so
+    /// it must not assume the thread has gone quiet. Work already running cannot
+    /// be reaped from here either way — only app-server's own exit does that,
+    /// and that process is shared with every other codex tab.
+    ///
+    /// Internal rather than private because this rule is the whole of finding
+    /// out whether a tab let a thread go safely, and it is checked directly for
+    /// all four combinations of its two flags.
+    func release(_ thread: String, settled: Bool, commands: Set<String>) async {
+        if commands.isEmpty, settled {
             await server.detach(threadId: thread)
-            return .clean
+        } else {
+            await server.abandon(threadId: thread)
         }
-        let outcome: CloseOutcome = commandsAtClose.isEmpty ? .turnDidNotConfirm
-                                                            : .leftCommandRunning
-        // Work may still be running and bob cannot reap it: only app-server's
-        // own exit does (phase 0), and that process is shared with every other
-        // codex tab. What bob CAN refuse to do is walk away from the thread
-        // while it can still ask something — an approval arriving at a route
-        // nobody owns parks that thread for good. So the route goes but the
-        // thread is marked: anything it asks from here is refused on the spot,
-        // and the work itself is reaped by the group kill at app quit.
-        await server.abandon(threadId: thread)
-        return outcome
     }
 
     /// Whether the live turn actually went terminal, on shutdown's own leash.
@@ -352,7 +399,7 @@ final class CodexSession: ObservableObject, Identifiable {
 
     // MARK: - thread lifecycle
 
-    private func boot() async {
+    private func boot(generation: Int) async {
         // BEFORE the RPC, so a repoint whose resume then fails still leaves no
         // rows from the thread this tab used to be on. `threadId` has already
         // been moved by the time a repoint reaches here, and is unchanged on a
@@ -361,6 +408,7 @@ final class CodexSession: ObservableObject, Identifiable {
         activity.adopt(thread: threadId ?? config.resumeThreadId)
         do {
             _ = try await server.start()
+            guard generation == transition, !isClosed else { return }
             let route = CodexThreadRoute(pump: pump, quiesce: { [weak self] in await self?.quiesce() })
             let opened: (threadId: String, model: String?, history: [CodexItem])
             // `threadId` first: when app-server dies this session keeps its
@@ -383,6 +431,21 @@ final class CodexSession: ObservableObject, Identifiable {
                 await abandonStartup(opened.threadId)
                 return
             }
+            // a newer transition took over while this RPC was in flight — a
+            // `/resume` pick on a tab that was still waking, or a second pick.
+            // Writing now would put the conversation the owner just left back on
+            // the tab, and hydrate its history under the wrong thread id.
+            //
+            // The queue is deliberately NOT dropped here the way `isClosed`
+            // drops it: it belongs to whoever superseded us. What does have to go
+            // is a thread this boot opened and nobody now owns — an approval from
+            // it would reach a route that no longer answers, which parks it.
+            if generation != transition {
+                if opened.threadId != threadId {
+                    await server.abandon(threadId: opened.threadId)
+                }
+                return
+            }
             let isNewThread = threadId != opened.threadId
             threadId = opened.threadId
             // records the id a fresh thread was just given, so the NEXT boot can
@@ -403,6 +466,9 @@ final class CodexSession: ObservableObject, Identifiable {
             state = .idle
             drain()
         } catch {
+            // a failure belonging to a superseded transition must not put the tab
+            // in `.failed` over a boot that is still going fine
+            guard generation == transition, !isClosed else { return }
             fail(error)
         }
     }
@@ -454,6 +520,84 @@ final class CodexSession: ObservableObject, Identifiable {
     func setName(_ name: String) async {
         guard let thread = threadId else { return }
         try? await server.setThreadName(name, threadId: thread)
+    }
+
+    /// Point this tab at another thread app-server already has (`/resume`, #38
+    /// T2.6): same tab, same cwd, same dial, different conversation. The peer of
+    /// `ClaudeSession.resume`, and of its `reload` — repointing at the thread
+    /// this tab is *already* on re-reads that thread instead, which is the only
+    /// way a restored tab's own history gets back on screen.
+    ///
+    /// Leaving a thread is the delicate half, not arriving at one — so the whole
+    /// of it is `standDown` and `release`, the same two steps `close()` takes,
+    /// rather than a second copy of that reasoning.
+    func repoint(to newThreadId: String) {
+        guard !isClosed else { return }
+        // bumped here, synchronously, rather than inside the task: a boot already
+        // in flight has to learn it is stale *now*, or it will finish and write
+        // the thread the owner just moved off back onto the tab
+        transition += 1
+        let mine = transition
+        Task { await moveThread(to: newThreadId, generation: mine) }
+    }
+
+    private func moveThread(to newThreadId: String, generation: Int) async {
+        let leaving = threadId
+        let reloading = newThreadId == leaving
+        state = .spawning
+        let (settled, commands) = await standDown(
+            refusing: "bob moved this tab to another thread")
+        // superseded mid-teardown: bail without touching `threadId`, so the
+        // transition that replaced us still sees the thread we were leaving and
+        // releases it itself. Bailing after a partial teardown is safe — every
+        // step of it is idempotent, and the newer one repeats all of them.
+        guard generation == transition, !isClosed else { return }
+        if let leaving, !reloading {
+            await release(leaving, settled: settled, commands: commands)
+        }
+        guard generation == transition, !isClosed else { return }
+        // everything below belongs to the thread being left
+        liveTurnId = nil
+        turnStarting = false
+        steerInFlight = false
+        wantsInterrupt = false
+        lastCompletedTurnId = nil
+        itemRows.removeAll()
+        currentAgentRow = nil
+        unclaimedAgentRow = nil
+        liveCommands.removeAll()
+        latestUsage = nil
+        contextWindow = nil
+        if contextUsedPct != nil { contextUsedPct = nil }
+        if tokenUsage != nil { tokenUsage = nil }
+        if lastTurn != nil { lastTurn = nil }
+        if lastError != nil { lastError = nil }
+        if !activeFlags.isEmpty { activeFlags = [] }
+        // an override is "for this turn and subsequent turns" *on one thread*,
+        // so arriving somewhere new means nothing has been applied yet
+        appliedOverride = false
+        threadDefaultModel = nil
+        // hydrate() only fills an empty transcript — that guard is what stops a
+        // server-death recovery doubling every line, and it is also what makes
+        // clearing here the whole of "show me that conversation instead"
+        transcript.replaceAll([])
+        threadId = newThreadId
+        if config.resumeThreadId != newThreadId {
+            config.resumeThreadId = newThreadId
+            onConfigChanged?()
+        }
+        await boot(generation: generation)
+        // after boot, not before: hydrate() declines a transcript that already has
+        // a row in it, and the picked thread's own history is the point
+        guard generation == transition else { return }
+        if !commands.isEmpty {
+            appendNotice("left \(commands.count) command"
+                + "\(commands.count == 1 ? "" : "s") running on the thread you came from"
+                + " — codex reaps those when bob quits")
+        } else if !settled {
+            appendNotice("the turn on the thread you came from never confirmed it stopped"
+                       + " — bob left that thread alone rather than reusing it")
+        }
     }
 
     // MARK: - the dial (#37 T1.5)
