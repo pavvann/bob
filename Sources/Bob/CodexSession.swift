@@ -3,11 +3,20 @@ import Foundation
 // MARK: - configuration
 
 struct CodexSessionConfig {
+    /// bob's own handle for this tab, kept across relaunches so the state file
+    /// doesn't rewrite a fresh id every launch. Unlike claude's `sessionId` it
+    /// names nothing on codex's side — the thread id does that.
+    var sessionId: UUID = UUID()
     var cwd: URL
     var name: String                                // tab label / log prefix
     var approvalPolicy: CodexApprovalPolicy = .onRequest
     /// nil means the sane GUI default: writes scoped to this session's own cwd.
     var sandbox: CodexSandboxPolicy? = nil
+    /// nil = whatever codex's own config resolves. Sent at thread open and on
+    /// every turn, so the dial can move mid-conversation.
+    var model: String? = nil
+    /// nil = the model's own advertised default effort.
+    var effort: String? = nil
     /// Names a thread app-server already has, so the first open is a resume.
     var resumeThreadId: String? = nil
 }
@@ -44,8 +53,18 @@ final class CodexSession: ObservableObject, Identifiable {
     }
 
     let id = UUID()
-    private(set) var config: CodexSessionConfig
+    /// Published because the dial draws its own checkmarks from it: the four
+    /// settings are bob's, visible, and changed in place.
+    @Published private(set) var config: CodexSessionConfig
     private(set) var threadId: String?
+
+    /// This session's config or thread no longer matches what the registry has
+    /// on disk. Whoever owns the state file wires this to its write; without it
+    /// a relaunch resumes yesterday's thread with today's model.
+    var onConfigChanged: (() -> Void)?
+    /// Who answers codex's approval requests. The UI broker by default — the
+    /// card is the whole reason a GUI can default to `on-request`.
+    var broker: PermissionBroker = UIPermissionBroker.shared
 
     /// Message content in its own @Observable store, exactly as claude
     /// sessions do it: a streamed token wakes the one row reading it and the
@@ -226,6 +245,7 @@ final class CodexSession: ObservableObject, Identifiable {
     func close() async {
         let asks = openRequests
         openRequests.removeAll()
+        broker.abandon(sessionId: id)
         if blockedOn != nil { blockedOn = nil }
         for ask in asks {
             await server.respond(to: ask.id, code: -32800, message: "bob closed this session")
@@ -248,13 +268,25 @@ final class CodexSession: ObservableObject, Identifiable {
             // the model had none of it.
             if let resume = threadId ?? config.resumeThreadId {
                 opened = try await server.resumeThread(
-                    resume, approvalPolicy: config.approvalPolicy, route: route)
+                    resume, approvalPolicy: config.approvalPolicy,
+                    model: config.model, route: route)
             } else {
                 let started = try await server.startThread(
-                    cwd: config.cwd, approvalPolicy: config.approvalPolicy, route: route)
+                    cwd: config.cwd, approvalPolicy: config.approvalPolicy,
+                    model: config.model, route: route)
                 opened = (started.threadId, started.model, [])
             }
+            let isNewThread = threadId != opened.threadId
             threadId = opened.threadId
+            // the thread id is what a relaunch resumes; it is only ever news
+            // once per thread, so this doesn't write on every retry
+            if isNewThread {
+                onConfigChanged?()
+                // named here rather than by the caller: the name needs the
+                // thread id, which only exists now
+                let name = config.name
+                Task { [weak self] in await self?.setName(name) }
+            }
             if model != opened.model { model = opened.model }
             hydrate(opened.history)
             state = .idle
@@ -302,6 +334,48 @@ final class CodexSession: ObservableObject, Identifiable {
         try? await server.setThreadName(name, threadId: thread)
     }
 
+    // MARK: - the dial (#37 T1.5)
+
+    /// All four settings are overrides carried on the next `turn/start`, so a
+    /// change lands on the next thing you say rather than needing a respawn —
+    /// the one thing codex sessions get for free that claude's model swap pays
+    /// a drain for.
+    func setModel(_ id: String?) {
+        guard config.model != id else { return }
+        config.model = id
+        // the caption follows the choice immediately: the next turn will run it,
+        // and app-server only names the model at thread open
+        if let id { model = id }
+        if let effort = config.effort,
+           !CodexCatalog.shared.efforts(for: id).isEmpty,
+           !CodexCatalog.shared.efforts(for: id).contains(effort) {
+            config.effort = nil     // this model doesn't advertise that one
+        }
+        onConfigChanged?()
+    }
+
+    func setEffort(_ effort: String?) {
+        guard config.effort != effort else { return }
+        config.effort = effort
+        onConfigChanged?()
+    }
+
+    func setSandbox(_ policy: CodexSandboxPolicy?) {
+        guard config.sandbox != policy else { return }
+        config.sandbox = policy
+        onConfigChanged?()
+    }
+
+    func setApprovalPolicy(_ policy: CodexApprovalPolicy) {
+        guard config.approvalPolicy != policy else { return }
+        config.approvalPolicy = policy
+        onConfigChanged?()
+    }
+
+    /// What the dial shows for the sandbox — nil in config means the default,
+    /// and the default is writes scoped to this session's own cwd.
+    var sandboxPolicy: CodexSandboxPolicy { sandbox }
+
     // MARK: - turn lifecycle
 
     /// At most one send leaves per call, and never a `turn/start` while a turn
@@ -339,7 +413,8 @@ final class CodexSession: ObservableObject, Identifiable {
             do {
                 let turnId = try await self.server.startTurn(
                     threadId: thread, text: out.text, clientMessageId: out.clientId,
-                    approvalPolicy: self.config.approvalPolicy, sandbox: self.sandbox)
+                    approvalPolicy: self.config.approvalPolicy, sandbox: self.sandbox,
+                    model: self.config.model, effort: self.config.effort)
                 self.adoptTurn(turnId)
             } catch {
                 self.turnStarting = false
@@ -456,9 +531,10 @@ final class CodexSession: ObservableObject, Identifiable {
         steerInFlight = false
         wantsInterrupt = false
         closeAgentRow(stopped: true)
-        // nothing can answer these any more, and phase 2 must not draw a card
-        // whose reply would go nowhere
+        // nothing can answer these any more, and a card whose reply would go
+        // nowhere is worse than no card
         openRequests.removeAll()
+        broker.abandon(sessionId: id)
         if blockedOn != nil { blockedOn = nil }
         if !activeFlags.isEmpty { activeFlags = [] }
         fail(reason: message)
@@ -499,6 +575,8 @@ final class CodexSession: ObservableObject, Identifiable {
             serverDied(message)
         case .serverRequest(let request):
             park(request)
+        case .requestResolved(let requestId):
+            resolved(requestId)
         case .agentMessageDelta, .unmodeled:
             break   // the classifier already coalesced or dropped these
         }
@@ -602,21 +680,58 @@ final class CodexSession: ObservableObject, Identifiable {
     private func park(_ request: CodexServerRequest) {
         openRequests.append(request)
         if blockedOn == nil { blockedOn = request }
-        appendNotice("codex is waiting on \(Self.ask(for: request.method)) — nothing moves until it's answered")
+        guard let ask = CodexApproval.ask(request, sessionId: id, sessionName: config.name) else {
+            // no honest card to draw — `item/tool/requestUserInput` answers a
+            // map of question ids, which is phase 2's. Say so out loud, and say
+            // what the way out is, rather than parking in silence.
+            appendNotice("codex is waiting on \(Self.ask(for: request.method))"
+                       + " — bob can't answer that one yet; stop the turn to get out")
+            return
+        }
+        Task { [weak self] in
+            guard let broker = self?.broker else { return }
+            let decision = await broker.decide(ask)
+            await self?.answer(request, choosing: decision)
+        }
+    }
+
+    /// The owner pressed a button. `.choice` carries the whole reply the
+    /// request's own decision list named; anything else means the ask was
+    /// withdrawn (its turn died, the session went away) and there is nobody
+    /// left to answer — which the openRequests check is what proves.
+    private func answer(_ request: CodexServerRequest, choosing decision: PermissionDecision) async {
+        guard openRequests.contains(where: { $0.id == request.id }) else { return }
+        guard case .choice(let choice) = decision else {
+            settle(request)
+            return
+        }
+        await answer(request, result: choice.result)
     }
 
     private func settle(_ request: CodexServerRequest) {
         openRequests.removeAll { $0.id == request.id }
         if blockedOn?.id == request.id { blockedOn = openRequests.first }
+        broker.withdraw(sessionId: id, requestId: CodexApproval.key(request.id))
+    }
+
+    /// `serverRequest/resolved` — somebody answered, and it may not have been
+    /// bob: two clients can be attached to one thread. Either way the card goes.
+    private func resolved(_ id: CodexRequestId) {
+        guard let request = openRequests.first(where: { $0.id == id }) else { return }
+        settle(request)
     }
 
     /// A turn that ended while parked leaves its asks unanswerable: app-server
     /// has stopped waiting on them, so a card drawn from one would be stale and
     /// an answer sent for one would name a dead turn.
     private func discardRequests(ofTurn turnId: String) {
-        guard openRequests.contains(where: { $0.turnId == turnId }) else { return }
+        let dead = openRequests.filter { $0.turnId == turnId }
+        guard !dead.isEmpty else { return }
         openRequests.removeAll { $0.turnId == turnId }
         if blockedOn?.turnId == turnId { blockedOn = openRequests.first }
+        for request in dead {
+            broker.withdraw(sessionId: id, requestId: CodexApproval.key(request.id))
+        }
     }
 
     private static func ask(for method: String) -> String {

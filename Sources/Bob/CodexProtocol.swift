@@ -114,6 +114,11 @@ enum CodexEvent: Sendable {
     /// takes every turn, every pending answer and the thread's route with it.
     case serverExited(String)
     case serverRequest(CodexServerRequest)
+    /// `serverRequest/resolved` — this request has an answer, possibly not
+    /// bob's: another client attached to the same thread can settle one. The
+    /// card has to come down either way, or it offers to answer something
+    /// nobody is asking any more.
+    case requestResolved(CodexRequestId)
     /// Decoded fine, not modelled here. Forward-compatible on purpose: a new
     /// method must be able to say less, never to break the stream.
     case unmodeled(method: String, line: String)
@@ -229,6 +234,9 @@ enum CodexJSON {
                 kind: (status["type"] as? String) ?? "?",
                 activeFlags: (status["activeFlags"] as? [String]) ?? []
             )
+        case "serverRequest/resolved":
+            guard let id = CodexRequestId(params["requestId"]) else { break }
+            return .requestResolved(id)
         case "error":
             guard let error = params["error"] as? [String: Any] else { break }
             return .turnFailed(

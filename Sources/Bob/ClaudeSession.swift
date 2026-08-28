@@ -38,6 +38,10 @@ enum PermissionDecision {
     /// ask (`permission_suggestions`, probe 1.6) — the "always allow" button.
     case allowAdopting([PermissionSuggestion])
     case deny(message: String)
+    /// One of the answers the request itself offered, carrying the whole reply
+    /// to send back. Codex's approvals work this way — the decision set differs
+    /// per request kind — and a claude ask never produces one.
+    case choice(PermissionChoice)
 }
 
 /// Ask-first sessions forward can_use_tool requests here; the CLI blocks the
@@ -50,10 +54,13 @@ protocol PermissionBroker {
     /// the answer any more, and a card offering to approve a dead session's
     /// Write is worse than no card.
     func abandon(sessionId: UUID)
+    /// One ask specifically: answered elsewhere, or its turn died under it.
+    func withdraw(sessionId: UUID, requestId: String)
 }
 
 extension PermissionBroker {
     func abandon(sessionId: UUID) {}
+    func withdraw(sessionId: UUID, requestId: String) {}
 }
 
 /// The no-op broker `.auto` sessions carry. --permission-mode auto never asks,
@@ -1232,6 +1239,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
             payload = allowPayload(ask, adopting: suggestions)
         case .deny(let message):
             payload = ["behavior": "deny", "message": message]
+        case .choice:
+            // unreachable: a claude ask carries no choices, so no card can
+            // offer one. Refuse rather than invent a behavior for it.
+            payload = ["behavior": "deny", "message": UIPermissionBroker.refusal]
         }
         writeLine([
             "type": "control_response",

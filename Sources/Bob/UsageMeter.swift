@@ -413,13 +413,18 @@ struct RateLimitStrip: View {
 /// other, in a hairline under its input bar. Silent until the first turn reports
 /// usage: a context meter reading 0% before you've said anything is noise, and a
 /// model name with nothing beside it isn't worth the line.
-struct SessionMeterCaption: View {
-    @ObservedObject var session: ClaudeSession
+///
+/// Provider-agnostic by construction. Claude's percentage divides by a table of
+/// model windows and ratchets; codex's arrives exact, because
+/// `thread/tokenUsage/updated` carries `modelContextWindow` with the counts —
+/// same caption, one fewer guess behind it.
+struct SessionMeterCaption<S: StageSession>: View {
+    @ObservedObject var session: S
 
     var body: some View {
         if let ctx = session.contextUsedPct {
             HStack(spacing: 5) {
-                if let model = session.modelShortName {
+                if let model = session.modelLabel {
                     Text(model).foregroundStyle(.secondary.opacity(0.7))
                     MeterDot()
                 }

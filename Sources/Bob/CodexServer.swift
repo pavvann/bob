@@ -488,12 +488,17 @@ actor CodexServer {
 
     // MARK: - typed verbs
 
-    func startThread(cwd: URL, approvalPolicy: CodexApprovalPolicy,
+    func startThread(cwd: URL, approvalPolicy: CodexApprovalPolicy, model: String? = nil,
                      route: CodexThreadRoute) async throws -> (threadId: String, model: String?) {
-        let result = try await call("thread/start", params: [
+        var params: [String: Any] = [
             "cwd": cwd.path,
             "approvalPolicy": approvalPolicy.rawValue,
-        ], claiming: route)
+        ]
+        // the thread's model, so the caption is right before the first turn has
+        // reported anything; `turn/start` carries it again, which is what makes
+        // a mid-conversation change take effect
+        if let model { params["model"] = model }
+        let result = try await call("thread/start", params: params, claiming: route)
         guard let id = (result["thread"] as? [String: Any])?["id"] as? String else {
             throw CodexServerError.malformed(method: "thread/start")
         }
@@ -505,12 +510,14 @@ actor CodexServer {
     /// notifications, so a caller that drops them has a model remembering a
     /// conversation the screen can't show.
     func resumeThread(_ threadId: String, approvalPolicy: CodexApprovalPolicy,
-                      route: CodexThreadRoute) async throws
+                      model: String? = nil, route: CodexThreadRoute) async throws
         -> (threadId: String, model: String?, history: [CodexItem]) {
-        let result = try await call("thread/resume", params: [
+        var params: [String: Any] = [
             "threadId": threadId,
             "approvalPolicy": approvalPolicy.rawValue,
-        ], claiming: route)
+        ]
+        if let model { params["model"] = model }
+        let result = try await call("thread/resume", params: params, claiming: route)
         guard let thread = result["thread"] as? [String: Any],
               let id = thread["id"] as? String
         else {
@@ -521,14 +528,20 @@ actor CodexServer {
 
     func startTurn(threadId: String, text: String, clientMessageId: String,
                    approvalPolicy: CodexApprovalPolicy,
-                   sandbox: CodexSandboxPolicy) async throws -> String {
-        let result = try await call("turn/start", params: [
+                   sandbox: CodexSandboxPolicy,
+                   model: String? = nil, effort: String? = nil) async throws -> String {
+        var params: [String: Any] = [
             "threadId": threadId,
             "input": [["type": "text", "text": text]],
             "clientUserMessageId": clientMessageId,
             "approvalPolicy": approvalPolicy.rawValue,
             "sandboxPolicy": sandbox.json,
-        ])
+        ]
+        // both are overrides "for this turn and subsequent turns" — absent means
+        // codex's own config decides, which is what the dial's "auto" means
+        if let model { params["model"] = model }
+        if let effort { params["effort"] = effort }
+        let result = try await call("turn/start", params: params)
         guard let id = (result["turn"] as? [String: Any])?["id"] as? String else {
             throw CodexServerError.malformed(method: "turn/start")
         }

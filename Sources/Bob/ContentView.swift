@@ -85,7 +85,7 @@ struct ContentView: View {
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: minions.active.map(\.id))
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.live.map(\.id))
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.parked.map(\.id))
-            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessionManager.workSessions.map(\.id))
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessionManager.workTabs.map(\.id))
             .animation(.easeInOut(duration: 0.2), value: sessionManager.activeID)
 
             topRight
@@ -117,7 +117,7 @@ struct ContentView: View {
             minions: minions.active,
             sessions: sessions.live,
             parked: sessions.parked,
-            workSessions: sessionManager.workSessions,
+            tabs: sessionManager.workTabs,
             activeID: sessionManager.activeID,
             onNewSession: {
                 withAnimation(.easeOut(duration: 0.18)) { showProjectPicker.toggle() }
@@ -144,15 +144,24 @@ struct ContentView: View {
                 .zIndex(3)
             ProjectPicker(
                 currentRepo: currentRepo,
-                onPick: { url, permissions, model in
+                onPick: { pick in
                     withAnimation(.easeOut(duration: 0.18)) { showProjectPicker = false }
-                    // spawn (idempotent per cwd — a cold restored tab wakes
-                    // instead of forking), then activate: spawnWorkSession
-                    // deliberately doesn't touch activeID itself. The picker's
-                    // ask-first hand and model dial ride along.
-                    let session = sessionManager.spawnWorkSession(cwd: url, model: model, permissions: permissions)
+                    // open (idempotent per cwd and provider — a cold restored
+                    // tab wakes instead of forking), then activate: neither
+                    // opener touches activeID itself. The picker's ask-first
+                    // hand and model dial ride along.
+                    let id: UUID
+                    switch pick.provider {
+                    case .claude:
+                        id = sessionManager.spawnWorkSession(
+                            cwd: pick.url, model: pick.model, permissions: pick.permissions).id
+                    case .codex:
+                        id = sessionManager.openCodexSession(
+                            cwd: pick.url, model: pick.model,
+                            approvalPolicy: pick.approvalPolicy).id
+                    }
                     SurfaceRouter.shared.close()   // picking = "put it on stage"
-                    sessionManager.activate(session.id)
+                    sessionManager.activate(id)
                 },
                 onClose: { closeProjectPicker() }
             )
@@ -206,7 +215,7 @@ struct ContentView: View {
             if withGutters {
                 Spacer(minLength: 10)
                 if let staged = activeSession, staged.id != sessionManager.companionID {
-                    FileTree(root: staged.config.cwd)
+                    FileTree(root: staged.cwd)
                         .frame(maxHeight: .infinity)
                         .transition(.opacity)
                 } else {
@@ -232,7 +241,11 @@ struct ContentView: View {
             .frame(maxHeight: .infinity)
             if withGutters {
                 Spacer(minLength: 10)
-                if let staged = activeSession {
+                // the rail is still claude-shaped — its cards are the question
+                // chooser and this conversation's agents, neither of which codex
+                // reports in phase 1. A codex tab gets the ghost, so the stage
+                // stays centred either way.
+                if case .claude(let staged)? = activeSession {
                     SessionRail(session: staged)
                         .transition(.opacity.combined(with: .move(edge: .trailing)))
                 } else {
@@ -255,11 +268,11 @@ struct ContentView: View {
     /// a companion question with nowhere to appear would hang the turn forever.
     /// The rail's cards are individually conditional, so bob simply shows fewer
     /// of them (no branch: ~/bob keeps no git).
-    private var activeSession: ClaudeSession? {
+    private var activeSession: SessionRef? {
         // read through the observed router: without the subscription this only
         // looked right because streaming invalidated the window constantly
-        guard router.active == nil, let id = sessionManager.activeID else { return nil }
-        return sessionManager.sessions.first { $0.id == id }
+        guard router.active == nil else { return nil }
+        return sessionManager.activeRef
     }
 
     private func closeProjectPicker() {

@@ -40,10 +40,7 @@ struct CenterStage: View {
     /// no-manager path, where active is nil) renders the classic face; the
     /// switch itself only needs the manager's activeID — WorkStage observes
     /// the session object directly for entries and state.
-    private var activeWork: ClaudeSession? {
-        guard let active = manager.active, active.id != manager.companionID else { return nil }
-        return active
-    }
+    private var activeWork: SessionRef? { manager.activeWorkTab }
 
     /// Bob's own session, by id rather than `sessions.first` — in compatibility
     /// mode there is no companion at all, and index 0 is then somebody else.
@@ -57,10 +54,16 @@ struct CenterStage: View {
         // work tab, which keeps running behind its band chip. The companion
         // face hosts it: the input bar underneath always talks to bob.
         if router.active == nil, let work = activeWork {
-            WorkStage(session: work, interceptHide: interceptHide)
-                // fresh field/scroll state per tab, so drafts never leak
-                // between sessions
-                .id(work.id)
+            // one switch, one stage: the provider picks the concrete session
+            // type SwiftUI needs to observe, and nothing below this line forks.
+            // `.id` gives each tab fresh field/scroll state, so drafts never
+            // leak between sessions.
+            switch work {
+            case .claude(let session):
+                WorkStage(session: session, interceptHide: interceptHide).id(session.id)
+            case .codex(let session):
+                WorkStage(session: session, interceptHide: interceptHide).id(session.id)
+            }
         } else {
             companion
         }
@@ -794,20 +797,21 @@ private struct FollowTail: View {
 
 // MARK: - the work stage
 
-/// Center stage for a WORK session — a raw claude living in a project
-/// directory. Same thread visuals as the companion (TurnRowView), none of the
-/// persona: no greeting face, no voice, no lens chip, no @lens parsing, no
-/// slash palette — everything in the box goes to the session verbatim (slash
-/// commands included; the CLI expands them in-session). Input routes through
-/// the manager so a cold restored tab spawns on first send.
-private struct WorkStage: View {
-    @ObservedObject var session: ClaudeSession
+/// Center stage for a WORK session — a raw claude or a codex thread living in a
+/// project directory. Same thread visuals as the companion (TurnRowView), none
+/// of the persona: no greeting face, no voice, no lens chip, no @lens parsing,
+/// no slash palette — everything in the box goes to the session verbatim (slash
+/// commands included; claude expands them in-session). Input routes through
+/// the manager so a cold restored tab wakes on first send.
+private struct WorkStage<S: StageSession>: View {
+    @ObservedObject var session: S
     var interceptHide: () -> Bool = { false }
 
     @State private var input = ""
     @State private var whisper: String?
     @State private var whisperSweep: Task<Void, Never>?
     @FocusState private var inputFocused: Bool
+    @ObservedObject private var broker = UIPermissionBroker.shared
 
     /// Nothing is hidden in a work session today, but the filter keeps parity
     /// with the companion thread if P3 ever injects into one.
@@ -818,6 +822,17 @@ private struct WorkStage: View {
             stage
             VStack(alignment: .leading, spacing: 8) {
                 if let whisper { DispatchWhisper(text: whisper) }
+                // the ask card, where the eyes already are. It also lives on
+                // the tab chip in the band, and both read one broker — so
+                // answering in either place closes both. Never dismissible:
+                // an unanswered codex approval parks its thread forever, so
+                // there is no gesture here that makes the question go away
+                // without answering it.
+                if let ask = broker.ask(for: session.id) {
+                    PermissionAskCard(ask: ask)
+                        .frame(maxWidth: 460, alignment: .leading)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
                 // same shape as the companion's: outside the bar's fill and
                 // outside the border's bleed
                 VStack(alignment: .trailing, spacing: 5) {
@@ -827,6 +842,7 @@ private struct WorkStage: View {
                 }
             }
             .animation(.easeInOut(duration: 0.25), value: whisper)
+            .animation(.easeInOut(duration: 0.2), value: broker.ask(for: session.id)?.id)
         }
         .onAppear { inputFocused = true }
         .onReceive(NotificationCenter.default.publisher(for: HotKeyManager.didSummon)) { _ in
@@ -843,13 +859,14 @@ private struct WorkStage: View {
             // no greeting here — that face is the companion's. Just where you
             // are and whether it's awake yet.
             VStack(spacing: 8) {
-                Text(session.config.name)
+                Text(session.displayName)
                     .font(.system(size: 30, weight: .light, design: .rounded))
                     .foregroundStyle(.primary.opacity(0.85))
                 Text(idleHint)
                     .font(.system(size: 12, weight: .regular, design: .rounded))
                     .foregroundStyle(.secondary.opacity(0.55))
                     .multilineTextAlignment(.center)
+                if case .down = session.phase { retryButton }
             }
             .frame(maxWidth: .infinity)
             .transition(.opacity.combined(with: .scale(scale: 0.98)))
@@ -894,13 +911,20 @@ private struct WorkStage: View {
         }
     }
 
-    /// A slim breadcrumb over the thread — whose conversation you're reading.
+    /// A slim breadcrumb over the thread — whose conversation you're reading,
+    /// what it's set to, and the way back up if it's down.
     private var header: some View {
         HStack(spacing: 6) {
-            Image(systemName: "folder")
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(.secondary.opacity(0.45))
-            Text(session.config.name)
+            if let glyph = session.provider.glyph {
+                Image(systemName: glyph)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary.opacity(0.5))
+            } else {
+                Image(systemName: "folder")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary.opacity(0.45))
+            }
+            Text(session.displayName)
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .foregroundStyle(.secondary.opacity(0.7))
             Text(cwdTail)
@@ -909,25 +933,48 @@ private struct WorkStage: View {
                 .lineLimit(1)
                 .truncationMode(.head)
             Spacer(minLength: 0)
+            // a session that went down mid-conversation must never be a dead
+            // end: codex reaches `.failed` whenever app-server dies under a
+            // perfectly healthy thread, and the retry resumes that same thread
+            if case .down = session.phase { retryButton }
+            if let codex = session.codexSession { CodexDial(session: codex) }
         }
     }
 
+    private var retryButton: some View {
+        Button { session.retry() } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.clockwise").font(.system(size: 8, weight: .semibold))
+                Text("retry").font(.system(size: 10, weight: .medium, design: .rounded))
+            }
+            .foregroundStyle(.orange.opacity(0.9))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background { Capsule().fill(.orange.opacity(0.14)) }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("open this session again — the conversation comes back with it")
+    }
+
     private var idleHint: String {
-        switch session.state {
-        case .unspawned:
+        switch session.phase {
+        case .cold:
             return "cold — say something and it wakes"
-        case .spawning:
+        case .waking:
             return "waking up in \(cwdTail)…"
-        case .failed(let reason):
-            return "session is down (\(reason)) — click its tab to retry"
+        case .down(let reason):
+            return "session is down (\(reason))"
         default:
-            return "a raw claude in \(cwdTail) — no lens, no voice, just the project"
+            return session.provider == .codex
+                ? "codex in \(cwdTail) — writes scoped here, approvals come to you"
+                : "a raw claude in \(cwdTail) — no lens, no voice, just the project"
         }
     }
 
     private var cwdTail: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let path = session.config.cwd.path
+        let path = session.cwd.path
         return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
     }
 
@@ -984,11 +1031,11 @@ private struct WorkStage: View {
     }
 
     private var placeholder: String {
-        switch session.state {
-        case .spawning: return "waking up…"
-        case .turnActive, .interrupting: return "..."
-        case .failed: return "session is down"
-        default: return "message \(session.config.name)"
+        switch session.phase {
+        case .waking: return "waking up…"
+        case .busy: return "..."
+        case .down: return "session is down"
+        default: return "message \(session.displayName)"
         }
     }
 
@@ -1009,10 +1056,12 @@ private struct WorkStage: View {
             return
         }
         // this tab's own history — the picker resumes into this session, not
-        // into bob's thread (same command, whichever stage you're standing on)
-        if CenterStage.isResumeCommand(prompt) {
+        // into bob's thread (same command, whichever stage you're standing on).
+        // Codex has its own thread list and its own picker (phase 2); until
+        // then the word travels as words rather than opening claude's.
+        if CenterStage.isResumeCommand(prompt), let claude = session.claudeSession {
             input = ""
-            ResumeStore.shared.open(for: session)
+            ResumeStore.shared.open(for: claude)
             return
         }
         input = ""
@@ -1032,10 +1081,10 @@ private struct WorkStage: View {
 /// say so; a command is never silently swallowed.
 @MainActor
 private func routeDispatch(_ raw: String, via manager: SessionManager) -> String? {
-    let sessions = manager.workSessions
+    let tabs = manager.workTabs
     guard case .send(let name, let text, let bang) =
-            SessionDispatch.parse(raw, names: sessions.map(\.config.name)),
-          let target = sessions.first(where: { $0.config.name == name })
+            SessionDispatch.parse(raw, names: tabs.map(\.name)),
+          let target = tabs.first(where: { $0.name == name })
     else { return nil }
     if bang {
         manager.stopAndTell(text, to: target.id)
