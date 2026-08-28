@@ -46,7 +46,13 @@ struct CodexOutputTail: Sendable, Equatable {
 
     mutating func append(_ chunk: String) {
         guard !chunk.isEmpty else { return }
-        let incoming = clipToBudget(chunk)
+        // CRLF is normalised to LF before anything is split, and this is the
+        // whole reason: Swift's Character is a grapheme cluster, so "\r\n" is ONE
+        // character and it is NOT equal to "\n". `split(separator: "\n")` never
+        // fired on CRLF output at all — a whole stream arrived as one unsplit
+        // line, and `contains("\r")` could not see it either. Cheap here because
+        // the chunk has already been clipped to the display's budget.
+        let incoming = clipToBudget(chunk).replacingOccurrences(of: "\r\n", with: "\n")
         let endsWithNewline = incoming.hasSuffix("\n")
         var pieces = incoming.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         if endsWithNewline { pieces.removeLast() }   // the empty piece after the final \n
@@ -78,11 +84,18 @@ struct CodexOutputTail: Sendable, Equatable {
     }
 
     private mutating func clip(_ line: String) -> String {
-        // a carriage return returns to column zero, so a progress bar's line is
-        // whatever followed the last one — which is also what makes \r\n endings
-        // land clean
         var text = line
-        if text.contains("\r") { text = String(text.split(separator: "\r", omittingEmptySubsequences: false).last ?? "") }
+        // A lone trailing \r — a chunk that stopped mid-progress-bar — is a
+        // return to column zero with nothing written after it yet, so what a
+        // terminal would still be showing is the text before it. Taking the
+        // segment *after* it would blank the line instead.
+        if text.hasSuffix("\r") { text.removeLast() }
+        // A carriage return *inside* a line really did return to column zero, so
+        // what a terminal would have shown is whatever followed the last one.
+        // That is a progress bar, and it is the only case this branch is for.
+        if text.contains("\r") {
+            text = String(text.split(separator: "\r", omittingEmptySubsequences: false).last ?? "")
+        }
         guard text.utf8.count > Self.maxLineChars else { return text }
         clipped = true
         return String(text.prefix(Self.maxLineChars))
@@ -226,6 +239,16 @@ final class CodexActivityStore {
     static let maxRows = 40
 
     private var index: [String: CodexActivityRow] = [:]
+    /// Which thread these rows describe.
+    ///
+    /// A tab can be repointed at a different thread (`CodexSession.repoint`,
+    /// #38 T2.6) and none of this may survive the move — rows and reasoning
+    /// would describe a conversation the tab has left. Keyed here rather than
+    /// cleared by the caller on purpose: a *retry* after app-server death
+    /// reopens the SAME thread, and there the rows must stay, because the ones
+    /// marked failed are the record of what died. Same thread keeps, different
+    /// thread clears, and no caller has to know which case it is in.
+    private var describes: String?
     /// The session's own directory. A command's `cwd` is only worth a word when
     /// it is somewhere else — which, given the sandbox, is news.
     private let scope: String?
@@ -288,6 +311,18 @@ final class CodexActivityStore {
         row.output.append(chunk)
     }
 
+    /// This store now describes `id`. Idempotent, and a no-op when the thread
+    /// has not actually changed.
+    func adopt(thread id: String?) {
+        guard describes != id else { return }
+        describes = id
+        rows.removeAll()
+        index.removeAll()
+        if reasoning != nil { reasoning = nil }
+        if turnDiff != nil { turnDiff = nil }
+        diffTurnId = nil
+    }
+
     /// app-server is gone, which is exactly what reaps the children a
     /// `turn/interrupt` never could — so nothing that was running still is.
     func endRunning(reason: String) {
@@ -298,6 +333,17 @@ final class CodexActivityStore {
     }
 
     // MARK: the turn's diff
+
+    /// A new turn starts with no diff of its own.
+    ///
+    /// Clearing the tally only when the *next* diff arrived was wrong in one
+    /// specific way: if turn A edited files and turn B edited none, no
+    /// `turn/diff/updated` ever came for B, so turn A's `+42 −7 in 3 files` sat
+    /// on screen all through B — labelled "this turn".
+    func beginTurn(_ turnId: String) {
+        diffTurnId = turnId
+        if turnDiff != nil { turnDiff = nil }
+    }
 
     func note(diff: CodexDiffTally, turnId: String) {
         if diffTurnId != turnId {
@@ -313,7 +359,12 @@ final class CodexActivityStore {
     func append(reasoning text: String, part: Int, item: String) {
         let row = liveReasoning(item)
         reserve(part: part, on: row)
-        guard part < row.parts.count else { return }
+        // `part >= 0` is not decoration. `summaryIndex` is an int64 off the wire;
+        // `reserve` declines a negative one, and this guard used to check only the
+        // upper bound — so `-1 < 0` passed and `parts[-1]` TRAPPED. A wire value
+        // must never be able to crash bob. An index above the cap already meant
+        // "drop this fragment"; a malformed one now means exactly the same.
+        guard part >= 0, part < row.parts.count else { return }
         let grown = row.parts[part] + text
         row.parts[part] = grown.count > CodexReasoningRow.maxPartChars
             ? String(grown.suffix(CodexReasoningRow.maxPartChars))

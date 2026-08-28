@@ -353,6 +353,12 @@ final class CodexSession: ObservableObject, Identifiable {
     // MARK: - thread lifecycle
 
     private func boot() async {
+        // BEFORE the RPC, so a repoint whose resume then fails still leaves no
+        // rows from the thread this tab used to be on. `threadId` has already
+        // been moved by the time a repoint reaches here, and is unchanged on a
+        // retry after app-server death — which is exactly the difference the
+        // store keys on.
+        activity.adopt(thread: threadId ?? config.resumeThreadId)
         do {
             _ = try await server.start()
             let route = CodexThreadRoute(pump: pump, quiesce: { [weak self] in await self?.quiesce() })
@@ -379,6 +385,9 @@ final class CodexSession: ObservableObject, Identifiable {
             }
             let isNewThread = threadId != opened.threadId
             threadId = opened.threadId
+            // records the id a fresh thread was just given, so the NEXT boot can
+            // tell a retry (same thread, keep the rows) from a move (clear them)
+            activity.adopt(thread: opened.threadId)
             // the thread id is what a relaunch resumes; it is only ever news
             // once per thread, so this doesn't write on every retry
             if isNewThread {
@@ -611,6 +620,8 @@ final class CodexSession: ObservableObject, Identifiable {
         if liveTurnId != turnId {
             liveTurnId = turnId
             itemRows = itemRows.filter { $0.value.turnId == lastCompletedTurnId }
+            // this turn owns no diff yet, and the gutter says "this turn"
+            activity.beginTurn(turnId)
             if case .turnActive = state {} else { state = .turnActive(.user) }
             openAgentRow()
         }
