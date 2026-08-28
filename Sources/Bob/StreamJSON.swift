@@ -363,11 +363,26 @@ enum StreamJSON {
     /// The one place the two mouths are reconciled: `utilization` is a
     /// **fraction** on the wire (0.26) and a **percentage** on the HTTP endpoint
     /// (26.0). One multiply, here, because a strip reading `0%` or `2600%` is
-    /// exactly the bug this asymmetry invites. Clamped, so a future wire that
-    /// switched units can't paint a number outside the ramp.
+    /// exactly the bug this asymmetry invites.
+    ///
+    /// **No upper clamp, deliberately.** A fraction can legitimately pass 1.0 —
+    /// that is what `isUsingOverage` is for — so a ceiling would turn a real 120%
+    /// into a flat 100% and put this reader at odds with the endpoint's, which
+    /// has no ceiling either. Two mouths that disagree about one account is worse
+    /// than a wide number.
+    ///
+    /// Nothing here sniffs units, and that is a decision rather than an omission.
+    /// A wire fraction and an endpoint percentage overlap completely on [0, 100],
+    /// so no threshold separates "1.2 means 120%" from "26.0 means someone
+    /// switched units" without also mistaking a genuine 2.6× overage for 2.6%.
+    /// Between a reading that fails loud (a units switch renders an absurd 2600%
+    /// and gets fixed) and one that fails reassuring (a real overage renders as
+    /// almost nothing), the loud one is the only safe choice. The lower bound is
+    /// clamped because a negative utilization is not a state the account can be
+    /// in — it is a decode error, and the ramp has no colour for it.
     static func percent(_ raw: Any?) -> Double? {
-        guard let fraction = raw as? Double else { return nil }
-        return min(100, max(0, fraction * 100))
+        guard let fraction = raw as? Double, fraction.isFinite else { return nil }
+        return max(0, fraction * 100)
     }
 
     private static func unix(_ raw: Any?) -> Date? {

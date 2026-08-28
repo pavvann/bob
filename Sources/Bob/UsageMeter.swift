@@ -12,11 +12,13 @@ import SwiftUI
 /// `rate_limit_info.unifiedWindows` — both utilizations, both reset instants,
 /// unasked.
 ///
-/// The OAuth usage endpoint survives as the stand-in for the one case the wire
-/// cannot cover: no turn has happened yet. It is asked at most once per run,
-/// after a grace period, and never once the wire has spoken — which is the whole
-/// reason first launch no longer opens with a keychain prompt. When it is asked,
-/// bob borrows the CLI's token and never refreshes, stores or logs it.
+/// The OAuth usage endpoint survives as the stand-in for the cases the wire
+/// cannot cover: no turn has happened yet, or a wire that stopped carrying
+/// `unifiedWindows`. It is armed as one deferred shot rather than a loop, rate
+/// limited rather than latched, and asked not at all once the wire has spoken —
+/// which is the whole reason first launch no longer opens with a keychain
+/// prompt. When it is asked, bob borrows the CLI's token and never refreshes,
+/// stores or logs it.
 @MainActor
 final class UsageMeter: ObservableObject {
     static let shared = UsageMeter()
@@ -56,9 +58,21 @@ final class UsageMeter: ObservableObject {
     /// One sleeper, fired once, never a loop.
     private static let wireGrace: UInt64 = 90 * 1_000_000_000
 
+    /// The stand-in's floor. A windowless `rate_limit_event` arrives once a turn,
+    /// so without this the compatibility path would be the poll we just deleted,
+    /// wearing an event's clothes. With it, a bob whose wire says nothing still
+    /// tracks its own usage — one fetch a minute at the very most, and only while
+    /// nothing better has spoken.
+    private static let fetchFloor: TimeInterval = 60
+
     private var endpointFallback: Task<Void, Never>?
-    /// The endpoint has been asked. One attempt per process — see `refresh()`.
-    private var endpointAsked = false
+    private var lastFetch: Date = .distantPast
+    /// One request at a time — the grace shot and a turn's event can land
+    /// together, and two fetches would only race to publish the same snapshot.
+    private var fetching = false
+    /// A trigger that arrived mid-flight. The reply in the air may have LEFT
+    /// before whatever moved the numbers, so it owes one more pass.
+    private var pendingRefresh = false
 
     private init() {
         endpointFallback = Task { [weak self] in
@@ -112,18 +126,45 @@ final class UsageMeter: ObservableObject {
         Task { await refresh() }
     }
 
+    /// Whether a trigger is allowed to reach the endpoint.
+    ///
+    /// **Only the wire is terminal.** A fetch having happened must never close
+    /// the door: the whole reason the endpoint is still here is the case where
+    /// `unifiedWindows` is absent or renamed, and in that case the utilization
+    /// still moves every turn. Closing after one attempt would freeze the strip
+    /// on its first snapshot and never retry a request that failed transiently.
+    /// What bounds it instead is the floor — a rate limit, not a latch.
+    ///
+    /// Static and pure so the rule can be asserted without a network or a
+    /// credential.
+    static func mayFetch(source: Source, lastFetch: Date, now: Date) -> Bool {
+        source != .wire && now.timeIntervalSince(lastFetch) >= fetchFloor
+    }
+
     /// Ask the endpoint. Everything expensive — reading the credential, the
     /// request, the JSON — happens off the main actor in `fetch()`; what crosses
-    /// back is one ==-guarded publish.
-    ///
-    /// Two guards, and they are the whole design. **Never once the wire has
-    /// spoken**, which is why a bob you talk to reads no credential at all; and
-    /// **once per process**, which is why one you never talk to reads it exactly
-    /// once instead of on a clock. Between them there is nothing to serialise, so
-    /// the single-flight bookkeeping this used to carry went out with the poll.
+    /// back is one ==-guarded publish. Single-flight, and a trigger that lands
+    /// mid-flight earns exactly one more pass rather than being dropped.
     func refresh() async {
-        guard source != .wire, !endpointAsked else { return }
-        endpointAsked = true
+        guard Self.mayFetch(source: source, lastFetch: lastFetch, now: Date()) else { return }
+        guard !fetching else {
+            pendingRefresh = true
+            return
+        }
+        fetching = true
+        defer { fetching = false }
+        repeat {
+            // cleared before the pass, not after: a trigger arriving *during*
+            // the pass has to earn another one. The floor is deliberately not
+            // re-checked here — an owed pass is the answer to a trigger that
+            // already passed it.
+            pendingRefresh = false
+            lastFetch = Date()
+            await fetchOnce()
+        } while pendingRefresh && source != .wire
+    }
+
+    private func fetchOnce() async {
         let answer = await Self.fetch()
         // a turn may have landed while the request was in the air, and a
         // first-hand number outranks a fetched one however it arrived
@@ -131,7 +172,7 @@ final class UsageMeter: ObservableObject {
         guard var fetched = answer else {
             // no credential, offline, or a token the CLI has since rotated.
             // Empty, not stale: a percentage bob can't vouch for is worse than
-            // no percentage, and the next turn will say it firsthand anyway.
+            // no percentage, and the next trigger re-reads the credential fresh.
             if !limits.isEmpty { limits = RateLimits() }
             return
         }
@@ -175,14 +216,23 @@ final class UsageMeter: ObservableObject {
     nonisolated static func parse(_ obj: [String: Any]) -> RateLimits? {
         var out = RateLimits()
         if let five = obj["five_hour"] as? [String: Any] {
-            out.fiveHourPct = five["utilization"] as? Double
+            out.fiveHourPct = alreadyPercent(five["utilization"])
             out.fiveHourResetsAt = date(five["resets_at"] as? String)
         }
         if let week = obj["seven_day"] as? [String: Any] {
-            out.weekPct = week["utilization"] as? Double
+            out.weekPct = alreadyPercent(week["utilization"])
             out.weekResetsAt = date(week["resets_at"] as? String)
         }
         return out.isEmpty ? nil : out
+    }
+
+    /// This mouth speaks percent already, so there is no multiply — but the
+    /// bounds have to match `StreamJSON.percent`'s exactly, or the two sources
+    /// would draw the same account differently. No ceiling here either: the
+    /// endpoint can report past a cap too.
+    private nonisolated static func alreadyPercent(_ raw: Any?) -> Double? {
+        guard let pct = raw as? Double, pct.isFinite else { return nil }
+        return max(0, pct)
     }
 
     /// `2026-08-19T01:59:59.662232+00:00` — six fractional digits, which
@@ -370,33 +420,74 @@ final class CodexMeter: ObservableObject {
 
 // MARK: - context windows
 
-/// The tier word a model id reduces to, and the one number to divide by when
-/// nothing else is available.
+/// The tier word a model id reduces to, and the denominator the context meter
+/// divides by.
 ///
-/// This used to hold a per-model window table, a `[1m]` sniffer and a ratchet,
-/// because the denominator was believed to be unavailable. It is reported: every
-/// `result` carries `modelUsage[<id>].contextWindow` (200000 for haiku, 1000000
-/// for `claude-sonnet-5[1m]` — both captured live), and the session takes it from
-/// there. The `result` that supplies the window is the same event that computes
-/// the percentage, so what is left here covers only a turn that reported no
-/// window at all — which is why it is one number rather than a table, and why it
-/// no longer claims to know anything about any tier.
+/// **The reported window is the source.** Every `result` carries
+/// `modelUsage[<id>].contextWindow` — 200000 for haiku, 1000000 for
+/// `claude-sonnet-5[1m]`, both captured live — and it arrives on the same event
+/// that computes the percentage, so it is never older than the numerator. The
+/// self-promoting ratchet that used to correct a wrong denominator after the
+/// fact is gone; there is nothing left for it to correct.
+///
+/// The table below is what remains, and it is **a guess of last resort**: it
+/// applies only to a turn whose `result` named no window at all, and any reported
+/// number overrides it. It is not measured truth and must not be read as any.
+/// It does lean on a measurement for *which way* to guess — fable threads on this
+/// account have held 426k and ~440k, and an opus thread passed 200k the same day,
+/// which only a 1M window allows — and the direction matters: guessing 1M for a
+/// 200k session reads low, while guessing 200k for a 1M session pins the meter at
+/// `ctx 100%`, which is the wrong answer someone has already had to notice.
 enum ContextWindow {
+    /// When neither the CLI nor the model's name has said anything.
     static let fallback = 200_000
 
-    /// Ordered, not a set: a model id containing two tier words must resolve the
-    /// same way every time.
-    private static let tiers = ["opus", "sonnet", "haiku", "fable"]
+    /// Ordered, not a dictionary: a model id containing two tier words must
+    /// resolve the same way every time.
+    private static let tiers: [(name: String, window: Int)] = [
+        ("opus", 1_000_000),
+        ("sonnet", 200_000),
+        ("haiku", 200_000),
+        ("fable", 1_000_000),
+    ]
 
-    /// "opus" out of "claude-opus-5" — what the caption says. Model names reach
-    /// bob two ways, the dial's bare alias (`opus`) and the CLI's resolved id
-    /// (`claude-haiku-4-5-20251001`); matching on the tier word handles both. nil
-    /// for a model bob has no word for, so the caption shows the context number
-    /// alone rather than a dated id nobody reads.
-    static func shortName(for model: String?) -> String? {
+    /// The suffix a long-context variant carries when the id has one at all —
+    /// `claude-sonnet-5[1m]`, captured live. Decisive where present, and checked
+    /// apart from the tier table because it changes the window without changing
+    /// the word the caption shows.
+    private static let longContextMarker = "[1m]"
+
+    /// Model names reach bob two ways — the dial's bare alias (`opus`) and the
+    /// CLI's resolved id (`claude-haiku-4-5-20251001`). Matching on the tier word
+    /// handles both.
+    private static func tier(for model: String?) -> (name: String, window: Int)? {
         guard let model = model?.lowercased(), !model.isEmpty else { return nil }
-        return tiers.first { model.contains($0) }
+        return tiers.first { model.contains($0.name) }
     }
+
+    /// The guess. See the type's note: last resort, never the primary source.
+    static func size(for model: String?) -> Int {
+        if let model, model.lowercased().contains(longContextMarker) { return 1_000_000 }
+        return tier(for: model)?.window ?? fallback
+    }
+
+    /// The whole denominator rule in one pure function, so it can be asserted
+    /// without a session.
+    ///
+    /// The reported window wins — but only for the model it was reported *for*. A
+    /// window measured under one model describes no other, so a session that
+    /// switches between a 200k and a 1M model falls back to the new model's guess
+    /// rather than reusing the old model's number. That reuse is how a 1M session
+    /// would read `ctx 100%` again.
+    static func denominator(model: String?, reported: (model: String?, window: Int)?) -> Int {
+        if let reported, reported.model == model, reported.window > 0 { return reported.window }
+        return size(for: model)
+    }
+
+    /// "opus" out of "claude-opus-5" — what the caption says. nil for a model bob
+    /// has no word for, so the caption shows the context number alone rather than
+    /// a dated id nobody reads.
+    static func shortName(for model: String?) -> String? { tier(for: model)?.name }
 }
 
 // MARK: - the tinted percentage
