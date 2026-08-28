@@ -612,7 +612,7 @@ struct CenterStage: View {
         guard head.hasPrefix("/"), head.count > 1 else { return nil }
         let name = String(head.dropFirst())
         guard !name.contains("/") else { return nil }
-        return SlashCommandService.shared.commands.contains { $0.name == name } ? name : nil
+        return SlashCommandService.shared.isClaudeCommand(name) ? name : nil
     }
 
     /// `/model` → whisper the current model; `/model opus|sonnet|haiku|fable`
@@ -830,8 +830,14 @@ private struct WorkStage<S: StageSession>: View {
     @State private var whisperSweep: Task<Void, Never>?
     @FocusState private var inputFocused: Bool
     @ObservedObject private var broker = UIPermissionBroker.shared
+    @ObservedObject private var slash = SlashCommandService.shared
 
-    private var slashScope: SlashCommandService.Scope { .work(session.provider) }
+    /// The palette's question carries both halves: which agent is behind this
+    /// tab, and which project it runs in. A work tab is rarely `~/bob`, so the
+    /// second half is what stops the palette offering the companion's commands.
+    private var slashScope: SlashCommandService.Scope {
+        .work(provider: session.provider, cwd: session.cwd)
+    }
 
     /// Nothing is hidden in a work session today, but the filter keeps parity
     /// with the companion thread if P3 ever injects into one.
@@ -864,7 +870,12 @@ private struct WorkStage<S: StageSession>: View {
             .animation(.easeInOut(duration: 0.25), value: whisper)
             .animation(.easeInOut(duration: 0.2), value: broker.ask(for: session.id)?.id)
         }
-        .onAppear { inputFocused = true }
+        .onAppear {
+            inputFocused = true
+            // scan this project's commands now, not on the first keystroke, so
+            // the first `/` is already complete. Once per launch per project.
+            slash.warm(slashScope)
+        }
         .onReceive(NotificationCenter.default.publisher(for: HotKeyManager.didSummon)) { _ in
             inputFocused = true
         }

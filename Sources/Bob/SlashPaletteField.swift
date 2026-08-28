@@ -138,9 +138,9 @@ private struct SlashPaletteSheet: ViewModifier {
                 // standard palette feel, and it makes esc's dismissal one-shot
                 state.dismissed = false
                 state.selection = 0
-                // the harvest is throttled, and only claude's list has one: a
-                // codex palette is bob's own commands and needs no disk at all
-                if input.hasPrefix("/"), scope != .work(.codex) { service.refresh() }
+                // throttled and cached inside; a codex palette is bob's own
+                // commands and touches no disk at all
+                if input.hasPrefix("/") { service.warm(scope) }
             }
     }
 

@@ -88,10 +88,19 @@ final class ResumeStore: ObservableObject {
     /// picking it re-reads the thread instead of switching threads, which is the
     /// only way to get a restored tab's own history back on screen.
     @Published private(set) var currentID: String?
+    /// The read failed rather than came back empty. Kept apart from an empty
+    /// list on purpose: "app-server would not start" and "this project has no
+    /// threads" are different sentences, and `try?` said the second when it
+    /// meant the first.
+    @Published private(set) var failure: String?
     /// The project whose history is on screen — shown in the header so a
     /// picker raised from the wrong tab is obvious before you click.
     private(set) var projectName: String = ""
     private(set) var provider: SessionProvider = .claude
+    /// Which app-server the codex loader asks. The shared one in the app; a
+    /// harness points it at one that cannot start, which is the only way to see
+    /// what this store does when `thread/list` fails rather than answers empty.
+    var codexServer: CodexServer = CodexServer.shared
 
     /// Filter as you type, over the title and the branch — the two things you
     /// actually remember about a conversation you want back.
@@ -139,9 +148,18 @@ final class ResumeStore: ObservableObject {
         // whose own row has to be marked and pickable (#32).
         currentID = session.threadId ?? session.config.resumeThreadId
         Task {
-            let found = (try? await CodexServer.shared.threads(cwd: cwd, limit: 40)) ?? []
-            guard gen == self.generation else { return }
-            self.rows = found.map(ResumeCandidate.init(codex:))
+            do {
+                let found = try await self.codexServer.threads(cwd: cwd, limit: 40)
+                guard gen == self.generation else { return }
+                self.rows = found.map(ResumeCandidate.init(codex:))
+            } catch {
+                guard gen == self.generation else { return }
+                // app-server missing, refusing to start, or answering in a shape
+                // bob doesn't know — all of which `CodexServerError` says in
+                // words. Showing them beats an empty list that blames the project.
+                self.failure = (error as? LocalizedError)?.errorDescription
+                    ?? String(describing: error)
+            }
             self.loading = false
         }
     }
@@ -156,6 +174,7 @@ final class ResumeStore: ObservableObject {
         query = ""
         rows = []
         currentID = nil
+        failure = nil
         loading = true
         isOpen = true
         return generation
@@ -168,6 +187,7 @@ final class ResumeStore: ObservableObject {
         query = ""
         loading = false
         currentID = nil
+        failure = nil
         isOpen = false
     }
 
@@ -255,6 +275,14 @@ struct ResumePicker: View {
                     if store.loading {
                         hint(store.provider == .codex ? "asking codex what it has…"
                                                       : "reading this project's history…")
+                    } else if let failure = store.failure {
+                        // not "no threads": the list never arrived
+                        Text("couldn't ask codex — \(failure)")
+                            .font(.system(size: 11, weight: .regular, design: .rounded))
+                            .foregroundStyle(.orange.opacity(0.85))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .fixedSize(horizontal: false, vertical: true)
                     } else if store.rows.isEmpty {
                         // codex matches a thread's directory *exactly* and lists
                         // nothing at all for a thread that never spoke, so the
