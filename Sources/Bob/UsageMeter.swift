@@ -255,6 +255,124 @@ final class UsageMeter: ObservableObject {
     }
 }
 
+// MARK: - the same strip, from codex's wire
+
+/// The codex half of the global strip — the *same* two numbers and countdown,
+/// from a source that costs nothing to read.
+///
+/// The contrast with the meter above is the whole point. That one reads a
+/// keychain, holds a bearer token, calls an HTTPS endpoint and polls every ten
+/// minutes because nothing tells it when the numbers move. Codex tells bob:
+/// `account/rateLimits/updated` arrives unasked on the app-server connection,
+/// once a turn, for the account rather than for a thread. So there is **no
+/// poller, no endpoint, no credential and no timer on this path** — one
+/// subscription to `CodexServer.events`, and one RPC at the top so a codex tab
+/// that hasn't spoken yet still shows numbers.
+///
+/// Publishes `UsageMeter.RateLimits`, not a shape of its own: the strip is one
+/// component with two sources, and a second value type is how two readouts
+/// start disagreeing about what 80% looks like.
+@MainActor
+final class CodexMeter: ObservableObject {
+    static let shared = CodexMeter()
+
+    @Published private(set) var limits = UsageMeter.RateLimits()
+
+    /// The merged snapshot, kept whole because the pushes are sparse: an update
+    /// carrying only `primary` must not erase the week.
+    private var merged = CodexRateLimits()
+    private var watch: Task<Void, Never>?
+    /// The one-shot read has been asked for on this app-server. Re-armed when
+    /// the server dies, since the next one is a different process with a
+    /// different snapshot to hand over.
+    private var asked = false
+
+    private init() {}
+
+    /// Idempotent — SessionManager opens this with the rest of the ambient layer,
+    /// harnesses drive their own instance's `apply` directly.
+    func start() { start(server: .shared) }
+
+    func start(server: CodexServer) {
+        guard watch == nil else { return }
+        watch = Task { [weak self] in
+            // eagerly, in case the server is already up — bob calls this at
+            // launch, before any codex tab exists, so this attempt normally
+            // finds nothing and costs nothing
+            await self?.primeOnce(server)
+            for await event in await server.events {
+                guard let self else { return }
+                switch event {
+                case .rateLimits(let update):
+                    self.apply(update)
+                case .serverExited:
+                    // whatever comes back is a new process with its own
+                    // snapshot to hand over
+                    self.asked = false
+                default:
+                    // any account-level line at all means app-server is up and
+                    // answering, which is the only thing the read was waiting
+                    // for. `remoteControl/status/changed` arrives right after
+                    // `initialize` (measured), so in practice this fires before
+                    // the first turn — and if a future build sends nothing, the
+                    // first turn's own push fills the strip anyway.
+                    await self.primeOnce(server)
+                }
+            }
+        }
+    }
+
+    /// `account/rateLimits/read` — once per app-server, never on a clock. The
+    /// schema's own advice: base on the read, merge the rolling updates into it.
+    ///
+    /// `asked` is set only when the server actually answered. A call that threw
+    /// means there is no app-server yet, and marking that as asked would be how
+    /// the strip stays blank for a whole session.
+    private func primeOnce(_ server: CodexServer) async {
+        guard !asked else { return }
+        do {
+            let result = try await server.call("account/rateLimits/read", params: [:])
+            asked = true
+            if let snapshot = result["rateLimits"] as? [String: Any] {
+                apply(CodexJSON.rateLimits(snapshot))
+            }
+        } catch {
+            // nothing to say yet; the next account-level line asks again
+        }
+    }
+
+    /// Merge, then publish only if the drawn value actually moved. Internal so a
+    /// harness can drive it with fixtures instead of a live account.
+    func apply(_ update: CodexRateLimits) {
+        merged.merge(update)
+        let next = Self.strip(merged)
+        if next != limits { limits = next }
+    }
+
+    /// Codex's two windows in the strip's own words.
+    ///
+    /// Which window is which is read off its **duration**, not off the key:
+    /// `primary`/`secondary` are 300 and 10080 minutes today, and a strip that
+    /// called a window "week" because it arrived second would be wrong the day
+    /// that stops being true. An absent duration falls back to the documented
+    /// order, which is the only guess available.
+    static func strip(_ snapshot: CodexRateLimits) -> UsageMeter.RateLimits {
+        var out = UsageMeter.RateLimits()
+        for (window, isPrimary) in [(snapshot.primary, true), (snapshot.secondary, false)] {
+            guard let window else { continue }
+            let isShort = window.windowMins.map { $0 < 24 * 60 } ?? isPrimary
+            if isShort {
+                out.fiveHourPct = window.usedPercent
+                out.fiveHourResetsAt = window.resetsAt
+            } else {
+                out.weekPct = window.usedPercent
+                out.weekResetsAt = window.resetsAt
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - context windows
 
 /// How much context a model has to spend. bob shows a percentage, and a
@@ -369,11 +487,31 @@ private struct ResetsIn: View {
 /// and on a session page alike. It floats over the ambient band beside the
 /// memory toggle rather than sitting in the row, so the tiles keep every point
 /// of width they had.
+///
+/// **It follows the active session's provider** (#38 T2.5, decision 3 of #35):
+/// codex's two windows on a codex tab, the claude subscription everywhere else.
+/// One component, two sources — same glyph, same threshold ramp, same countdown
+/// leaf — because a second strip is how two readouts start meaning different
+/// things by the same colour. Both meters are observed rather than one of them,
+/// since a view cannot subscribe conditionally; each publishes only when its
+/// drawn numbers move, so the idle cost of the one you aren't looking at is nil.
 struct RateLimitStrip: View {
+    var provider: SessionProvider = .claude
+
     @ObservedObject private var meter = UsageMeter.shared
+    @ObservedObject private var codex = CodexMeter.shared
+
+    /// Which source a provider draws from. A named function rather than a
+    /// ternary buried in `body`, so the switch itself can be asserted without
+    /// rendering anything.
+    static func source(for provider: SessionProvider,
+                       claude: UsageMeter.RateLimits,
+                       codex: UsageMeter.RateLimits) -> UsageMeter.RateLimits {
+        provider == .codex ? codex : claude
+    }
 
     var body: some View {
-        let limits = meter.limits
+        let limits = Self.source(for: provider, claude: meter.limits, codex: codex.limits)
         if !limits.isEmpty {
             HStack(spacing: 5) {
                 Image(systemName: "hourglass")

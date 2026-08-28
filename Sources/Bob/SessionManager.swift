@@ -47,9 +47,11 @@ final class SessionManager: ObservableObject {
 
     @Published private(set) var sessions: [ClaudeSession] = []
     /// Codex tabs. A separate list rather than a widened `sessions`, because
-    /// `sessions` is what the bridge mirrors and what AttentionCenter watches —
-    /// both of which mean *claude* — while the band, the stage and the state
-    /// file read `workTabs`, which is both kinds in the order they arrived.
+    /// `sessions` is what the bridge mirrors, and that means *claude* — while
+    /// the band, the stage and the state file read `workTabs`, which is both
+    /// kinds in the order they arrived. AttentionCenter used to read `sessions`
+    /// too; it now subscribes to both (#38), because a codex tab going red is
+    /// the same news as a claude one.
     @Published private(set) var codexSessions: [CodexSession] = []
     /// Tab order across providers, by session id. The registry can't derive it:
     /// two lists have no shared index, and a claude tab opened after a codex one
@@ -132,8 +134,12 @@ final class SessionManager: ObservableObject {
         }
         restoreWorkSessions()
         // the manager's ear opens with the registry — status transitions in
-        // any work session become digests in bob's own thread (D9)
+        // any work session, either provider, become digests in bob's own
+        // thread (D9, #38)
         AttentionCenter.shared.start()
+        // and the statusline's codex source, which is a subscription rather
+        // than a poller: it costs one idle task until app-server exists
+        CodexMeter.shared.start()
     }
 
     /// Last launch's work sessions come back as cold tabs: config only, no

@@ -227,6 +227,44 @@ struct CodexTokenUsage: Sendable {
     var contextInUse: Int { inputTokens }
 }
 
+/// `account/rateLimits/updated`, and the same `RateLimitSnapshot` that
+/// `account/rateLimits/read` answers under the same key — one shape, two
+/// arrivals. Pushed unasked, once a turn: no endpoint, no keychain, no poll.
+///
+/// **Every field is optional because the notification is explicitly sparse.**
+/// The schema says a rolling update carries what moved, and that a nullable
+/// field being absent "does not clear a previously observed value" — so this
+/// decodes to absences and the meter merges. Nothing here may be read as "the
+/// account no longer has one of these".
+///
+/// Carries no freshness timestamp, deliberately (#26): a `Date()` in a published
+/// value makes every snapshot compare unequal, and then an equality guard
+/// invalidates the window on every push that changed nothing.
+struct CodexRateLimits: Sendable, Equatable {
+    /// One rolling window. `usedPercent` is the only required member, so a
+    /// window that decodes at all is a window worth drawing.
+    struct Window: Sendable, Equatable {
+        var usedPercent: Double
+        var resetsAt: Date?
+        /// 300 and 10080 live — five hours and a week. Kept rather than assumed,
+        /// because it is what decides which of the two a window *is*.
+        var windowMins: Int?
+    }
+
+    var primary: Window?
+    var secondary: Window?
+
+    /// A rolling update carries what moved; an absence is silence, not a
+    /// retraction. A present window is always complete (`usedPercent` is
+    /// required inside one), so this merges whole windows rather than fields.
+    mutating func merge(_ update: CodexRateLimits) {
+        if let primary = update.primary { self.primary = primary }
+        if let secondary = update.secondary { self.secondary = secondary }
+    }
+
+    var isEmpty: Bool { primary == nil && secondary == nil }
+}
+
 /// What a `CodexSession` reacts to. Sendable: these cross from the reader,
 /// through the coalescer, to the main actor.
 enum CodexEvent: Sendable {
@@ -247,6 +285,10 @@ enum CodexEvent: Sendable {
     case reasoningPartAdded(itemId: String, part: Int)
     case turnDiff(turnId: String, tally: CodexDiffTally)
     case tokenUsage(CodexTokenUsage)
+    /// `account/rateLimits/updated` — the account's, not a thread's, so no
+    /// session owns it: it reaches `CodexServer.events` and the statusline strip
+    /// is its only subscriber (#38 T2.5).
+    case rateLimits(CodexRateLimits)
     case threadStatus(kind: String, activeFlags: [String])
     /// `error` — a turn failed. `willRetry` means app-server is having another
     /// go on its own and no `turn/completed` follows yet.
@@ -404,6 +446,13 @@ enum CodexJSON {
         case "thread/tokenUsage/updated":
             guard let usage = tokenUsage(params) else { break }
             return .tokenUsage(usage)
+        case "account/rateLimits/updated":
+            guard let snapshot = params["rateLimits"] as? [String: Any] else { break }
+            let limits = rateLimits(snapshot)
+            // an update that named neither window says nothing bob draws; let it
+            // stay opaque rather than publish an empty snapshot over a good one
+            guard !limits.isEmpty else { break }
+            return .rateLimits(limits)
         case "thread/status/changed":
             guard let status = params["status"] as? [String: Any] else { break }
             return .threadStatus(
@@ -506,6 +555,34 @@ enum CodexJSON {
     /// have finished when nothing said so is the one wrong answer here.
     private static func status(_ raw: Any?) -> CodexWorkStatus {
         CodexWorkStatus(rawValue: (raw as? String) ?? "") ?? .inProgress
+    }
+
+    /// A `RateLimitSnapshot`, from either the push or the one-shot read. Only
+    /// the two windows are decoded: `planType`, `credits`, `limitName` and
+    /// `spendControlReached` all arrive and none of them is drawn, and a field
+    /// bob doesn't draw is a field that can't break it (UsageMeter's own rule).
+    /// `rateLimitReachedType` is the one omission worth naming — the sparse
+    /// merge cannot tell "no longer reached" from "not mentioned", so a word
+    /// held from it would outlive the fact; 100% already goes red on its own.
+    static func rateLimits(_ snapshot: [String: Any]) -> CodexRateLimits {
+        CodexRateLimits(primary: window(snapshot["primary"]),
+                        secondary: window(snapshot["secondary"]))
+    }
+
+    /// `usedPercent` arrives as an int32 and `resetsAt` as unix **seconds** —
+    /// both read live (51% / 300 mins / 1787943426 → an instant two hours out).
+    /// Numbers are taken through `NSNumber` because JSONSerialization is free to
+    /// hand back either an Int or a Double for the same field.
+    private static func window(_ any: Any?) -> CodexRateLimits.Window? {
+        guard let obj = any as? [String: Any],
+              let used = (obj["usedPercent"] as? NSNumber)?.doubleValue
+        else { return nil }
+        return CodexRateLimits.Window(
+            usedPercent: min(100, max(0, used)),
+            resetsAt: (obj["resetsAt"] as? NSNumber)
+                .map { Date(timeIntervalSince1970: $0.doubleValue) },
+            windowMins: (obj["windowDurationMins"] as? NSNumber)?.intValue
+        )
     }
 
     private static func tokenUsage(_ params: [String: Any]) -> CodexTokenUsage? {

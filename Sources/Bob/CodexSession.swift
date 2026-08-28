@@ -921,6 +921,8 @@ final class CodexSession: ObservableObject, Identifiable {
             activity.reserveReasoning(part: part, item: itemId)
         case .turnDiff(let turnId, let tally):
             activity.note(diff: tally, turnId: turnId)
+        case .rateLimits:
+            break   // the account's, not this thread's — the statusline owns it
         case .agentMessageDelta, .commandOutputDelta, .reasoningDelta, .unmodeled:
             break   // the classifier already coalesced or dropped these
         }

@@ -304,7 +304,9 @@ struct ContentView: View {
     /// session page.
     private var topRight: some View {
         HStack(spacing: 10) {
-            RateLimitStrip()
+            // the numbers follow whoever is on stage — read through the already
+            // observed manager, so this costs no second subscription
+            RateLimitStrip(provider: sessionManager.activeRef?.provider ?? .claude)
             memoryToggle
         }
         .padding(.top, 12)
