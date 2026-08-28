@@ -1,8 +1,9 @@
 import Foundation
 
-/// One slash command the claude CLI will accept — `/ship`, `/vercel:deploy`.
+/// One slash command the claude CLI will accept — `/ship`, `/vercel:deploy` —
+/// or one bob implements itself.
 struct SlashCommand: Identifiable, Equatable {
-    enum Source: String { case builtIn = "built-in", user, project, plugin }
+    enum Source: String { case bob, builtIn = "built-in", user, project, plugin }
     let name: String
     /// One-line description where the filesystem has one; "" for CLI-only names.
     let detail: String
@@ -27,10 +28,25 @@ struct SlashCommand: Identifiable, Equatable {
 ///    palette is complete from launch without ever spawning claude for it.
 ///
 /// Terminal-session built-ins (/clear, /model, /usage...) are curated out —
-/// they manage an interactive REPL that doesn't exist inside bob's chat.
+/// they manage an interactive REPL that doesn't exist inside bob's chat. The two
+/// bob reimplements as its own gestures come back through `native`, because the
+/// curation is by name and would otherwise take them with it.
 @MainActor
 final class SlashCommandService: ObservableObject {
     static let shared = SlashCommandService()
+
+    /// Which input bar is asking. The list is not the same on all three: this
+    /// one holds claude's commands, and claude's commands are meaningless to
+    /// codex — app-server's `turn/start` takes text, a `/name` inside text stays
+    /// text, and there is no expansion RPC and no command catalogue to expand
+    /// from. Offering them on a codex tab would be 150-odd rows that all quietly
+    /// do nothing, which is worse than an empty palette.
+    enum Scope: Equatable {
+        /// bob's own thread.
+        case companion
+        /// A work tab. Claude's expand in-session; codex's don't exist.
+        case work(SessionProvider)
+    }
 
     @Published private(set) var commands: [SlashCommand] = []
 
@@ -45,17 +61,52 @@ final class SlashCommandService: ObservableObject {
 
     /// Commands matching what's typed after the `/`. Prefix matches lead,
     /// subsequence matches trail; both case-insensitive. "" matches everything.
-    func matches(_ query: String) -> [SlashCommand] {
-        guard !query.isEmpty else { return commands }
+    /// bob's own commands lead their match class — there are two of them, and a
+    /// fuzzy match against 150 names would otherwise bury both.
+    func matches(_ query: String, in scope: Scope) -> [SlashCommand] {
+        let pool = Self.native(in: scope) + (Self.runsClaudeCommands(scope) ? commands : [])
+        guard !query.isEmpty else { return pool }
         let q = query.lowercased()
         var starts: [SlashCommand] = []
         var fuzzy: [SlashCommand] = []
-        for cmd in commands {
+        for cmd in pool {
             let n = cmd.name.lowercased()
             if n.hasPrefix(q) { starts.append(cmd) }
             else if isSubsequence(q, of: n) { fuzzy.append(cmd) }
         }
         return starts + fuzzy
+    }
+
+    /// Whether the surface can actually run a claude CLI command.
+    private static func runsClaudeCommands(_ scope: Scope) -> Bool {
+        switch scope {
+        case .companion:            return true
+        case .work(let provider):   return provider == .claude
+        }
+    }
+
+    /// The commands bob implements itself — intercepted in the input bar and
+    /// never sent anywhere. They are listed rather than left to be remembered:
+    /// `/resume` reads as broken when the palette goes blank as you finish
+    /// typing it, which is exactly what a name in `terminalOnly` does.
+    ///
+    /// `/model` is the companion's alone. A work tab's model is picked in the
+    /// "+" picker (claude) or the stage dial (codex), and bob would have nothing
+    /// to switch.
+    private static func native(in scope: Scope) -> [SlashCommand] {
+        var out = [SlashCommand(
+            name: "resume",
+            detail: "pick up a conversation this project already has",
+            source: .bob
+        )]
+        if scope == .companion {
+            out.append(SlashCommand(
+                name: "model",
+                detail: "which model bob runs on — /model opus·sonnet·haiku·fable·default",
+                source: .bob
+            ))
+        }
+        return out
     }
 
     /// Rebuild the list off the main thread. Throttled — the palette calls this

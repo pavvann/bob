@@ -438,6 +438,93 @@ final class CodexSession: ObservableObject, Identifiable {
         try? await server.setThreadName(name, threadId: thread)
     }
 
+    /// Point this tab at another thread app-server already has (`/resume`, #38
+    /// T2.6): same tab, same cwd, same dial, different conversation. The peer of
+    /// `ClaudeSession.resume`, and of its `reload` — repointing at the thread
+    /// this tab is *already* on re-reads that thread instead, which is the only
+    /// way a restored tab's own history gets back on screen.
+    ///
+    /// Leaving a thread is the delicate half, not arriving at one. An approval
+    /// left open on the way out parks the thread bob is walking away from
+    /// forever (phase 0: that park is permanent), so the asks are refused
+    /// *before* the route goes, and the live turn is stood down first — the
+    /// same order, and the same leash, `close()` uses. A command already
+    /// running still cannot be reaped from here, so the old thread is abandoned
+    /// rather than detached and the owner is told, instead of the tab quietly
+    /// leaving work behind.
+    func repoint(to newThreadId: String) {
+        guard !isClosed else { return }
+        Task { await moveThread(to: newThreadId) }
+    }
+
+    private func moveThread(to newThreadId: String) async {
+        let reloading = newThreadId == threadId
+        state = .spawning
+        let asks = openRequests
+        openRequests.removeAll()
+        if blockedOn != nil { blockedOn = nil }
+        for ask in asks {
+            await server.respond(to: ask.id, code: -32800,
+                                 message: "bob moved this tab to another thread")
+        }
+        // a prompt queued for the conversation you just left must not arrive in
+        // the one you picked
+        queue.removeAll()
+        pendingUserRows.removeAll()
+        // snapshot BEFORE the interrupt, for the reason close() gives: an
+        // interrupted command's item goes terminal in milliseconds while the
+        // process it spawned keeps running
+        let commandsAtMove = liveCommands
+        await quiesce()
+        _ = await waitForTurnEnd()
+        if let old = threadId, !reloading {
+            if commandsAtMove.isEmpty {
+                await server.detach(threadId: old)
+            } else {
+                await server.abandon(threadId: old)
+            }
+        }
+        guard !isClosed else { return }
+        // everything below belongs to the thread being left
+        liveTurnId = nil
+        turnStarting = false
+        steerInFlight = false
+        wantsInterrupt = false
+        lastCompletedTurnId = nil
+        itemRows.removeAll()
+        currentAgentRow = nil
+        unclaimedAgentRow = nil
+        liveCommands.removeAll()
+        latestUsage = nil
+        contextWindow = nil
+        if contextUsedPct != nil { contextUsedPct = nil }
+        if tokenUsage != nil { tokenUsage = nil }
+        if lastTurn != nil { lastTurn = nil }
+        if lastError != nil { lastError = nil }
+        if !activeFlags.isEmpty { activeFlags = [] }
+        // an override is "for this turn and subsequent turns" *on one thread*,
+        // so arriving somewhere new means nothing has been applied yet
+        appliedOverride = false
+        threadDefaultModel = nil
+        // hydrate() only fills an empty transcript — that guard is what stops a
+        // server-death recovery doubling every line, and it is also what makes
+        // clearing here the whole of "show me that conversation instead"
+        transcript.replaceAll([])
+        threadId = newThreadId
+        if config.resumeThreadId != newThreadId {
+            config.resumeThreadId = newThreadId
+            onConfigChanged?()
+        }
+        await boot()
+        // after boot, not before: hydrate() declines a transcript that already
+        // has a row in it, and the picked thread's own history is the point
+        if !commandsAtMove.isEmpty {
+            appendNotice("left \(commandsAtMove.count) command"
+                + "\(commandsAtMove.count == 1 ? "" : "s") running on the thread you came from"
+                + " — codex reaps those when bob quits")
+        }
+    }
+
     // MARK: - the dial (#37 T1.5)
 
     /// All four settings are overrides carried on the next `turn/start`, so a
