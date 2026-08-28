@@ -106,9 +106,15 @@ final class CodexSession: ObservableObject, Identifiable {
     /// Last turn's counts, published at the boundary with the percentage above
     /// — never on a delta, and never the mid-turn readings.
     @Published private(set) var tokenUsage: CodexTokenUsage? = nil
-    /// The oldest request codex is blocked on. Phase 2 draws the card; phase
-    /// 1a's job is that the state is visible rather than silent.
+    /// The oldest request codex is actually *waiting* on. A non-blocking
+    /// question is deliberately not one of these — see `nonBlocking` — because
+    /// this is what the rail and the status derivation read as "this thread has
+    /// stopped moving".
     @Published private(set) var blockedOn: CodexServerRequest? = nil
+    /// The question on the chooser, when codex has asked one (#38 T2.2). It is
+    /// claude's own `SessionQuestion`, so the rail mounts claude's card rather
+    /// than a second overlay.
+    @Published private(set) var question: SessionQuestion? = nil
     /// app-server's own read on the thread — `waitingOnApproval` and friends.
     @Published private(set) var activeFlags: [String] = []
 
@@ -175,6 +181,26 @@ final class CodexSession: ObservableObject, Identifiable {
         let turnId: String
     }
 
+    private struct PendingQuestion {
+        let request: CodexServerRequest
+        let asked: SessionQuestion
+        /// The request's own `autoResolutionMs`, when it declared one.
+        let autoResolutionMs: Int?
+        /// When the request LANDED — not when its card went up.
+        let arrived: ContinuousClock.Instant
+
+        /// What is left of the declared window, nil when none was declared.
+        ///
+        /// Measured from arrival, so time a question spends queued behind
+        /// another comes off its window instead of being added to it. A card
+        /// answerable past the deadline it declared is the same "looks live but
+        /// isn't" state the lapse exists to prevent.
+        var remaining: Duration? {
+            guard let ms = autoResolutionMs else { return nil }
+            return .milliseconds(ms) - arrived.duration(to: ContinuousClock().now)
+        }
+    }
+
     private var queue: [Outbound] = []
     /// Item rows are NOT dropped when a turn completes: phase 0 watched an
     /// interrupted command's `item/completed` arrive *after* `turn/completed`,
@@ -192,6 +218,27 @@ final class CodexSession: ObservableObject, Identifiable {
     /// Rows bob wrote locally on send, waiting for their echo to claim them.
     private var pendingUserRows: [(clientId: String, entry: TranscriptEntry)] = []
     private var openRequests: [CodexServerRequest] = []
+    /// Request ids that declared `isBlocking: false`. They stay in
+    /// `openRequests` — they still have to be answerable, and withdrawable when
+    /// their turn dies — but they are never a park, so `blockedOn` skips them.
+    ///
+    /// `isBlocking: false` is not a promise. A live 0.149.0 question carried it
+    /// while that same thread reported `activeFlags: ["waitingOnUserInput"]` —
+    /// codex was waiting after all. So the flag governs only what *bob* claims
+    /// (it never freezes the input bar over one, and never calls it a park),
+    /// while `activeFlags` stays the first-hand authority for the status the
+    /// rail and the digest read. Which is why the distinction costs no
+    /// visibility: a question codex really is waiting on shows up either way.
+    private var nonBlocking: Set<CodexRequestId> = []
+    /// Questions bob could draw a card for, oldest first. The chooser is one
+    /// card, so a second `requestUserInput` waits here rather than replacing a
+    /// half-made choice. A question that lapses leaves this list but stays in
+    /// `openRequests`, which is exactly what stops it being offered twice.
+    private var questionQueue: [PendingQuestion] = []
+    /// The live question's own `autoResolutionMs`, armed as a one-shot sleep
+    /// rather than a tick, and cancelled the instant the question settles — so a
+    /// lapse can never land on one already answered.
+    private var questionLapse: Task<Void, Never>?
     private var latestUsage: CodexTokenUsage?
     private var contextWindow: Int?
     private var noteTaps: [UUID: AsyncStream<SessionNote>.Continuation] = [:]
@@ -281,6 +328,25 @@ final class CodexSession: ObservableObject, Identifiable {
         settle(request)
     }
 
+    /// The owner picked. `picked` maps each question's **id** to the labels
+    /// chosen for it — the chooser collects under `Ask.key`, which for a codex
+    /// question is that id — and the reply goes back on the request's own id as
+    /// `{answers: {<questionId>: {answers: [labels]}}}`. The shape and the
+    /// keying are `ToolRequestUserInputResponse.json`'s, not a guess; see
+    /// `CodexQuestion.result`.
+    func answerQuestion(_ picked: [String: [String]]) {
+        guard question != nil, let head = questionQueue.first else { return }
+        finishQuestion(head, result: CodexQuestion.result(for: head.asked, picked: picked))
+    }
+
+    /// "you pick". An empty `answers` map is the one schema-legal way to hand
+    /// the choice back without bob inventing a label — the nearest thing codex
+    /// has to claude's `behavior: deny` on an AskUserQuestion.
+    func declineQuestion() {
+        guard question != nil, let head = questionQueue.first else { return }
+        finishQuestion(head, result: CodexQuestion.noAnswer)
+    }
+
     /// Shutdown's hook, called by the server from outside its own isolation so
     /// the reply to this interrupt can still be dispatched while it waits.
     func quiesce() async {
@@ -349,10 +415,7 @@ final class CodexSession: ObservableObject, Identifiable {
         // typed for the conversation this tab is walking away from
         queue.removeAll()
         pendingUserRows.removeAll()
-        let asks = openRequests
-        openRequests.removeAll()
-        broker.abandon(sessionId: id)
-        if blockedOn != nil { blockedOn = nil }
+        let asks = dropPendingAsks()
         for ask in asks {
             await server.respond(to: ask.id, code: -32800, message: reason)
         }
@@ -836,12 +899,41 @@ final class CodexSession: ObservableObject, Identifiable {
         activity.endRunning(reason: "app-server died")
         activity.endReasoning()
         // nothing can answer these any more, and a card whose reply would go
-        // nowhere is worse than no card
-        openRequests.removeAll()
-        broker.abandon(sessionId: id)
-        if blockedOn != nil { blockedOn = nil }
+        // nowhere is worse than no card. There is no wire left to refuse them
+        // on, so the asks handed back are dropped rather than answered.
+        dropPendingAsks()
         if !activeFlags.isEmpty { activeFlags = [] }
         fail(reason: message)
+    }
+
+    /// Everything "codex is waiting on the owner" means, gone — in one place.
+    ///
+    /// Two paths reach this and they are the same operation: the tab letting go
+    /// of a thread, and app-server dying under it. Neither leaves anything that
+    /// could answer, so no card of any kind may survive, no queued question, and
+    /// no armed lapse that would write a notice about a session that has already
+    /// failed. `nonBlocking` goes with them: app-server numbers its requests out
+    /// of its own space and starts small, so a stale id left in that set would
+    /// make the next server's *blocking* question read as non-blocking.
+    ///
+    /// It is one function because this list has grown on every pass of this
+    /// effort, and every regression was the same shape — a lifecycle path that
+    /// forgot a line another path remembered.
+    ///
+    /// `openRequests` is emptied and handed back rather than left for the caller
+    /// to clear afterwards: a caller that still has a wire refuses what it gets,
+    /// and the removal happening *first* is what stops a resumed continuation
+    /// putting a second answer on that wire.
+    @discardableResult
+    private func dropPendingAsks() -> [CodexServerRequest] {
+        let asks = openRequests
+        openRequests.removeAll()
+        nonBlocking.removeAll()
+        questionQueue.removeAll()
+        clearCard()
+        broker.abandon(sessionId: id)
+        if blockedOn != nil { blockedOn = nil }
+        return asks
     }
 
     // MARK: - the semantic beat (what the ambient layer listens to)
@@ -1023,22 +1115,25 @@ final class CodexSession: ObservableObject, Identifiable {
 
     /// An unanswered approval never expires: phase 0 left one open and the
     /// thread simply parked in `activeFlags: ["waitingOnApproval"]`
-    /// indefinitely. bob owns that deadline, and until phase 2 draws the card
-    /// the least this can do is say so out loud rather than look hung —
-    /// `interrupt()` is the way back out.
+    /// indefinitely. bob owns that deadline, and the least this can do is say so
+    /// out loud rather than look hung — `interrupt()` is the way back out.
+    ///
+    /// A question is the mirror image of that and goes its own way below: it may
+    /// declare its own timeout, and its answer is a map rather than a decision.
     ///
     /// Built from the request and nothing else: `item/tool/requestUserInput`
     /// arrives with no accompanying item, so anything assembled here from
     /// `itemRows` would be empty exactly when it mattered.
     private func park(_ request: CodexServerRequest) {
         openRequests.append(request)
-        if blockedOn == nil { blockedOn = request }
+        guard request.method != CodexQuestion.method else { return askQuestion(request) }
+        refreshBlockedOn()
         guard let ask = CodexApproval.ask(request, sessionId: id, sessionName: config.name) else {
-            // no honest card to draw — `item/tool/requestUserInput` answers a
-            // map of question ids, which is phase 2's. Say so out loud, and say
-            // what the way out is, rather than parking in silence.
+            // a request kind bob has no button for at all — a future approval
+            // method, say. Say so out loud, and say what the way out is, rather
+            // than parking in silence.
             appendNotice("codex is waiting on \(Self.ask(for: request.method))"
-                       + " — bob can't answer that one yet; stop the turn to get out")
+                       + " — bob can't answer that one; stop the turn to get out")
             return
         }
         Task { [weak self] in
@@ -1063,8 +1158,19 @@ final class CodexSession: ObservableObject, Identifiable {
 
     private func settle(_ request: CodexServerRequest) {
         openRequests.removeAll { $0.id == request.id }
-        if blockedOn?.id == request.id { blockedOn = openRequests.first }
+        nonBlocking.remove(request.id)
+        forgetQuestion(request.id)
+        refreshBlockedOn()
         broker.withdraw(sessionId: id, requestId: CodexApproval.key(request.id))
+    }
+
+    /// The oldest request codex is actually waiting on. A non-blocking question
+    /// is answerable and withdrawable like any other, but it is not a park, so it
+    /// must never become `blockedOn` — everything reading that surface means
+    /// "this thread has stopped".
+    private func refreshBlockedOn() {
+        let next = openRequests.first { !nonBlocking.contains($0.id) }
+        if blockedOn?.id != next?.id { blockedOn = next }
     }
 
     /// `serverRequest/resolved` — somebody answered, and it may not have been
@@ -1081,10 +1187,150 @@ final class CodexSession: ObservableObject, Identifiable {
         let dead = openRequests.filter { $0.turnId == turnId }
         guard !dead.isEmpty else { return }
         openRequests.removeAll { $0.turnId == turnId }
-        if blockedOn?.turnId == turnId { blockedOn = openRequests.first }
+        // the card goes with the turn it belonged to — app-server has stopped
+        // waiting on it, so an answer sent from here would name a dead turn.
+        // Dropped as a set rather than one at a time, so a queue holding several
+        // of that turn's questions doesn't flicker each one onto the card on the
+        // way out.
+        let doomed = Set(dead.map(\.id))
+        let cardIsDead = questionQueue.first.map { doomed.contains($0.request.id) } ?? false
+        questionQueue.removeAll { doomed.contains($0.request.id) }
+        if cardIsDead { clearCard() }
         for request in dead {
+            nonBlocking.remove(request.id)
             broker.withdraw(sessionId: id, requestId: CodexApproval.key(request.id))
         }
+        refreshBlockedOn()
+        presentQuestion()
+    }
+
+    // MARK: - questions (#38 T2.2)
+
+    /// `item/tool/requestUserInput` — codex's own question, onto claude's
+    /// chooser.
+    ///
+    /// Defensive by construction, because this is the least stable thing bob
+    /// decodes: `EXPERIMENTAL` in 0.149.0's schema and emitted at all only behind
+    /// `--enable default_mode_request_user_input`. A payload that doesn't read
+    /// has to land as a line the owner can see — never a crash, and never a
+    /// thread parked in silence.
+    private func askQuestion(_ request: CodexServerRequest) {
+        let reading = CodexQuestion.read(request)
+        // filed before `refreshBlockedOn`, which is the whole difference between
+        // a park the rail should name and a question codex is not waiting on
+        if !reading.isBlocking { nonBlocking.insert(request.id) }
+        refreshBlockedOn()
+        switch reading.verdict {
+        case .cannotDraw(let why):
+            // the request stays open — codex may well still be waiting on it —
+            // but the owner is told what it wants and what the way out is
+            appendNotice(why + (reading.isBlocking
+                ? " — the turn is parked on it; stop the turn to get out"
+                : " — codex says it isn't waiting on one; stop the turn if it stalls anyway"))
+        case .ask(let asked):
+            questionQueue.append(PendingQuestion(request: request, asked: asked,
+                                                 autoResolutionMs: reading.autoResolutionMs,
+                                                 arrived: ContinuousClock().now))
+            presentQuestion()
+        }
+    }
+
+    /// Put the oldest undrawn question on the card. One at a time: the chooser is
+    /// a single card, and swapping it out from under a half-made choice is worse
+    /// than making the second question wait its turn.
+    ///
+    /// A question whose own window ran out while it waited behind another is
+    /// never drawn at all. It is already past the deadline it declared, and a
+    /// card that appears already dead is worse than one that never appeared —
+    /// but the owner still gets the line, because a question that quietly
+    /// vanished is exactly what this path exists to prevent.
+    private func presentQuestion() {
+        while question == nil, let head = questionQueue.first {
+            if let left = head.remaining, left <= .zero {
+                questionQueue.removeFirst()
+                lapseNotice(head)
+                continue
+            }
+            question = head.asked
+            armLapse(head)
+        }
+    }
+
+    /// The request's own deadline, if it declared one.
+    ///
+    /// bob does **not** answer when it lapses: it has no answer to give, and
+    /// inventing one is the single thing a chooser must never do. What it does is
+    /// take the card down and say so — a card still on screen past the window the
+    /// request itself declared is a card claiming to be live when it isn't. The
+    /// exact mirror of an approval, which declares no window and never expires.
+    /// `autoResolutionMs` is marked `@deprecated` in the pinned schema ("use
+    /// `isBlocking`") and was null in every live sample, so this lane exists and
+    /// is not expected to carry traffic.
+    private func armLapse(_ pending: PendingQuestion) {
+        questionLapse?.cancel()
+        questionLapse = nil
+        // whatever is left of the window it declared on arrival, never a fresh
+        // copy of it — `PendingQuestion.remaining` is where that is measured
+        guard let left = pending.remaining, left > .zero else { return }
+        questionLapse = Task { [weak self] in
+            try? await Task.sleep(for: left)
+            guard !Task.isCancelled else { return }
+            self?.lapse(pending.request.id)
+        }
+    }
+
+    private func lapse(_ requestId: CodexRequestId) {
+        guard let head = questionQueue.first, head.request.id == requestId else { return }
+        questionQueue.removeFirst()
+        clearCard()
+        lapseNotice(head)
+        presentQuestion()
+    }
+
+    /// The line the owner reads when a question's own window ran out. Shared by
+    /// both ways that happens — on the card, and while queued behind another —
+    /// because they are the same sentence, and the second one is the easier to
+    /// forget.
+    private func lapseNotice(_ pending: PendingQuestion) {
+        let ms = pending.autoResolutionMs ?? 0
+        appendNotice("codex's question lapsed — its own \(ms)ms window ran out and bob sent no answer"
+                   + (nonBlocking.contains(pending.request.id)
+                        ? "; codex says it isn't waiting on one — stop the turn if it stalls anyway"
+                        : "; the turn is still parked on it — stop the turn to get out"))
+    }
+
+    /// Answer the question on the card, then move to the next one.
+    ///
+    /// The request leaves `openRequests` **before** the reply is awaited, which is
+    /// the same rule the approval path proves by membership: a close or a turn
+    /// death landing in that window must not put a second answer on the wire for
+    /// one id.
+    private func finishQuestion(_ pending: PendingQuestion, result: [String: Any]) {
+        let request = pending.request
+        questionQueue.removeFirst()
+        clearCard()
+        settle(request)
+        Task { [weak self] in await self?.server.respond(to: request.id, result: result) }
+        presentQuestion()
+    }
+
+    /// Take a question off the card and out of the queue, if this request is the
+    /// one it belongs to. Keyed by id rather than by position, because a question
+    /// can be settled from four directions — answered here, answered by another
+    /// client attached to the same thread, its turn died, the tab closed — and
+    /// only one of those knows where in the queue it sat.
+    private func forgetQuestion(_ requestId: CodexRequestId) {
+        let wasOnCard = questionQueue.first?.request.id == requestId
+        questionQueue.removeAll { $0.request.id == requestId }
+        guard wasOnCard else { return }
+        clearCard()
+        presentQuestion()
+    }
+
+    private func clearCard() {
+        questionLapse?.cancel()
+        questionLapse = nil
+        if question != nil { question = nil }
     }
 
     private static func ask(for method: String) -> String {
@@ -1092,7 +1338,6 @@ final class CodexSession: ObservableObject, Identifiable {
         case "item/commandExecution/requestApproval": return "permission to run a command"
         case "item/fileChange/requestApproval": return "permission to change files"
         case "item/permissions/requestApproval": return "a permission change"
-        case "item/tool/requestUserInput": return "an answer"
         default: return method
         }
     }
