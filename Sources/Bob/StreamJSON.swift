@@ -99,7 +99,7 @@ enum StreamEvent: Equatable, Sendable {
     /// `rate_limit_event` — the CLI's own read on the subscription block.
     /// Session metadata, not transcript: it says nothing about the conversation
     /// and only ever moves the global meter.
-    case rateLimit(type: String?, resetsAt: Date?, isUsingOverage: Bool)
+    case rateLimit(RateLimitInfo)
     /// hooks, thinking meters, unknown shapes. `forensic` is non-nil only when
     /// the line didn't decode at all — callers log those.
     case ignored(forensic: String?)
@@ -120,6 +120,27 @@ enum StreamEvent: Equatable, Sendable {
         /// live-activity row, built by TranscriptParser's shared vocabulary.
         case toolUse(name: String, activity: String)
     }
+}
+
+/// `rate_limit_info` off a `rate_limit_event` — the whole global statusline in
+/// one line, once a turn, unasked.
+///
+/// `type`/`resetsAt` name one window; the four below come from `unifiedWindows`,
+/// which names both. They are optional because `unifiedWindows` is **absent from
+/// the published SDK types** — the wire runs ahead of the `.d.ts` — so a shape
+/// change costs the percentages and nothing else, and `hasPercentages` is what
+/// the meter reads to decide it needs the HTTP endpoint after all.
+struct RateLimitInfo: Equatable, Sendable {
+    var type: String?
+    var resetsAt: Date?
+    var isUsingOverage = false
+    /// Percentages, not the wire's fractions — see `StreamJSON.percent`.
+    var fiveHourPct: Double?
+    var fiveHourResetsAt: Date?
+    var weekPct: Double?
+    var weekResetsAt: Date?
+
+    var hasPercentages: Bool { fiveHourPct != nil || weekPct != nil }
 }
 
 /// The token counts riding one assistant message. `contextInUse` is what the
@@ -146,6 +167,20 @@ struct TurnResult: Equatable, Sendable {
     var durationMs: Int?
     var costUSD: Double?
     var deniedTools: [String] = []
+    /// `modelUsage[<resolved id>].contextWindow` — the context meter's
+    /// denominator, reported rather than guessed. Keyed by resolved id
+    /// (`claude-sonnet-5[1m]`), the same string `system/init` names, so the
+    /// lookup below is normally an exact hit.
+    var contextWindows: [String: Int] = [:]
+
+    /// The window this turn reported for `model`. nil means the turn named none
+    /// bob can attribute, and the caller's fallback stands.
+    func contextWindow(for model: String?) -> Int? {
+        if let model, let window = contextWindows[model] { return window }
+        // a subagent on another tier is the only way one turn reports two
+        // windows — with one entry there is nothing to disambiguate
+        return contextWindows.count == 1 ? contextWindows.values.first : nil
+    }
 }
 
 // MARK: - decoding
@@ -298,19 +333,45 @@ enum StreamJSON {
     }
 
     /// `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
-    /// "resetsAt":1787104800,"rateLimitType":"five_hour",
-    /// "isUsingOverage":false}}` — camelCase and a unix stamp here, snake_case
-    /// and ISO-8601 on the HTTP endpoint. The CLI's two mouths don't agree, so
-    /// both shapes get their own reader.
+    /// "resetsAt":1787950200,"rateLimitType":"five_hour",
+    /// "isUsingOverage":false,"unifiedWindows":{
+    ///   "five_hour":{"utilization":0.26,"resetsAt":1787950200},
+    ///   "seven_day":{"utilization":0.24,"resetsAt":1788382800}}}}
+    /// — captured live. camelCase and unix stamps here, snake_case and ISO-8601
+    /// on the HTTP endpoint. The CLI's two mouths don't agree, so both shapes get
+    /// their own reader.
     private static func rateLimit(_ obj: [String: Any]) -> StreamEvent {
         guard let info = obj["rate_limit_info"] as? [String: Any] else {
             return .ignored(forensic: nil)
         }
-        return .rateLimit(
-            type: info["rateLimitType"] as? String,
-            resetsAt: (info["resetsAt"] as? Double).map { Date(timeIntervalSince1970: $0) },
-            isUsingOverage: (info["isUsingOverage"] as? Bool) ?? false
-        )
+        var out = RateLimitInfo()
+        out.type = info["rateLimitType"] as? String
+        out.resetsAt = unix(info["resetsAt"])
+        out.isUsingOverage = (info["isUsingOverage"] as? Bool) ?? false
+        let unified = info["unifiedWindows"] as? [String: Any] ?? [:]
+        if let five = unified["five_hour"] as? [String: Any] {
+            out.fiveHourPct = percent(five["utilization"])
+            out.fiveHourResetsAt = unix(five["resetsAt"])
+        }
+        if let week = unified["seven_day"] as? [String: Any] {
+            out.weekPct = percent(week["utilization"])
+            out.weekResetsAt = unix(week["resetsAt"])
+        }
+        return .rateLimit(out)
+    }
+
+    /// The one place the two mouths are reconciled: `utilization` is a
+    /// **fraction** on the wire (0.26) and a **percentage** on the HTTP endpoint
+    /// (26.0). One multiply, here, because a strip reading `0%` or `2600%` is
+    /// exactly the bug this asymmetry invites. Clamped, so a future wire that
+    /// switched units can't paint a number outside the ramp.
+    static func percent(_ raw: Any?) -> Double? {
+        guard let fraction = raw as? Double else { return nil }
+        return min(100, max(0, fraction * 100))
+    }
+
+    private static func unix(_ raw: Any?) -> Date? {
+        (raw as? Double).map { Date(timeIntervalSince1970: $0) }
     }
 
     private static func user(_ obj: [String: Any]) -> StreamEvent {
@@ -340,6 +401,8 @@ enum StreamJSON {
         r.costUSD = obj["total_cost_usd"] as? Double
         r.deniedTools = ((obj["permission_denials"] as? [[String: Any]]) ?? [])
             .compactMap { $0["tool_name"] as? String }
+        r.contextWindows = ((obj["modelUsage"] as? [String: [String: Any]]) ?? [:])
+            .compactMapValues { ($0["contextWindow"] as? Int).flatMap { $0 > 0 ? $0 : nil } }
         return .result(r)
     }
 

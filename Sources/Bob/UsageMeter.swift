@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 import SwiftUI
 
@@ -9,11 +8,15 @@ import SwiftUI
 /// exactly one place in the window that shows it. A copy per session would be
 /// four copies of the same truth, drifting.
 ///
-/// The source is the same OAuth usage endpoint the CLI's own statusline reads.
-/// bob borrows the CLI's token to ask; it never refreshes it, never stores it,
-/// never logs it. A 401 means the CLI has rotated it since — so the answer is to
-/// say nothing and re-read the credentials next cycle, not to hold a stale number
-/// on screen.
+/// **The wire is the source.** Every turn's `rate_limit_event` carries
+/// `rate_limit_info.unifiedWindows` — both utilizations, both reset instants,
+/// unasked.
+///
+/// The OAuth usage endpoint survives as the stand-in for the one case the wire
+/// cannot cover: no turn has happened yet. It is asked at most once per run,
+/// after a grace period, and never once the wire has spoken — which is the whole
+/// reason first launch no longer opens with a keychain prompt. When it is asked,
+/// bob borrows the CLI's token and never refreshes, stores or logs it.
 @MainActor
 final class UsageMeter: ObservableObject {
     static let shared = UsageMeter()
@@ -29,7 +32,7 @@ final class UsageMeter: ObservableObject {
         var weekPct: Double?
         var weekResetsAt: Date?
         /// The wire's own flag — the endpoint doesn't carry it, so it survives a
-        /// poll and only a later `rate_limit_event` clears it.
+        /// fetch and only a later `rate_limit_event` clears it.
         var isUsingOverage = false
 
         /// Nothing worth drawing. The strip hides itself rather than showing
@@ -40,61 +43,46 @@ final class UsageMeter: ObservableObject {
 
     @Published private(set) var limits = RateLimits()
 
-    /// Ten minutes. The five-hour block moves ~0.3% a minute at full tilt, so a
-    /// tighter loop would spend main-actor publishes to move a rounded integer
-    /// that hadn't changed. Activation and the wire event cover the rest.
-    private static let pollInterval: UInt64 = 10 * 60 * 1_000_000_000
-    /// A wire event says the numbers just moved, but the CLI emits one per turn
-    /// on a busy afternoon — so a nudge is worth at most one extra fetch a
-    /// minute. Anything less is a poll wearing an event's clothes.
-    private static let nudgeFloor: TimeInterval = 60
+    /// Which source filled the percentages, named rather than left to be
+    /// inferred. `.wire` is terminal for the life of the process. Not
+    /// `@Published` — nothing draws it.
+    enum Source: Equatable { case nothingYet, wire, endpoint }
 
-    private var poller: Task<Void, Never>?
-    private var activationObserver: NSObjectProtocol?
-    /// One request at a time — activation and the loop can land together, and
-    /// two fetches would only race to publish the same snapshot.
-    private var fetching = false
-    /// A trigger that arrived while `fetching` was true. The in-flight request
-    /// may predate whatever it was telling us about, so it owes one more pass.
-    private var pendingRefresh = false
-    private var lastNudge: Date = .distantPast
+    private(set) var source: Source = .nothingYet
+
+    /// How long the wire gets before bob resorts to asking. Long enough that any
+    /// real use of bob — one turn, in any session — arrives first and cancels the
+    /// shot, and short enough that a window left open untouched still fills in.
+    /// One sleeper, fired once, never a loop.
+    private static let wireGrace: UInt64 = 90 * 1_000_000_000
+
+    private var endpointFallback: Task<Void, Never>?
+    /// The endpoint has been asked. One attempt per process — see `refresh()`.
+    private var endpointAsked = false
 
     private init() {
-        // Coming back to bob is when you look at the numbers, so that's when
-        // they're worth re-reading — a window that's been hidden for an hour
-        // shows an hour-old block otherwise.
-        activationObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in await self?.refresh() }
-        }
-
-        poller = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refresh()
-                try? await Task.sleep(nanoseconds: Self.pollInterval)
-            }
+        endpointFallback = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.wireGrace)
+            guard !Task.isCancelled else { return }
+            await self?.refresh()
         }
     }
 
     deinit {
-        if let activationObserver {
-            NotificationCenter.default.removeObserver(activationObserver)
-        }
-        poller?.cancel()
+        endpointFallback?.cancel()
     }
 
-    /// A `rate_limit_event` came off a session's stdout. It carries the reset
-    /// instant and the overage flag first-hand, so those land immediately; the
-    /// percentages still have to come from the endpoint, and that fetch is
-    /// coalesced so a chatty afternoon can't turn this into a poll.
-    func nudge(type: String?, resetsAt: Date?, isUsingOverage: Bool) {
+    /// A `rate_limit_event` came off a session's stdout with the whole strip on
+    /// it. No I/O here — this is arithmetic and one guarded publish.
+    ///
+    /// `unifiedWindows` is absent from the published SDK types, so a line without
+    /// it is an ordinary outcome, not an error: it means the endpoint is wanted
+    /// after all, and sooner than the grace would have allowed.
+    func apply(_ info: RateLimitInfo) {
         var next = limits
-        next.isUsingOverage = isUsingOverage
-        if let resetsAt {
-            switch type {
+        next.isUsingOverage = info.isUsingOverage
+        if let resetsAt = info.resetsAt {
+            switch info.type {
             case "five_hour", "session", .none:
                 next.fiveHourResetsAt = resetsAt
             case "seven_day", "weekly", "weekly_all":
@@ -103,11 +91,24 @@ final class UsageMeter: ObservableObject {
                 break                       // a window bob doesn't show
             }
         }
+        // written after the switch, because the unified block names both windows
+        // explicitly and so outranks the one `rateLimitType` picked — including
+        // for the week's countdown, which the old shape supplied one turn in many
+        if let pct = info.fiveHourPct { next.fiveHourPct = pct }
+        if let at = info.fiveHourResetsAt { next.fiveHourResetsAt = at }
+        if let pct = info.weekPct { next.weekPct = pct }
+        if let at = info.weekResetsAt { next.weekResetsAt = at }
         if next != limits { limits = next }
 
-        let now = Date()
-        guard now.timeIntervalSince(lastNudge) >= Self.nudgeFloor else { return }
-        lastNudge = now
+        guard !info.hasPercentages else {
+            // first-hand numbers. The endpoint has nothing left to add for the
+            // life of this process, so the pending shot is cancelled outright
+            // rather than left to fire and read a credential for nothing.
+            source = .wire
+            endpointFallback?.cancel()
+            endpointFallback = nil
+            return
+        }
         Task { await refresh() }
     }
 
@@ -115,41 +116,30 @@ final class UsageMeter: ObservableObject {
     /// request, the JSON — happens off the main actor in `fetch()`; what crosses
     /// back is one ==-guarded publish.
     ///
-    /// Single-flight, but never at the cost of dropping a trigger: a request
-    /// already in the air may have LEFT before whatever moved the numbers, so
-    /// its answer cannot be allowed to stand as the last word. A trigger that
-    /// lands mid-flight is remembered and runs one more pass the moment this one
-    /// finishes — sequentially, so there are still never two requests out at
-    /// once. Without this, a nudge arriving during a fetch spent its 60s
-    /// allowance on a reply that predated the change, and the strip stayed stale
-    /// until the ten-minute poll.
+    /// Two guards, and they are the whole design. **Never once the wire has
+    /// spoken**, which is why a bob you talk to reads no credential at all; and
+    /// **once per process**, which is why one you never talk to reads it exactly
+    /// once instead of on a clock. Between them there is nothing to serialise, so
+    /// the single-flight bookkeeping this used to carry went out with the poll.
     func refresh() async {
-        guard !fetching else {
-            pendingRefresh = true
-            return
-        }
-        fetching = true
-        defer { fetching = false }
-        repeat {
-            // cleared before the pass, not after: a trigger arriving *during*
-            // the pass has to earn another one
-            pendingRefresh = false
-            await fetchOnce()
-        } while pendingRefresh
-    }
-
-    private func fetchOnce() async {
-        guard var fetched = await Self.fetch() else {
+        guard source != .wire, !endpointAsked else { return }
+        endpointAsked = true
+        let answer = await Self.fetch()
+        // a turn may have landed while the request was in the air, and a
+        // first-hand number outranks a fetched one however it arrived
+        guard source != .wire else { return }
+        guard var fetched = answer else {
             // no credential, offline, or a token the CLI has since rotated.
             // Empty, not stale: a percentage bob can't vouch for is worse than
-            // no percentage. The next cycle re-reads the credential fresh.
+            // no percentage, and the next turn will say it firsthand anyway.
             if !limits.isEmpty { limits = RateLimits() }
             return
         }
         // the endpoint has no overage field — that fact only ever arrives on the
-        // wire, so a poll must not erase it
+        // wire, so a fetch must not erase it
         fetched.isUsingOverage = limits.isUsingOverage
         if fetched != limits { limits = fetched }
+        source = .endpoint
     }
 
     // MARK: - off the main actor
@@ -173,11 +163,16 @@ final class UsageMeter: ObservableObject {
     }
 
     /// `{"five_hour":{"utilization":44.0,"resets_at":"…"},"seven_day":{…}, …}` —
-    /// verified live. Every other key in that payload (dollar caps, per-model
-    /// scopes, promotional windows) is deliberately ignored: the strip is two
-    /// numbers and a countdown, and a field bob doesn't draw is a field that
-    /// can't break it.
-    private nonisolated static func parse(_ obj: [String: Any]) -> RateLimits? {
+    /// verified live. Note `utilization` here is already a **percentage** (44.0),
+    /// where the wire's is a fraction (0.44) — the wire's is converted at decode
+    /// so both arrive in the same units. Every other key in that payload (dollar
+    /// caps, per-model scopes, promotional windows) is deliberately ignored: the
+    /// strip is two numbers and a countdown, and a field bob doesn't draw is a
+    /// field that can't break it.
+    ///
+    /// Internal, not private, so a harness can hold the two mouths side by side
+    /// and assert they land on the same drawn number.
+    nonisolated static func parse(_ obj: [String: Any]) -> RateLimits? {
         var out = RateLimits()
         if let five = obj["five_hour"] as? [String: Any] {
             out.fiveHourPct = five["utilization"] as? Double
@@ -375,53 +370,33 @@ final class CodexMeter: ObservableObject {
 
 // MARK: - context windows
 
-/// How much context a model has to spend. bob shows a percentage, and a
-/// percentage of the wrong denominator is worse than no percentage — so the
-/// denominator lives here and nowhere else. Every tier is 200k today; the table
-/// exists so that when one of them isn't, exactly one number changes.
+/// The tier word a model id reduces to, and the one number to divide by when
+/// nothing else is available.
 ///
-/// Measured rather than guessed: on this account both fable and opus sessions
-/// hold more than 200k (fable threads at 426k and ~440k; an opus thread past
-/// 200k the same day), which only a 1M window allows. The CLI never names the
-/// window on the wire (ids arrive as `claude-opus-5` or a bare alias, no
-/// `[1m]` marker), so those rows say 1M outright, and `publishContextUse`
-/// ratchets any session that outgrows its assumed window. A hypothetical
-/// 200k session on these tiers reads low — the honest direction to be wrong in.
+/// This used to hold a per-model window table, a `[1m]` sniffer and a ratchet,
+/// because the denominator was believed to be unavailable. It is reported: every
+/// `result` carries `modelUsage[<id>].contextWindow` (200000 for haiku, 1000000
+/// for `claude-sonnet-5[1m]` — both captured live), and the session takes it from
+/// there. The `result` that supplies the window is the same event that computes
+/// the percentage, so what is left here covers only a turn that reported no
+/// window at all — which is why it is one number rather than a table, and why it
+/// no longer claims to know anything about any tier.
 enum ContextWindow {
     static let fallback = 200_000
 
-    /// Ordered, not a dictionary: a model id containing two tier words must
-    /// resolve the same way every time.
-    private static let tiers: [(name: String, window: Int)] = [
-        ("opus", 1_000_000),
-        ("sonnet", 200_000),
-        ("haiku", 200_000),
-        ("fable", 1_000_000),
-    ]
+    /// Ordered, not a set: a model id containing two tier words must resolve the
+    /// same way every time.
+    private static let tiers = ["opus", "sonnet", "haiku", "fable"]
 
-    /// The suffix a long-context variant carries when the id has one at all —
-    /// `claude-opus-5[1m]`. Checked separately from the tier table because it
-    /// changes the window without changing the word the caption shows.
-    private static let longContextMarker = "[1m]"
-
-    /// Model names reach bob two ways — the dial hands over a bare alias
-    /// (`opus`), the CLI's init line hands over a resolved id
-    /// (`claude-opus-5`, `claude-haiku-4-5-20251001`). Match on the tier word
-    /// and both work.
-    private static func tier(for model: String?) -> (name: String, window: Int)? {
+    /// "opus" out of "claude-opus-5" — what the caption says. Model names reach
+    /// bob two ways, the dial's bare alias (`opus`) and the CLI's resolved id
+    /// (`claude-haiku-4-5-20251001`); matching on the tier word handles both. nil
+    /// for a model bob has no word for, so the caption shows the context number
+    /// alone rather than a dated id nobody reads.
+    static func shortName(for model: String?) -> String? {
         guard let model = model?.lowercased(), !model.isEmpty else { return nil }
-        return tiers.first { model.contains($0.name) }
+        return tiers.first { model.contains($0) }
     }
-
-    static func size(for model: String?) -> Int {
-        if let model, model.lowercased().contains(longContextMarker) { return 1_000_000 }
-        return tier(for: model)?.window ?? fallback
-    }
-
-    /// "opus" out of "claude-opus-5" — what the caption says. nil for a model bob
-    /// has no word for, so the caption shows the context number alone rather than
-    /// a dated id nobody reads.
-    static func shortName(for model: String?) -> String? { tier(for: model)?.name }
 }
 
 // MARK: - the tinted percentage
@@ -552,10 +527,10 @@ struct RateLimitStrip: View {
 /// usage: a context meter reading 0% before you've said anything is noise, and a
 /// model name with nothing beside it isn't worth the line.
 ///
-/// Provider-agnostic by construction. Claude's percentage divides by a table of
-/// model windows and ratchets; codex's arrives exact, because
-/// `thread/tokenUsage/updated` carries `modelContextWindow` with the counts —
-/// same caption, one fewer guess behind it.
+/// Provider-agnostic by construction, and now symmetrical behind the glass:
+/// codex reports `modelContextWindow` on `thread/tokenUsage/updated`, claude
+/// reports `modelUsage[<id>].contextWindow` on `result`. Both denominators are
+/// the provider's own number; neither is a table.
 struct SessionMeterCaption<S: StageSession>: View {
     @ObservedObject var session: S
 
