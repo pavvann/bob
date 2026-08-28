@@ -527,7 +527,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
                 }
             }
         }
-        let pump = StreamPump(session: self)
+        let pump = StreamPump<StreamEvent>.claude(session: self)
         let name = config.name
         let sink = stderrSink
         let reader = Task.detached(priority: .userInitiated) {
