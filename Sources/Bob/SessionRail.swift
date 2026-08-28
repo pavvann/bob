@@ -235,16 +235,36 @@ struct AgentRows: View {
 /// the card states the question, lists the options with their reasons, and keeps
 /// a way out — declining hands the choice back rather than leaving the session
 /// hanging on a person who walked away.
+///
+/// One card, both providers (#38 T2.2). Codex's `item/tool/requestUserInput`
+/// arrives down a different channel and answers a different shape, but it is the
+/// same question — which one — so it gets this card rather than a second
+/// overlay. The only thing the provider changes here is the word at the top.
+/// It takes plain data and two closures precisely so that stays true.
 struct QuestionChooser: View {
     let asked: SessionQuestion
+    let provider: SessionProvider
     let onAnswer: ([String: [String]]) -> Void
     let onDecline: () -> Void
 
     @State private var picked: [String: [String]] = [:]
 
+    /// Spelled out rather than synthesized: the memberwise init a `@State`
+    /// property makes is private to this file, and codex's rail mounts this
+    /// card from its own.
+    init(asked: SessionQuestion,
+         provider: SessionProvider = .claude,
+         onAnswer: @escaping ([String: [String]]) -> Void,
+         onDecline: @escaping () -> Void) {
+        self.asked = asked
+        self.provider = provider
+        self.onAnswer = onAnswer
+        self.onDecline = onDecline
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("claude asks")
+            Text("\(provider.rawValue) asks")
                 .font(.system(size: 10.5, weight: .medium, design: .rounded))
                 .foregroundStyle(Color.orange.opacity(0.7))
             ForEach(asked.questions) { ask in
@@ -311,7 +331,16 @@ struct QuestionChooser: View {
                 .background { Capsule().fill(.white.opacity(0.06)) }
         }
         .buttonStyle(.plain)
-        .help("let claude decide, and say what it chose")
+        .help(declineHint)
+    }
+
+    /// Same gesture, two protocols. Claude's decline carries a message asking it
+    /// to say what it went with; codex's answer map has nowhere to put words, so
+    /// its version promises less.
+    private var declineHint: String {
+        provider == .codex
+            ? "send no answer — codex picks for itself"
+            : "let claude decide, and say what it chose"
     }
 
     private var showsSend: Bool {
@@ -321,12 +350,12 @@ struct QuestionChooser: View {
     private var ready: Bool { asked.isComplete(picked) }
 
     private func optionRow(ask: SessionQuestion.Ask, option: SessionQuestion.Ask.Option) -> some View {
-        let chosen = (picked[ask.question] ?? []).contains(option.label)
+        let chosen = (picked[ask.key] ?? []).contains(option.label)
         return Button {
             toggle(ask: ask, label: option.label)
             // the common case — one question, one pick — shouldn't need a second
             // click to mean what it obviously means
-            if !showsSend { onAnswer([ask.question: [option.label]]) }
+            if !showsSend { onAnswer([ask.key: [option.label]]) }
         } label: {
             VStack(alignment: .leading, spacing: 1) {
                 Text(option.label)
@@ -358,12 +387,12 @@ struct QuestionChooser: View {
     }
 
     private func toggle(ask: SessionQuestion.Ask, label: String) {
-        var current = picked[ask.question] ?? []
+        var current = picked[ask.key] ?? []
         if ask.multiSelect {
             if let index = current.firstIndex(of: label) { current.remove(at: index) } else { current.append(label) }
         } else {
             current = [label]
         }
-        picked[ask.question] = current
+        picked[ask.key] = current
     }
 }

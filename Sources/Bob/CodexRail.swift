@@ -5,9 +5,10 @@ import SwiftUI
 ///
 /// Claude's rail shows the question chooser and the agents this conversation set
 /// running; codex reports its work as typed items instead, so this shows those
-/// (#38 T2.3) and, above them, what the model is thinking (#38 T2.4). Same
-/// width, same card chrome, same quiet tone: it is one gutter with two
-/// providers, not two gutters.
+/// (#38 T2.3) and, above them, what the model is thinking (#38 T2.4). The
+/// chooser is shared outright (#38 T2.2) — same card, same position in the
+/// column, same keyboard behaviour. Same width, same card chrome, same quiet
+/// tone: it is one gutter with two providers, not two gutters.
 struct CodexRail: View {
     @ObservedObject var session: CodexSession
     @ObservedObject private var git = GitStatus.shared
@@ -16,6 +17,21 @@ struct CodexRail: View {
         VStack(alignment: .leading, spacing: 10) {
             if let branch = git.branch(for: session.config.cwd) {
                 BranchChip(branch: branch, path: tidyPath)
+            }
+            // claude's card, verbatim — `item/tool/requestUserInput` asks the
+            // same thing down a different channel, and the answer's shape is the
+            // session's business rather than the card's
+            if let asked = session.question {
+                QuestionChooser(asked: asked,
+                                provider: .codex,
+                                onAnswer: { session.answerQuestion($0) },
+                                onDecline: { session.declineQuestion() })
+                    // a fresh identity per question, so the half-made picks
+                    // inside the card die with the question they were for: codex
+                    // can queue a second request behind the first, and two of
+                    // them can reuse a question id
+                    .id(asked.id)
+                    .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
             }
             // absent entirely when the model emits no reasoning, which most do
             // not — a "thinking" row with nothing behind it is a placeholder
@@ -30,6 +46,8 @@ struct CodexRail: View {
         }
         .frame(width: SessionRail.width, alignment: .leading)
         .frame(maxHeight: .infinity, alignment: .center)
+        // the same spring claude's rail gives the same card
+        .animation(.spring(response: 0.32, dampingFraction: 0.84), value: session.question?.id)
         // keyed on counts, not on the rows themselves: a row's output grows
         // sixty times a second and none of that is a layout change
         .animation(.easeInOut(duration: 0.18), value: session.activity.rows.count)

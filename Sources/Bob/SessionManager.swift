@@ -570,6 +570,10 @@ final class SessionManager: ObservableObject {
         if case .failed = session.state { return .error }
         if UIPermissionBroker.shared.count(for: session.id) > 0 { return .awaitingInput }
         if !session.activeFlags.isEmpty { return .awaitingInput }
+        // a question codex is *blocking* on. `blockedOn` excludes the
+        // non-blocking kind by construction, which is what keeps a question
+        // codex isn't waiting for from reading as a stopped thread.
+        if session.blockedOn != nil { return .awaitingInput }
         switch session.state {
         case .turnActive, .interrupting, .spawning: return .working
         default: break
