@@ -184,7 +184,21 @@ final class CodexSession: ObservableObject, Identifiable {
     private struct PendingQuestion {
         let request: CodexServerRequest
         let asked: SessionQuestion
+        /// The request's own `autoResolutionMs`, when it declared one.
         let autoResolutionMs: Int?
+        /// When the request LANDED — not when its card went up.
+        let arrived: ContinuousClock.Instant
+
+        /// What is left of the declared window, nil when none was declared.
+        ///
+        /// Measured from arrival, so time a question spends queued behind
+        /// another comes off its window instead of being added to it. A card
+        /// answerable past the deadline it declared is the same "looks live but
+        /// isn't" state the lapse exists to prevent.
+        var remaining: Duration? {
+            guard let ms = autoResolutionMs else { return nil }
+            return .milliseconds(ms) - arrived.duration(to: ContinuousClock().now)
+        }
     }
 
     private var queue: [Outbound] = []
@@ -401,13 +415,7 @@ final class CodexSession: ObservableObject, Identifiable {
         // typed for the conversation this tab is walking away from
         queue.removeAll()
         pendingUserRows.removeAll()
-        let asks = openRequests
-        openRequests.removeAll()
-        nonBlocking.removeAll()
-        questionQueue.removeAll()
-        clearCard()
-        broker.abandon(sessionId: id)
-        if blockedOn != nil { blockedOn = nil }
+        let asks = dropPendingAsks()
         for ask in asks {
             await server.respond(to: ask.id, code: -32800, message: reason)
         }
@@ -891,12 +899,41 @@ final class CodexSession: ObservableObject, Identifiable {
         activity.endRunning(reason: "app-server died")
         activity.endReasoning()
         // nothing can answer these any more, and a card whose reply would go
-        // nowhere is worse than no card
-        openRequests.removeAll()
-        broker.abandon(sessionId: id)
-        if blockedOn != nil { blockedOn = nil }
+        // nowhere is worse than no card. There is no wire left to refuse them
+        // on, so the asks handed back are dropped rather than answered.
+        dropPendingAsks()
         if !activeFlags.isEmpty { activeFlags = [] }
         fail(reason: message)
+    }
+
+    /// Everything "codex is waiting on the owner" means, gone — in one place.
+    ///
+    /// Two paths reach this and they are the same operation: the tab letting go
+    /// of a thread, and app-server dying under it. Neither leaves anything that
+    /// could answer, so no card of any kind may survive, no queued question, and
+    /// no armed lapse that would write a notice about a session that has already
+    /// failed. `nonBlocking` goes with them: app-server numbers its requests out
+    /// of its own space and starts small, so a stale id left in that set would
+    /// make the next server's *blocking* question read as non-blocking.
+    ///
+    /// It is one function because this list has grown on every pass of this
+    /// effort, and every regression was the same shape — a lifecycle path that
+    /// forgot a line another path remembered.
+    ///
+    /// `openRequests` is emptied and handed back rather than left for the caller
+    /// to clear afterwards: a caller that still has a wire refuses what it gets,
+    /// and the removal happening *first* is what stops a resumed continuation
+    /// putting a second answer on that wire.
+    @discardableResult
+    private func dropPendingAsks() -> [CodexServerRequest] {
+        let asks = openRequests
+        openRequests.removeAll()
+        nonBlocking.removeAll()
+        questionQueue.removeAll()
+        clearCard()
+        broker.abandon(sessionId: id)
+        if blockedOn != nil { blockedOn = nil }
+        return asks
     }
 
     // MARK: - the semantic beat (what the ambient layer listens to)
@@ -1192,7 +1229,8 @@ final class CodexSession: ObservableObject, Identifiable {
                 : " — codex says it isn't waiting on one; stop the turn if it stalls anyway"))
         case .ask(let asked):
             questionQueue.append(PendingQuestion(request: request, asked: asked,
-                                                 autoResolutionMs: reading.autoResolutionMs))
+                                                 autoResolutionMs: reading.autoResolutionMs,
+                                                 arrived: ContinuousClock().now))
             presentQuestion()
         }
     }
@@ -1200,10 +1238,22 @@ final class CodexSession: ObservableObject, Identifiable {
     /// Put the oldest undrawn question on the card. One at a time: the chooser is
     /// a single card, and swapping it out from under a half-made choice is worse
     /// than making the second question wait its turn.
+    ///
+    /// A question whose own window ran out while it waited behind another is
+    /// never drawn at all. It is already past the deadline it declared, and a
+    /// card that appears already dead is worse than one that never appeared —
+    /// but the owner still gets the line, because a question that quietly
+    /// vanished is exactly what this path exists to prevent.
     private func presentQuestion() {
-        guard question == nil, let head = questionQueue.first else { return }
-        question = head.asked
-        armLapse(head)
+        while question == nil, let head = questionQueue.first {
+            if let left = head.remaining, left <= .zero {
+                questionQueue.removeFirst()
+                lapseNotice(head)
+                continue
+            }
+            question = head.asked
+            armLapse(head)
+        }
     }
 
     /// The request's own deadline, if it declared one.
@@ -1219,23 +1269,34 @@ final class CodexSession: ObservableObject, Identifiable {
     private func armLapse(_ pending: PendingQuestion) {
         questionLapse?.cancel()
         questionLapse = nil
-        guard let ms = pending.autoResolutionMs else { return }
+        // whatever is left of the window it declared on arrival, never a fresh
+        // copy of it — `PendingQuestion.remaining` is where that is measured
+        guard let left = pending.remaining, left > .zero else { return }
         questionLapse = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(ms))
+            try? await Task.sleep(for: left)
             guard !Task.isCancelled else { return }
-            self?.lapse(pending.request.id, after: ms)
+            self?.lapse(pending.request.id)
         }
     }
 
-    private func lapse(_ requestId: CodexRequestId, after ms: Int) {
+    private func lapse(_ requestId: CodexRequestId) {
         guard let head = questionQueue.first, head.request.id == requestId else { return }
         questionQueue.removeFirst()
         clearCard()
+        lapseNotice(head)
+        presentQuestion()
+    }
+
+    /// The line the owner reads when a question's own window ran out. Shared by
+    /// both ways that happens — on the card, and while queued behind another —
+    /// because they are the same sentence, and the second one is the easier to
+    /// forget.
+    private func lapseNotice(_ pending: PendingQuestion) {
+        let ms = pending.autoResolutionMs ?? 0
         appendNotice("codex's question lapsed — its own \(ms)ms window ran out and bob sent no answer"
-                   + (nonBlocking.contains(requestId)
+                   + (nonBlocking.contains(pending.request.id)
                         ? "; codex says it isn't waiting on one — stop the turn if it stalls anyway"
                         : "; the turn is still parked on it — stop the turn to get out"))
-        presentQuestion()
     }
 
     /// Answer the question on the card, then move to the next one.
