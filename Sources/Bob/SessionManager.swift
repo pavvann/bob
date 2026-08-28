@@ -444,8 +444,25 @@ final class SessionManager: ObservableObject {
         } else if let index = codexSessions.firstIndex(where: { $0.id == id }) {
             let session = codexSessions.remove(at: index)
             // the thread survives on disk — that's what makes it resumable —
-            // but nothing of it may be left running or waiting on an answer
-            Task { await session.close() }
+            // but nothing of it may be left *startable*, and if something was
+            // already running the owner hears about it rather than wondering
+            let name = session.config.name
+            Task { [weak self] in
+                switch await session.close() {
+                case .clean:
+                    break
+                case .leftCommandRunning:
+                    self?.report("closed \(name), but a command it had already started is still"
+                               + " running — codex reaps it when bob quits")
+                case .turnDidNotConfirm:
+                    // forensics, not news: nothing is known to be running, and
+                    // the thread was abandoned rather than left routable. Saying
+                    // this out loud every time app-server is slow to answer an
+                    // interrupt would be noise wearing an alarm's clothes.
+                    self?.note("closed \(name) — codex didn't confirm the turn stopped inside"
+                             + " the leash; thread abandoned rather than detached")
+                }
+            }
         } else {
             return
         }
@@ -761,6 +778,14 @@ final class SessionManager: ObservableObject {
         case .codex:
             return codexSessions.contains { $0.config.cwd.standardizedFileURL == dir }
         }
+    }
+
+    /// Something happened to a session that the owner would otherwise have no
+    /// way to know: it goes in bob's own thread, which is where bob tells him
+    /// things, and in the log either way.
+    private func report(_ line: String) {
+        note(line)
+        companion?.transcript.append(TranscriptEntry(role: .notice, text: line))
     }
 
     /// Registry forensics land in the same log a curious owner already checks:

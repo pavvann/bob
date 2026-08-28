@@ -52,6 +52,24 @@ final class CodexSession: ObservableObject, Identifiable {
         case failed(String)
     }
 
+    /// What closing this tab actually managed to stand down. The two failures
+    /// are kept apart because they are different sentences to say to the owner:
+    /// one is work that is definitely still running, the other is a turn that
+    /// never confirmed it stopped.
+    enum CloseOutcome: Equatable {
+        case clean
+        /// A command was executing when the tab closed. It keeps running until
+        /// app-server exits — bob has no way to reap it (phase 0: children
+        /// survive `turn/interrupt`, and the process group belongs to the server
+        /// every other codex tab is also using).
+        case leftCommandRunning
+        /// The interrupt went out but `turn/completed` didn't arrive inside the
+        /// leash — app-server does not always answer `turn/interrupt` promptly.
+        /// Nothing is known to be running; the thread is treated as still live
+        /// because assuming otherwise is what strands it.
+        case turnDidNotConfirm
+    }
+
     let id = UUID()
     /// Published because the dial draws its own checkmarks from it: the four
     /// settings are bob's, visible, and changed in place.
@@ -115,6 +133,23 @@ final class CodexSession: ObservableObject, Identifiable {
     private var steerInFlight = false
     private var wantsInterrupt = false
     private var lastCompletedTurnId: String?
+    /// The tab is gone. Terminal and one-way: a `thread/start` still in flight
+    /// when the owner closes the tab must not be adopted on the way back, or a
+    /// prompt queued while it was waking runs for a session the manager and the
+    /// UI have already dropped — an invisible turn, with invisible approvals.
+    private var isClosed = false
+    /// What app-server resolved for this thread when it opened — the honest
+    /// meaning of "auto" once a per-turn override has been applied.
+    private var threadDefaultModel: String?
+    /// A model or effort override has gone out on this thread, so silence no
+    /// longer means "codex's own default".
+    private var appliedOverride = false
+    /// `commandExecution` items that never reported a terminal state. Phase 0
+    /// measured that `turn/interrupt` leaves the spawned process running while
+    /// its item reports `failed` / `exitCode: -1`, so this is deliberately NOT
+    /// pruned at a turn boundary: it is the only honest answer to "did this tab
+    /// start something that can outlive it".
+    private var liveCommands: Set<String> = []
 
     private struct Outbound {
         let text: String
@@ -163,6 +198,7 @@ final class CodexSession: ObservableObject, Identifiable {
     /// Open the thread. Idempotent from a settled state; a retry after failure
     /// starts clean.
     func open() {
+        guard !isClosed else { return }
         switch state {
         case .unspawned, .failed:
             state = .spawning
@@ -173,6 +209,7 @@ final class CodexSession: ObservableObject, Identifiable {
     }
 
     func send(_ rawText: String, source: TurnSource = .user) {
+        guard !isClosed else { return }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         if case .failed(let why) = state {
@@ -229,20 +266,39 @@ final class CodexSession: ObservableObject, Identifiable {
     /// Shutdown's hook, called by the server from outside its own isolation so
     /// the reply to this interrupt can still be dispatched while it waits.
     func quiesce() async {
-        guard let thread = threadId, let turn = liveTurnId else { return }
+        guard let thread = threadId else { return }
+        guard let turn = liveTurnId else {
+            // the turn's id hasn't come back yet, so there is nothing to name in
+            // an interrupt. Arm it the same way `interrupt()` does and
+            // `adoptTurn` stands the turn down the moment the id lands —
+            // without this, a close inside that window leaves the turn running
+            // and the wait below burns its whole leash.
+            if turnStarting { wantsInterrupt = true }
+            return
+        }
         try? await server.interruptTurn(threadId: thread, turnId: turn,
                                         timeout: CodexServer.quiesceTimeout)
     }
 
-    /// This tab is going away: leave nothing of it running, push the pump's
-    /// tail out, and stop receiving. The thread itself survives on disk —
-    /// that's what makes it resumable.
+    /// This tab is going away: leave nothing of it *startable*, push the pump's
+    /// tail out, and stop receiving. The thread itself survives on disk — that's
+    /// what makes it resumable.
     ///
     /// Detaching alone would strand it: the shared server keeps executing the
     /// turn, and its next approval arrives at a route nobody owns, which parks
-    /// that thread for good. So the open asks are refused and the live turn is
-    /// stopped first, on the same leash shutdown uses.
-    func close() async {
+    /// that thread for good. So the open asks are refused, the queue is dropped
+    /// and the live turn is stopped first, on the same leash shutdown uses.
+    ///
+    /// The outcome is honest rather than reassuring: a command already running
+    /// cannot be reaped from here, so a close that leaves one behind says so and
+    /// the owner is told.
+    @discardableResult
+    func close() async -> CloseOutcome {
+        isClosed = true
+        // a prompt still waiting for the thread to open must never leave: the
+        // tab that typed it is gone
+        queue.removeAll()
+        pendingUserRows.removeAll()
         let asks = openRequests
         openRequests.removeAll()
         broker.abandon(sessionId: id)
@@ -250,9 +306,42 @@ final class CodexSession: ObservableObject, Identifiable {
         for ask in asks {
             await server.respond(to: ask.id, code: -32800, message: "bob closed this session")
         }
+        // snapshot BEFORE the interrupt: an interrupted command's item goes
+        // terminal within milliseconds while the process it spawned keeps
+        // running, so after the interrupt this set is empty and tells us nothing
+        let commandsAtClose = liveCommands
         await quiesce()
+        let settled = await waitForTurnEnd()
         await pump.finish()
-        if let thread = threadId { await server.detach(threadId: thread) }
+        guard let thread = threadId else { return .clean }
+        if commandsAtClose.isEmpty, settled {
+            await server.detach(threadId: thread)
+            return .clean
+        }
+        let outcome: CloseOutcome = commandsAtClose.isEmpty ? .turnDidNotConfirm
+                                                            : .leftCommandRunning
+        // Work may still be running and bob cannot reap it: only app-server's
+        // own exit does (phase 0), and that process is shared with every other
+        // codex tab. What bob CAN refuse to do is walk away from the thread
+        // while it can still ask something — an approval arriving at a route
+        // nobody owns parks that thread for good. So the route goes but the
+        // thread is marked: anything it asks from here is refused on the spot,
+        // and the work itself is reaped by the group kill at app quit.
+        await server.abandon(threadId: thread)
+        return outcome
+    }
+
+    /// Whether the live turn actually went terminal, on shutdown's own leash.
+    /// Nothing polls app-server: this watches bob's own state, which only moves
+    /// when `turn/completed` arrives.
+    private func waitForTurnEnd() async -> Bool {
+        guard liveTurnId != nil || turnStarting else { return true }
+        let deadline = ContinuousClock().now + CodexServer.quiesceTimeout
+        while ContinuousClock().now < deadline {
+            if liveTurnId == nil, !turnStarting { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return liveTurnId == nil && !turnStarting
     }
 
     // MARK: - thread lifecycle
@@ -276,6 +365,12 @@ final class CodexSession: ObservableObject, Identifiable {
                     model: config.model, route: route)
                 opened = (started.threadId, started.model, [])
             }
+            // the owner closed the tab while this RPC was in flight. Adopting
+            // now would drain the queue into a session nothing on screen owns.
+            if isClosed {
+                await abandonStartup(opened.threadId)
+                return
+            }
             let isNewThread = threadId != opened.threadId
             threadId = opened.threadId
             // the thread id is what a relaunch resumes; it is only ever news
@@ -288,12 +383,21 @@ final class CodexSession: ObservableObject, Identifiable {
                 Task { [weak self] in await self?.setName(name) }
             }
             if model != opened.model { model = opened.model }
+            threadDefaultModel = opened.model
             hydrate(opened.history)
             state = .idle
             drain()
         } catch {
             fail(error)
         }
+    }
+
+    /// A thread that finished opening after its tab was closed. It is nobody's:
+    /// the route is refused rather than merely dropped, because a thread whose
+    /// requests reach no one parks forever.
+    private func abandonStartup(_ thread: String) async {
+        queue.removeAll()
+        await server.abandon(threadId: thread)
     }
 
     /// Put a resumed thread's own history on screen. Codex sends it once, in
@@ -345,7 +449,7 @@ final class CodexSession: ObservableObject, Identifiable {
         config.model = id
         // the caption follows the choice immediately: the next turn will run it,
         // and app-server only names the model at thread open
-        if let id { model = id }
+        if let resolved = id ?? turnModel ?? threadDefaultModel { model = resolved }
         if let effort = config.effort,
            !CodexCatalog.shared.efforts(for: id).isEmpty,
            !CodexCatalog.shared.efforts(for: id).contains(effort) {
@@ -358,6 +462,27 @@ final class CodexSession: ObservableObject, Identifiable {
         guard config.effort != effort else { return }
         config.effort = effort
         onConfigChanged?()
+    }
+
+    /// What "auto" has to put on the wire, and why it can't just be silence.
+    ///
+    /// `model` and `effort` on `turn/start` are overrides "for this turn **and
+    /// subsequent turns**". Once one has been applied, dropping the field stops
+    /// saying anything and app-server keeps running the last thing it was told —
+    /// so the dial would read auto while the session ran whatever was picked
+    /// three turns ago. Auto therefore restores explicitly: the model
+    /// app-server itself resolved when the thread opened, and that model's own
+    /// advertised default effort. Before any override has been applied there is
+    /// nothing to undo and the field stays absent, which is what lets codex's
+    /// own config decide on a fresh thread.
+    private var turnModel: String? {
+        if let picked = config.model { return picked }
+        return appliedOverride ? (threadDefaultModel ?? CodexCatalog.shared.defaultModelId) : nil
+    }
+
+    private var turnEffort: String? {
+        if let picked = config.effort { return picked }
+        return appliedOverride ? CodexCatalog.shared.defaultEffort(for: turnModel) : nil
     }
 
     func setSandbox(_ policy: CodexSandboxPolicy?) {
@@ -383,7 +508,7 @@ final class CodexSession: ObservableObject, Identifiable {
     /// refusing it, so mid-turn input goes through `turn/steer` and its
     /// `expectedTurnId` precondition, which fails loudly when it's stale.
     private func drain() {
-        guard !queue.isEmpty else { return }
+        guard !isClosed, !queue.isEmpty else { return }
         switch state {
         case .idle:
             // a steer still in flight may yet come back and requeue its
@@ -408,13 +533,16 @@ final class CodexSession: ObservableObject, Identifiable {
         state = .turnActive(out.source)
         turnStarting = true
         openAgentRow()
+        let model = turnModel
+        let effort = turnEffort
+        if model != nil || effort != nil { appliedOverride = true }
         Task { [weak self] in
             guard let self else { return }
             do {
                 let turnId = try await self.server.startTurn(
                     threadId: thread, text: out.text, clientMessageId: out.clientId,
                     approvalPolicy: self.config.approvalPolicy, sandbox: self.sandbox,
-                    model: self.config.model, effort: self.config.effort)
+                    model: model, effort: effort)
                 self.adoptTurn(turnId)
             } catch {
                 self.turnStarting = false
@@ -531,6 +659,9 @@ final class CodexSession: ObservableObject, Identifiable {
         steerInFlight = false
         wantsInterrupt = false
         closeAgentRow(stopped: true)
+        // its exit is exactly what reaps the children a `turn/interrupt` never
+        // could, so nothing this session started is running any more
+        liveCommands.removeAll()
         // nothing can answer these any more, and a card whose reply would go
         // nowhere is worse than no card
         openRequests.removeAll()
@@ -598,8 +729,9 @@ final class CodexSession: ObservableObject, Identifiable {
             }
             itemRows[item.id] = ItemRow(entry: row, turnId: item.turnId)
             currentAgentRow = row
-        case .other:
-            break
+        case .other(let type):
+            // the one item kind whose life outlasts bob's interest in it
+            if type == "commandExecution" { liveCommands.insert(item.id) }
         }
     }
 
@@ -623,8 +755,8 @@ final class CodexSession: ObservableObject, Identifiable {
             if row.text != text { transcript.set(text: text, of: row) }
             transcript.finalize(row)
             if currentAgentRow === row { currentAgentRow = nil }
-        case .other:
-            break
+        case .other(let type):
+            if type == "commandExecution" { liveCommands.remove(item.id) }
         }
     }
 

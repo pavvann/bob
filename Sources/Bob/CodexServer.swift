@@ -90,6 +90,11 @@ actor CodexServer {
     private var nextId = 1
     private var pending: [CodexRequestId: Waiter] = [:]
     private var routes: [String: CodexThreadRoute] = [:]
+    /// Threads whose session closed while work was still running. bob has
+    /// stopped owning them, so their requests are refused on arrival — an
+    /// approval delivered to no one parks a thread indefinitely, and phase 0
+    /// measured that park as permanent.
+    private var abandonedThreads: Set<String> = []
     private var taps: [UUID: AsyncStream<CodexEvent>.Continuation] = [:]
     private var exitWait: CheckedContinuation<Bool, Never>?
     private var exitDeadline: Task<Void, Never>?
@@ -371,6 +376,9 @@ actor CodexServer {
             if let claim = waiter.claim,
                let threadId = (result["thread"] as? [String: Any])?["id"] as? String {
                 routes[threadId] = claim
+                // reopened on purpose: whatever the last tab left running, this
+                // owner is here now and its requests are theirs to answer
+                abandonedThreads.remove(threadId)
             }
             waiter.continuation.resume(returning: result)
             return nil
@@ -383,6 +391,12 @@ actor CodexServer {
             return nil
 
         case .request(let request):
+            // a thread bob walked away from answers for itself, immediately:
+            // leaving it parked would cost it every later turn as well
+            if let threadId = request.threadId, abandonedThreads.contains(threadId) {
+                respond(to: request.id, code: -32800, message: "bob closed this session")
+                return nil
+            }
             // routed with its id intact and nothing awaited: an approval
             // nobody answers must cost this thread its turn, never the reader
             guard let threadId = request.threadId, let route = routes[threadId] else {
@@ -423,6 +437,15 @@ actor CodexServer {
     private func dropTap(_ key: UUID) { taps[key] = nil }
 
     func detach(threadId: String) { routes[threadId] = nil }
+
+    /// Detach, and refuse anything this thread asks from here on. For a tab that
+    /// closed with a command still running: the work cannot be reaped from here
+    /// (only app-server's own exit does that, and it is shared), but the thread
+    /// must not be able to wedge itself on a question nobody will answer.
+    func abandon(threadId: String) {
+        routes[threadId] = nil
+        abandonedThreads.insert(threadId)
+    }
 
     // MARK: - requests
 

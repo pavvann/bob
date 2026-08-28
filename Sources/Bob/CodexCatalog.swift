@@ -29,9 +29,17 @@ final class CodexCatalog: ObservableObject {
         loading = Task { [weak self] in
             let rows = await Self.fetch()
             guard let self else { return }
-            if !rows.isEmpty, self.models != rows { self.models = rows }
+            self.adopt(rows)
             self.loading = nil
         }
+    }
+
+    /// The one place the cache is written — so a caller that paged `model/list`
+    /// itself (a harness, or anything that already had the rows) primes the dial
+    /// without a second round trip.
+    func adopt(_ rows: [Model]) {
+        guard !rows.isEmpty, models != rows else { return }
+        models = rows
     }
 
     /// The efforts to offer for whatever model a session is on — the model's
@@ -39,6 +47,17 @@ final class CodexCatalog: ObservableObject {
     func efforts(for model: String?) -> [String] {
         if let model, let row = models.first(where: { $0.id == model }) { return row.efforts }
         return models.first(where: \.isDefault)?.efforts ?? []
+    }
+
+    /// What codex would pick on its own. A session going back to "auto" has to
+    /// name these explicitly: a per-turn override persists into later turns, so
+    /// dropping the field would leave the last choice running under a dial that
+    /// says auto. nil when the list never loaded — then silence is all bob has.
+    var defaultModelId: String? { models.first(where: \.isDefault)?.id }
+
+    func defaultEffort(for model: String?) -> String? {
+        if let model, let row = models.first(where: { $0.id == model }) { return row.defaultEffort }
+        return models.first(where: \.isDefault)?.defaultEffort
     }
 
     private static func fetch() async -> [Model] {

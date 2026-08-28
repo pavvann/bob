@@ -1081,10 +1081,10 @@ private struct WorkStage<S: StageSession>: View {
 /// say so; a command is never silently swallowed.
 @MainActor
 private func routeDispatch(_ raw: String, via manager: SessionManager) -> String? {
-    let tabs = manager.workTabs
+    let keyed = dispatchKeys(manager.workTabs)
     guard case .send(let name, let text, let bang) =
-            SessionDispatch.parse(raw, names: tabs.map(\.name)),
-          let target = tabs.first(where: { $0.name == name })
+            SessionDispatch.parse(raw, names: Array(keyed.keys)),
+          let target = keyed[name]
     else { return nil }
     if bang {
         manager.stopAndTell(text, to: target.id)
@@ -1092,6 +1092,34 @@ private func routeDispatch(_ raw: String, via manager: SessionManager) -> String
         manager.inject(text, into: target.id)
     }
     return "→ \(name)\(bang ? " (stopped)" : ""): \(text)"
+}
+
+/// What `>` can address, and nothing it can address twice.
+///
+/// A claude tab and a codex tab in the same directory get the same default
+/// name, and `>project` taking the first of them means the other is
+/// unreachable and `>project!` may stop the wrong one — a silently wrong target
+/// is the worst outcome this feature has. So a name shared by two tabs is
+/// replaced by `name/claude` and `name/codex`, which leaves the bare name
+/// matching neither exactly and both by prefix: ambiguous, which the parser
+/// already handles by declining. A unique name is untouched, so `>web` and
+/// `>we` stay as terse as they were. Two tabs that still collide after
+/// qualification (two claude tabs in same-named directories — true before codex
+/// existed) drop out entirely rather than being guessed at.
+/// Internal rather than private so the rule can be checked directly, the same
+/// reason `SessionDispatch` beside it is.
+@MainActor
+func dispatchKeys(_ tabs: [SessionRef]) -> [String: SessionRef] {
+    var counts: [String: Int] = [:]
+    for tab in tabs { counts[tab.name, default: 0] += 1 }
+    var keyed: [String: SessionRef] = [:]
+    var collided: Set<String> = []
+    for tab in tabs {
+        let key = counts[tab.name] == 1 ? tab.name : "\(tab.name)/\(tab.provider.rawValue)"
+        if keyed[key] != nil { collided.insert(key) } else { keyed[key] = tab }
+    }
+    for key in collided { keyed[key] = nil }
+    return keyed
 }
 
 /// The whisper strip — while a surface holds the stage, bob's reply stays
