@@ -8,6 +8,7 @@ struct ContentView: View {
 
     @ObservedObject private var minions = MinionService.shared
     @ObservedObject private var sessions = SessionWatcher.shared
+    @ObservedObject private var codexSessions = CodexSessionWatcher.shared
     @ObservedObject private var music = MusicService.shared
     @ObservedObject private var sessionManager = SessionManager.shared
     @ObservedObject private var router = SurfaceRouter.shared
@@ -84,6 +85,7 @@ struct ContentView: View {
             // is pure invalidation noise
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: minions.active.map(\.id))
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.live.map(\.id))
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: codexSessions.live.map(\.id))
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessions.parked.map(\.id))
             .animation(.spring(response: 0.4, dampingFraction: 0.82), value: sessionManager.workTabs.map(\.id))
             .animation(.easeInOut(duration: 0.2), value: sessionManager.activeID)
@@ -115,7 +117,7 @@ struct ContentView: View {
     private var minionBand: some View {
         MinionStrip(
             minions: minions.active,
-            sessions: sessions.live,
+            sessions: sessions.live + codexSessions.live,
             parked: sessions.parked,
             tabs: sessionManager.workTabs,
             activeID: sessionManager.activeID,

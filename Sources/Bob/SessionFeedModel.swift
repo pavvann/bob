@@ -62,7 +62,7 @@ final class SessionFeedModel: ObservableObject {
             cwd = s.cwd
             gitBranch = s.gitBranch
             lastActivity = s.lastActivity
-            flavor = .cliTranscript
+            flavor = s.provider == .codex ? .codexRollout : .cliTranscript
             tailer = TranscriptTailer(url: s.fileURL)
         case .live(let s):
             title = s.config.name
@@ -259,10 +259,13 @@ final class SessionFeedModel: ObservableObject {
         if let b = out.update.gitBranch, b != gitBranch { gitBranch = b }
         if let m = out.update.model, m != model { model = m }
         switch flavor {
-        case .cliTranscript:
-            // mtime moves when claude rewrites an idle transcript's metadata —
-            // the green dot would flash on a session that said nothing. Only a
-            // real event advances the clock; silence leaves it where it was.
+        case .cliTranscript, .codexRollout:
+            // claude: mtime moves when an idle transcript's metadata is
+            // rewritten, so the dot would flash on a session that said nothing.
+            // codex: no metadata upsert at all, but the rollout still carries
+            // token-count and world-state lines that only appear mid-turn.
+            // Either way it is the stamped event that advances the clock, and
+            // silence leaves it where it was.
             if let at = out.update.lastEventAt, at > (lastActivity ?? .distantPast) { lastActivity = at }
         case .minionStream:
             if let mt = out.mtime, mt != lastActivity { lastActivity = mt }
