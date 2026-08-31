@@ -364,6 +364,7 @@ struct CenterStage: View {
             }
 
             lensChip
+            TerminalButton(cwd: BobHome.shared.root, name: "bob")
             micButton
             speakerButton
         }
@@ -1048,6 +1049,8 @@ private struct WorkStage<S: StageSession>: View {
                 return .handled
             }
             .slashPaletteKeys($palette, input: $input, scope: slashScope)
+
+            TerminalButton(cwd: session.cwd, name: session.displayName)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 13)
