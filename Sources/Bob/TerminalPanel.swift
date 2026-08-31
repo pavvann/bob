@@ -41,10 +41,26 @@ final class TerminalController: NSObject, ObservableObject, NSWindowDelegate, Lo
     private final class Instance {
         let panel: NSPanel
         let view: LocalProcessTerminalView
-        init(panel: NSPanel, view: LocalProcessTerminalView) {
+        /// The path the header shows. Its own object rather than a field, so
+        /// `cd` inside the shell can move it without rebuilding the panel.
+        let cwdLine: WhereLine
+        init(panel: NSPanel, view: LocalProcessTerminalView, cwdLine: WhereLine) {
             self.panel = panel
             self.view = view
+            self.cwdLine = cwdLine
         }
+    }
+
+    /// One published string: where the shell currently is.
+    @MainActor
+    final class WhereLine: ObservableObject {
+        @Published var text: String
+        init(_ text: String) { self.text = text }
+    }
+
+    static func tidy(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
     }
 
     /// AppKit's own memory for a window size. One key, shared: the owner sizes a
@@ -85,6 +101,13 @@ final class TerminalController: NSObject, ObservableObject, NSWindowDelegate, Lo
         view.configureNativeColors()
         view.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
         view.caretColor = .controlAccentColor
+        // Let the panel's material show through the default background. Only the
+        // default background goes translucent — text, caret, selection and cells
+        // with their own colour stay opaque — and it needs the clear window
+        // below to composite against.
+        // Legibility first: this is a window you'll run `vi` in, so the glass
+        // reads as glass without the text fighting a blurred desktop. One knob.
+        view.backgroundOpacity = 0.7
 
         let panel = NSPanel(
             contentRect: view.frame,
@@ -94,15 +117,27 @@ final class TerminalController: NSObject, ObservableObject, NSWindowDelegate, Lo
         )
         panel.title = name
         panel.titlebarAppearsTransparent = true
+        // The title lives in the panel's own header, next to the chips, the way
+        // every other bob panel does it.
+        panel.titleVisibility = .hidden
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        // Deliberately NOT movableByWindowBackground, unlike the read-only
+        // panels: dragging inside a terminal selects text. The header is the
+        // handle.
         panel.collectionBehavior = [.fullScreenNone, .moveToActiveSpace]
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
-        panel.minSize = NSSize(width: 420, height: 220)
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+        panel.minSize = NSSize(width: 420, height: 240)
         panel.delegate = self
-        panel.contentView = view
+        let cwdLine = WhereLine(Self.tidy(cwd.path))
+        panel.contentView = NSHostingView(
+            rootView: TerminalPanelView(view: view, name: name, cwdLine: cwdLine)
+        )
         panel.initialFirstResponder = view
 
         // A remembered frame wins; a first-ever open gets placed by the mouse.
@@ -123,7 +158,7 @@ final class TerminalController: NSObject, ObservableObject, NSWindowDelegate, Lo
             environment: SwiftTerm.Terminal.getEnvironmentVariables(termName: "xterm-256color"),
             currentDirectory: cwd.path
         )
-        return Instance(panel: panel, view: view)
+        return Instance(panel: panel, view: view, cwdLine: cwdLine)
     }
 
     private func place(_ panel: NSPanel) {
@@ -186,7 +221,8 @@ final class TerminalController: NSObject, ObservableObject, NSWindowDelegate, Lo
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
         guard let view = source as? LocalProcessTerminalView, let k = key(of: view),
               let directory, !directory.isEmpty else { return }
-        open[k]?.panel.title = (directory as NSString).lastPathComponent
+        // The header reads this, not `panel.title` — the real title is hidden.
+        open[k]?.cwdLine.text = Self.tidy(directory)
     }
 
     func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
@@ -219,4 +255,77 @@ struct TerminalButton: View {
         .buttonStyle(.plain)
         .help(isUp ? "hide the terminal" : "a terminal in \(name)")
     }
+}
+
+/// The panel's chrome, in the same glass language as the session panels: a
+/// `hudWindow` material behind everything, a header that clears the traffic
+/// lights with the same 26pt the other panels use, a hairline, then the
+/// terminal.
+///
+/// The header exists because the window's own title is hidden — a
+/// `fullSizeContentView` panel draws its content under the titlebar, which is
+/// what put the first rows of terminal output behind the close button.
+private struct TerminalPanelView: View {
+    let view: LocalProcessTerminalView
+    let name: String
+    @ObservedObject var cwdLine: TerminalController.WhereLine
+
+    var body: some View {
+        ZStack {
+            VisualEffectView(material: .hudWindow, blendingMode: .behindWindow)
+                .ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                    .padding(.top, 26)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 10)
+                Rectangle().fill(.white.opacity(0.07)).frame(height: 0.5)
+                TerminalSurface(view: view)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
+                    .padding(.top, 6)
+            }
+        }
+        .frame(minWidth: 420, minHeight: 240)
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "terminal")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary.opacity(0.7))
+            Text(name)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary.opacity(0.92))
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            chip("folder", cwdLine.text)
+        }
+    }
+
+    private func chip(_ icon: String, _ text: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 8, weight: .medium))
+            Text(text)
+                .font(.system(size: 9, weight: .regular, design: .rounded))
+                .lineLimit(1)
+                .truncationMode(.head)
+        }
+        .foregroundStyle(.secondary.opacity(0.7))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background { Capsule().fill(.white.opacity(0.06)) }
+        .frame(maxWidth: 260, alignment: .trailing)
+    }
+}
+
+/// Hands SwiftUI the terminal view bob is already holding. `makeNSView` returns
+/// the retained instance rather than building one, which is what keeps the pty,
+/// the running process and the scrollback alive across a rebuild — the same
+/// reason closing the panel only orders it out.
+private struct TerminalSurface: NSViewRepresentable {
+    let view: LocalProcessTerminalView
+    func makeNSView(context: Context) -> LocalProcessTerminalView { view }
+    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {}
 }
