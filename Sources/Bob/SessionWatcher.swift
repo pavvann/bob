@@ -59,6 +59,9 @@ final class SessionWatcher: ObservableObject {
         let gitBranch: String?
         let lastActivity: Date
         var status: ExternalStatus = .unknown
+        /// Which agent is behind it. Defaulted so every claude call site — the
+        /// transcript scan, the registry fallback, the harness — stays as it was.
+        var provider: SessionProvider = .claude
     }
 
     /// One `~/.claude/sessions/<pid>.json` record, reduced to what triage

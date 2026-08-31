@@ -882,7 +882,7 @@ struct SessionCard: View {
         } label: {
             HStack(spacing: 8) {
                 statusDot
-                Image(systemName: "terminal")
+                Image(systemName: session.provider.glyph ?? "terminal")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary.opacity(0.7))
                 VStack(alignment: .leading, spacing: 1) {
