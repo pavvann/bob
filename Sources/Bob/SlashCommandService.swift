@@ -75,13 +75,31 @@ final class SlashCommandService: ObservableObject {
 
     nonisolated private static func assemble(root: URL) -> [SlashCommand] {
         var byName: [String: SlashCommand] = [:]
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        // user first, project after — project wins a name collision, like the CLI
-        scanSkills(home.appendingPathComponent(".claude/skills"), source: .user, into: &byName)
-        scanCommands(home.appendingPathComponent(".claude/commands"), source: .user, into: &byName)
-        scanSkills(root.appendingPathComponent(".claude/skills"), source: .project, into: &byName)
-        scanCommands(root.appendingPathComponent(".claude/commands"), source: .project, into: &byName)
+        let userClaude = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude")
+        let projectClaude = root.appendingPathComponent(".claude")
+        // The palette sends into bob's own session, so it may only offer what
+        // that session can run. The companion's loadout drops the `user` settings
+        // source (CompanionLoadout), which takes ~/.claude's skills and every
+        // plugin's with it — offering `/ship` there would be offering a dead key.
+        let carriesUserSkills = Self.companionCarriesUserSkills
+
+        if carriesUserSkills {
+            // user first, project after — project wins a name collision, like the CLI
+            scanSkills(userClaude.appendingPathComponent("skills"), source: .user, into: &byName)
+            scanCommands(userClaude.appendingPathComponent("commands"), source: .user, into: &byName)
+        }
+        scanSkills(projectClaude.appendingPathComponent("skills"), source: .project, into: &byName)
+        scanCommands(projectClaude.appendingPathComponent("commands"), source: .project, into: &byName)
+        // The harvest comes off a MINION's init event, and minions still carry the
+        // whole machine — so when the companion doesn't, subtract by provenance:
+        // what each source actually provides, named the way the CLI names it.
+        let fromUser = carriesUserSkills ? [] : provided(in: userClaude)
+        let fromProject = carriesUserSkills ? [] : provided(in: projectClaude)
         for name in harvestNames(root: root) where byName[name] == nil {
+            if !carriesUserSkills, !reachable(name, fromProject: fromProject, fromUser: fromUser) {
+                continue
+            }
             byName[name] = SlashCommand(
                 name: name, detail: "",
                 source: name.contains(":") ? .plugin : .builtIn
@@ -90,6 +108,94 @@ final class SlashCommandService: ObservableObject {
         return byName.values
             .filter { !excluded($0.name) }
             .sorted { $0.name < $1.name }
+    }
+
+    /// Whether bob's companion still reads `~/.claude`'s settings — and so its
+    /// skills and plugins. An empty source list is the CLI's default: everything.
+    nonisolated static var companionCarriesUserSkills: Bool {
+        let sources = CompanionLoadout.current.settingSources
+        return sources.isEmpty || sources.contains("user")
+    }
+
+    /// Can bob's companion still run this harvested name once its loadout drops
+    /// the `user` settings source?
+    ///
+    /// By provenance, not by shape. The `project` source is untouched, so whatever
+    /// it provides stays — including a namespaced one: `~/bob/.claude/commands/
+    /// team/deploy.md` is `/team:deploy` and runs fine. Judging the colon instead
+    /// would have hidden it along with the plugins. What's left: a namespaced name
+    /// the project doesn't claim belongs to a plugin (plugins are enabled *in*
+    /// `~/.claude/settings.json`, so they left with it) or to a nested user
+    /// command, and a plain name is one of the CLI's own built-ins unless
+    /// `~/.claude` claims it.
+    nonisolated private static func reachable(_ name: String,
+                                             fromProject: Set<String>,
+                                             fromUser: Set<String>) -> Bool {
+        if fromProject.contains(name) { return true }
+        if name.contains(":") { return false }
+        return !fromUser.contains(name)
+    }
+
+    /// Every command name a `.claude` directory provides, named as the CLI names
+    /// it. Scoped to its `skills/` and `commands/` children — the rest of
+    /// `~/.claude` is transcripts and caches, and walking those would be both slow
+    /// and wrong. Descriptions aren't read: this only ever builds a subtraction set.
+    nonisolated private static func provided(in claudeDir: URL) -> Set<String> {
+        skillNames(under: claudeDir.appendingPathComponent("skills"))
+            .union(commandNames(under: claudeDir.appendingPathComponent("commands")))
+    }
+
+    /// The folder name of every `SKILL.md` below `dir`, at any depth — a skill is
+    /// `/<its own folder>` however deep it sits, so `skills/gstack/ship/SKILL.md`
+    /// is `/ship`, and a one-level scan would miss a whole suite of them.
+    ///
+    /// Recursion does NOT stop at a directory that is itself a skill: a skill dir
+    /// can hold more skills (`gstack/` has its own `SKILL.md` *and* 46 beneath it),
+    /// and stopping there was exactly the bug. Hidden directories are skipped —
+    /// vendored copies live in `.slate/` and the CLI ignores them too.
+    nonisolated private static func skillNames(under dir: URL, depth: Int = 0) -> Set<String> {
+        guard depth < maxConfigDepth else { return [] }
+        var out: Set<String> = []
+        for item in contents(of: dir) where isDirectory(item) {
+            if FileManager.default.fileExists(
+                atPath: item.appendingPathComponent("SKILL.md").path) {
+                out.insert(item.lastPathComponent)
+            }
+            out.formUnion(skillNames(under: item, depth: depth + 1))
+        }
+        return out
+    }
+
+    /// `<dir>/team/deploy.md` is `/team:deploy` — a command carries its
+    /// subdirectories as its colon namespace, at any depth.
+    nonisolated private static func commandNames(under dir: URL, prefix: String = "",
+                                                 depth: Int = 0) -> Set<String> {
+        guard depth < maxConfigDepth else { return [] }
+        var out: Set<String> = []
+        for item in contents(of: dir) {
+            if isDirectory(item) {
+                out.formUnion(commandNames(under: item,
+                                           prefix: prefix + item.lastPathComponent + ":",
+                                           depth: depth + 1))
+            } else if item.pathExtension == "md" {
+                out.insert(prefix + item.deletingPathExtension().lastPathComponent)
+            }
+        }
+        return out
+    }
+
+    /// A config tree is shallow; six levels is generous and stops a symlink loop
+    /// from walking forever.
+    nonisolated private static let maxConfigDepth = 6
+
+    nonisolated private static func contents(of dir: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles])) ?? []
+    }
+
+    nonisolated private static func isDirectory(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
     }
 
     /// `<dir>/<name>/SKILL.md` — skills invokable as `/name`.

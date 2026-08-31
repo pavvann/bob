@@ -82,7 +82,9 @@ final class MinionService: ObservableObject {
         for dir in [activeDir, doneDir, binDir] {
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
-        try? Self.wrapperScript.write(to: wrapperURL, atomically: true, encoding: .utf8)
+        // rewritten every launch, so a loadout edit lands on the next minion
+        try? Self.wrapperScript(extraArgs: CompanionLoadout.current.minionArguments())
+            .write(to: wrapperURL, atomically: true, encoding: .utf8)
 
         reader = Reader(minionsDir: minionsDir, activeDir: activeDir,
                         doneDir: doneDir, wrapperURL: wrapperURL)
@@ -418,7 +420,18 @@ final class MinionService: ObservableObject {
     /// Runs claude in stream-json mode, teeing events to <id>.events.jsonl, then
     /// writes its own done/failed status + a prose summary pulled from the final
     /// `result` event — so it completes even if bob is gone.
-    private static let wrapperScript = #"""
+    ///
+    /// `extraArgs` is baked into the file rather than passed at spawn time, so
+    /// `~/bob/bin/run-minion.py` reads as the truth about what a minion runs.
+    /// Rendered as single-quoted python literals — CompanionLoadout only ever
+    /// produces flags and JSON, never an apostrophe.
+    private static func wrapperScript(extraArgs: [String]) -> String {
+        let literal = "[" + extraArgs.map { "'\($0.replacingOccurrences(of: "'", with: ""))'" }
+            .joined(separator: ", ") + "]"
+        return wrapperTemplate.replacingOccurrences(of: "__BOB_EXTRA_ARGS__", with: literal)
+    }
+
+    private static let wrapperTemplate = #"""
     #!/usr/bin/env python3
     import json, sys, subprocess, os, datetime
 
@@ -465,6 +478,10 @@ final class MinionService: ObservableObject {
 
     argv = [claude_path, "-p", "--output-format", "stream-json", "--verbose",
             "--permission-mode", "auto"]
+    # what bob decided a minion should NOT carry — see ~/bob/state/companion-loadout.json.
+    # a background worker can't finish an OAuth handshake, so the MCP servers go;
+    # its skills stay, because a minion may still need /git-guardrail before it commits.
+    argv += __BOB_EXTRA_ARGS__
     if lens_path and os.path.exists(lens_path):
         argv += ["--append-system-prompt-file", lens_path]
     # workers default to sonnet — never the CLI default, which follows the

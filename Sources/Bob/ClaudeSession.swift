@@ -19,6 +19,11 @@ struct SessionConfig {
     /// hard-errors: "Session ID … is already in use"). Restored tabs set this;
     /// a brand-new session leaves it false.
     var resumed: Bool = false
+    /// Flags this session carries on top of bob's core argv. The companion puts
+    /// its slim loadout here (see CompanionLoadout); a work session leaves it
+    /// empty on purpose — a tab has to be the same claude the owner would get in
+    /// a terminal, whole skill set and all.
+    var extraArguments: [String] = []
 }
 
 enum PermissionPolicy: Equatable {
@@ -630,6 +635,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
         // --replay-user-messages: turns render locally, hidden ones stay hidden.
         args += [sessionOnDisk ? "--resume" : "--session-id", config.sessionId.uuidString.lowercased()]
         if let model = config.model { args += ["--model", model] }
+        // what this session is *not* carrying (the companion's slim loadout).
+        // Empty for work sessions, so their argv is byte-for-byte today's.
+        args += config.extraArguments
         if let prompt = config.appendSystemPrompt { args += ["--append-system-prompt", prompt] }
         return args
     }

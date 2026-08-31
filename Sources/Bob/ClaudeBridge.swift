@@ -183,7 +183,8 @@ final class ClaudeBridge: ObservableObject {
             appendSystemPrompt: activeLens.flatMap { LensStore.shared.resolve($0)?.text },
             permissions: .auto,     // parity with the legacy argv (edge 11)
             name: "bob",
-            voiced: true
+            voiced: true,
+            extraArguments: CompanionLoadout.current.spawnArguments()
         )))
         return session
     }
@@ -401,7 +402,11 @@ final class ClaudeBridge: ObservableObject {
             // call (Edit, Write, Bash, etc) is judged for safety and auto-allowed
             // when low-risk, blocked when destructive.
             "--permission-mode", "auto",
-        ] + modelArgs + [
+        ] + modelArgs
+            // the same slim loadout the streaming companion runs: this is bob's
+            // voice too, and the fallback path pays the prompt on EVERY turn, so
+            // it's the last place that should be carrying a terminal's kit.
+            + CompanionLoadout.current.spawnArguments() + [
             prompt
         ]
         // Run claude inside ~/bob/ so it picks up that directory's CLAUDE.md

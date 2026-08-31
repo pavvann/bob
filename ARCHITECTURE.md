@@ -80,6 +80,16 @@ Targets:
 
 Bob enforces these caps in Swift before calling `claude -p`. If a wiki page grows past a threshold, bob suggests splitting it.
 
+### The bill bob didn't write
+
+Careful accounting of the wiki misses the larger number: the `claude` child inherits its *owner's whole machine*. Measured 2026-08-19 (CLI 2.1.235, `--model sonnet`, cwd `~/bob`), the companion opened every conversation at **53,573 tokens — 27% of a 200k window** — before a word was typed: ~94 skills under `~/.claude/skills`, five enabled plugins and the MCP servers they bring, nine globally configured MCP servers, and all thirty-odd built-in tools including cron, worktrees, plan mode and notebooks.
+
+So the companion carries a declared loadout instead (`CompanionLoadout` → `~/bob/state/companion-loadout.json`): no global MCP servers, no `user` settings source, and only the eleven built-in tools `CLAUDE.md` actually asks for. **53,573 → 32,017 (16%)**, itemized in that file so the owner can see what was traded and put any of it back in one line.
+
+Two rules hold:
+- **work sessions are never slimmed.** A tab in `~/Code/whatever` must be the same claude the owner gets in a terminal — same skills, same plugins, same MCP — or bob stops being a window onto his own setup.
+- **minions lose only their MCP servers** (52,086 → 49,889 a run). A headless worker can't finish an OAuth handshake, but it can still need `/git-guardrail` before it commits.
+
 ## UX rules
 
 What bob **does** do:
