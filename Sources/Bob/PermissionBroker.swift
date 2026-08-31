@@ -17,6 +17,31 @@ struct PermissionSuggestion {
     var destination: String? { fields["destination"] as? String }
 }
 
+/// One button on an ask card, in the order the request offered them.
+///
+/// Codex approvals carry their own decision list on the wire, it differs per
+/// request kind, and it drifts between versions — so the buttons are data, not
+/// a fixed row of three. `result` is the whole JSON-RPC result to answer with,
+/// assembled where the request was read: nothing downstream has to know which
+/// approval kind it came from, and an amendment payload travels back exactly as
+/// it arrived.
+struct PermissionChoice: Identifiable, Equatable {
+    enum Tone { case affirm, neutral, stop }
+
+    /// The wire decision's own name — the card's identity for this button.
+    let id: String
+    let label: String
+    let tone: Tone
+    /// One line on hover. `decline` and `cancel` differ in whether the turn
+    /// survives, and that difference has to be readable before clicking.
+    let hint: String?
+    let result: [String: Any]
+
+    static func == (lhs: PermissionChoice, rhs: PermissionChoice) -> Bool {
+        lhs.id == rhs.id && lhs.label == rhs.label
+    }
+}
+
 /// One tool call waiting on the owner. The CLI is blocked on it: manual mode +
 /// `--permission-prompt-tool stdio` turns every tool into this question, and the
 /// turn does not move until a control_response goes back (probe 1.6).
@@ -37,6 +62,10 @@ struct PermissionRequest: Identifiable {
     /// a panel feed wear the same glyph.
     let symbol: String
     let suggestions: [PermissionSuggestion]
+    /// Empty for claude, whose answer is always allow / deny / always. Non-empty
+    /// for a codex approval, where the card renders exactly these and nothing
+    /// else.
+    let choices: [PermissionChoice]
     let asked = Date()
 
     /// Per-session, because the continuation waiting on this is keyed by it and
@@ -55,6 +84,7 @@ struct PermissionRequest: Identifiable {
         self.sessionId = sessionId
         self.sessionName = sessionName
         self.toolName = toolName
+        self.choices = []
 
         let request = Self.requestObject(rawJSON)
         let input = request["input"] as? [String: Any]
@@ -70,10 +100,10 @@ struct PermissionRequest: Identifiable {
             ?? toolName.lowercased()
     }
 
-    /// Test/harness door — a request with everything already decided.
+    /// Everything already decided — the codex door, and the harness one.
     init(requestId: String, sessionId: UUID, sessionName: String, toolName: String,
          input: [String: Any]?, detail: String, symbol: String = "shield.lefthalf.filled",
-         suggestions: [PermissionSuggestion] = []) {
+         suggestions: [PermissionSuggestion] = [], choices: [PermissionChoice] = []) {
         self.requestId = requestId
         self.sessionId = sessionId
         self.sessionName = sessionName
@@ -82,6 +112,7 @@ struct PermissionRequest: Identifiable {
         self.detail = detail
         self.symbol = symbol
         self.suggestions = suggestions
+        self.choices = choices
     }
 
     private static func requestObject(_ line: String) -> [String: Any] {
@@ -215,6 +246,24 @@ final class UIPermissionBroker: ObservableObject, PermissionBroker {
 
     func deny(_ request: PermissionRequest, message: String = UIPermissionBroker.refusal) {
         settle(request, .deny(message: message))
+    }
+
+    /// One of the buttons the request itself offered. No blanket: a codex
+    /// decision that means "stop asking" says so on the wire
+    /// (`acceptForSession`, an execpolicy amendment), and bob answering for it
+    /// locally would hide that from the session it belongs to.
+    func choose(_ request: PermissionRequest, _ choice: PermissionChoice) {
+        settle(request, .choice(choice))
+    }
+
+    /// This ask is gone — answered in another client, or its turn died under
+    /// it. Takes the card down and unblocks whoever is waiting; the caller
+    /// checks the request is still live before putting anything on the wire.
+    func withdraw(sessionId: UUID, requestId: String) {
+        let id = "\(sessionId.uuidString)/\(requestId)"
+        guard let continuation = waiters.removeValue(forKey: id) else { return }
+        pending.removeAll { $0.id == id }
+        continuation.resume(returning: .deny(message: "the request was withdrawn"))
     }
 
     /// One answer per ask: a second click (card in the tab *and* in a panel)

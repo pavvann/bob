@@ -11,7 +11,7 @@ struct MinionStrip: View {
     let minions: [MinionService.Minion]
     let sessions: [SessionWatcher.Session]
     var parked: [SessionWatcher.Session] = []
-    var workSessions: [ClaudeSession] = []
+    var tabs: [SessionRef] = []
     var activeID: UUID? = nil
     var onNewSession: () -> Void = {}
 
@@ -31,8 +31,15 @@ struct MinionStrip: View {
                     ForEach(AppSurface.allCases) { surface in
                         SurfaceChip(surface: surface)
                     }
-                    ForEach(workSessions) { session in
-                        SessionTab(session: session, isActive: session.id == activeID)
+                    ForEach(tabs) { tab in
+                        // one switch, one generic chip: the provider changes the
+                        // glyph and the status reading, never the furniture
+                        switch tab {
+                        case .claude(let session):
+                            SessionTab(session: session, isActive: session.id == activeID)
+                        case .codex(let session):
+                            SessionTab(session: session, isActive: session.id == activeID)
+                        }
                     }
                     NewSessionButton(action: onNewSession)
                     ForEach(minions) { MinionCard(minion: $0) }
@@ -143,19 +150,23 @@ struct SurfaceChip: View {
 
 // MARK: - work-session tabs
 
-/// One of bob's own work sessions — a living claude in a project directory,
-/// rendered center-stage when active. Observes the session directly: status
-/// derives from its per-session @Published state, so the dot can never go
+/// One of bob's own work sessions — a living claude or codex in a project
+/// directory, rendered center-stage when active. Observes the session directly:
+/// status derives from its per-session @Published state, so the dot can never go
 /// stale behind a manager-level snapshot. Click activates (waking a cold
 /// restored tab); hover reveals peek (float a live panel without switching)
 /// and ✕ (close).
-struct SessionTab: View {
-    @ObservedObject var session: ClaudeSession
+struct SessionTab<S: StageSession>: View {
+    @ObservedObject var session: S
     let isActive: Bool
     @State private var hover = false
     @ObservedObject private var broker = UIPermissionBroker.shared
 
-    private var status: SessionStatus { SessionManager.status(of: session) }
+    private var status: SessionStatus {
+        if let codex = session.codexSession { return SessionManager.status(of: codex) }
+        if let claude = session.claudeSession { return SessionManager.status(of: claude) }
+        return .done
+    }
     /// The oldest tool call this session is holding for an answer, if any — an
     /// ask-first claude is stopped dead until this is settled.
     private var ask: PermissionRequest? { broker.ask(for: session.id) }
@@ -174,10 +185,13 @@ struct SessionTab: View {
             HStack(spacing: 8) {
                 statusDot
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(session.config.name)
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(.primary.opacity(isActive ? 0.95 : 0.85))
-                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        providerGlyph
+                        Text(session.displayName)
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundStyle(.primary.opacity(isActive ? 0.95 : 0.85))
+                            .lineLimit(1)
+                    }
                     Text(cwdTail)
                         .font(.system(size: 9, weight: .regular, design: .rounded))
                         .foregroundStyle(.secondary.opacity(0.6))
@@ -187,7 +201,7 @@ struct SessionTab: View {
                 }
                 if ask != nil { askBadge }
                 if hover {
-                    peekButton
+                    if session.claudeSession != nil { peekButton }
                     closeButton
                 }
             }
@@ -226,16 +240,31 @@ struct SessionTab: View {
             withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) { hover = isHover }
         }
         .contextMenu {
-            Button("peek live panel") { peek() }
+            if session.claudeSession != nil {
+                Button("peek live panel") { peek() }
+            }
             Button("close session") { SessionManager.shared.close(session.id) }
         }
-        .help(isActive ? "this session is on stage" : "switch to \(session.config.name)")
+        .help(isActive ? "this session is on stage" : "switch to \(session.displayName)")
     }
 
     private var strokeTint: Color {
         if ask != nil { return .orange.opacity(0.55) }
         if isActive { return .accentColor.opacity(0.45) }
         return .white.opacity(hover ? 0.18 : 0.06)
+    }
+
+    /// Which agent is behind this tab — a mark, not a label: the band is tight,
+    /// and claude wears nothing because claude is what a tab is unless it says
+    /// otherwise.
+    @ViewBuilder
+    private var providerGlyph: some View {
+        if let glyph = session.provider.glyph {
+            Image(systemName: glyph)
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(.secondary.opacity(0.65))
+                .help("a codex session")
+        }
     }
 
     /// "waiting on you" at a glance, counted when more than one tool is queued
@@ -258,16 +287,19 @@ struct SessionTab: View {
         .help(count > 1 ? "\(count) tool calls waiting on you" : "a tool call is waiting on you")
     }
 
-    /// "~/Code/webapp" — where this claude lives, home-abbreviated.
+    /// "~/Code/webapp" — where this session lives, home-abbreviated.
     private var cwdTail: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let path = session.config.cwd.path
+        let path = session.cwd.path
         return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
     }
 
-    /// Glance without switching — floats the session's live panel (P2c).
+    /// Glance without switching — floats the session's live panel (P2c). The
+    /// panel reads claude's feed model, so a codex tab has nothing to float
+    /// yet and the affordance is hidden rather than dead.
     private func peek() {
-        SessionPanelController.shared.toggleLive(session: session)
+        guard let claude = session.claudeSession else { return }
+        SessionPanelController.shared.toggleLive(session: claude)
     }
 
     private var peekButton: some View {
@@ -380,11 +412,23 @@ struct PermissionAskCard: View {
                 .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 6) {
-                answer("allow", filled: true) { broker.allow(ask) }
-                answer("deny") { broker.deny(ask) }
-                if !compact {
-                    answer("always") { broker.allowAlways(ask) }
-                        .help(ask.alwaysScope)
+                if ask.choices.isEmpty {
+                    answer("allow", filled: true) { broker.allow(ask) }
+                    answer("deny") { broker.deny(ask) }
+                    if !compact {
+                        answer("always") { broker.allowAlways(ask) }
+                            .help(ask.alwaysScope)
+                    }
+                } else {
+                    // codex: the buttons ARE the request's `availableDecisions`,
+                    // in its own order. The set differs per approval kind and
+                    // drifts between versions — the live exec approval offered
+                    // no `decline` at all — so nothing here may assume a shape.
+                    ForEach(ask.choices) { choice in
+                        answer(choice.label, filled: choice.tone == .affirm,
+                               danger: choice.tone == .stop) { broker.choose(ask, choice) }
+                            .help(choice.hint ?? choice.id)
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -400,12 +444,14 @@ struct PermissionAskCard: View {
         }
     }
 
-    private func answer(_ title: String, filled: Bool = false,
+    private func answer(_ title: String, filled: Bool = false, danger: Bool = false,
                         action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: compact ? 9 : 10, weight: .semibold, design: .rounded))
-                .foregroundStyle(filled ? .black.opacity(0.85) : .primary.opacity(0.8))
+                .foregroundStyle(filled ? .black.opacity(0.85)
+                                        : (danger ? .red.opacity(0.9) : .primary.opacity(0.8)))
+                .lineLimit(1)
                 .padding(.horizontal, compact ? 8 : 10)
                 .padding(.vertical, compact ? 3 : 4)
                 .background {
@@ -430,10 +476,10 @@ struct PermissionAskCard: View {
 /// (wired by ContentView) still closes the picker before any app-hide.
 struct ProjectPicker: View {
     var currentRepo: URL? = nil
-    /// The policy and model ride with the pick: `.askFirst` when the little
-    /// hand is up, and whichever model the dial shows (nil = CLI default) —
-    /// spawnWorkSession takes it from there.
-    let onPick: (URL, PermissionPolicy, String?) -> Void
+    /// Everything the pick decides travels in one value — which agent, which
+    /// model, and whether its tools wait on you. The manager takes it from
+    /// there.
+    let onPick: (SessionPick) -> Void
     let onClose: () -> Void
 
     struct Row: Identifiable {
@@ -447,14 +493,33 @@ struct ProjectPicker: View {
     @State private var projects: [Row] = []
     @State private var loaded = false
     /// Spawn the session with tool calls held for approval (P3a). Off by
-    /// default — ask-first is a choice, not a toll.
+    /// default — ask-first is a choice, not a toll. On a codex session the same
+    /// hand means the same thing one notch stricter: `untrusted` asks about
+    /// everything, where the default `on-request` asks when codex needs out of
+    /// the sandbox.
     @State private var askFirst = false
     /// opus, not the CLI default — the default tier priced a chat at
     /// heavy-lifting rates once already (2026-08-13).
     @State private var model: String = "opus"
+    /// Which agent the new tab runs. Claude unless asked otherwise; the
+    /// companion is always claude.
+    @State private var provider: SessionProvider = .claude
+    /// Codex's own dial, kept apart from claude's so flipping the provider
+    /// back and forth doesn't hand one provider the other's model name.
+    @State private var codexModel: String = ""
+    @ObservedObject private var catalog = CodexCatalog.shared
     @FocusState private var focused: Bool
 
     private var policy: PermissionPolicy { askFirst ? .askFirst : .auto }
+
+    private var pick: (URL) -> SessionPick {
+        { url in
+            SessionPick(url: url, provider: provider, permissions: policy,
+                        model: provider == .codex
+                            ? (codexModel.isEmpty ? nil : codexModel)
+                            : pickedModel)
+        }
+    }
 
     private var matches: [Row] {
         let q = query.trimmingCharacters(in: .whitespaces)
@@ -483,12 +548,13 @@ struct ProjectPicker: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 13, weight: .regular, design: .rounded))
                 .focused($focused)
-                .onSubmit { if let first = matches.first { onPick(first.url, policy, pickedModel) } }
+                .onSubmit { if let first = matches.first { onPick(pick(first.url)) } }
                 .onKeyPress(.escape) {
                     onClose()
                     return .handled
                 }
-                modelDial
+                providerToggle
+                if provider == .codex { codexModelDial } else { modelDial }
                 askFirstToggle
             }
             .padding(.horizontal, 14)
@@ -504,7 +570,7 @@ struct ProjectPicker: View {
                         hint("nothing matches")
                     }
                     ForEach(matches) { row in
-                        PickerRow(row: row) { onPick(row.url, policy, pickedModel) }
+                        PickerRow(row: row) { onPick(pick(row.url)) }
                     }
                 }
                 .padding(6)
@@ -571,6 +637,72 @@ struct ProjectPicker: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("model for this session")
+    }
+
+    /// Which agent. Only offered when codex is actually installed — an option
+    /// that can only fail is worse than no option. Flipping to codex is also
+    /// what warms app-server and fetches its model list, so the first turn
+    /// isn't paying for both.
+    @ViewBuilder
+    private var providerToggle: some View {
+        if CodexServer.codexPath != nil {
+            Button {
+                provider = provider == .claude ? .codex : .claude
+                if provider == .codex { catalog.loadIfNeeded() }
+            } label: {
+                HStack(spacing: 4) {
+                    if let glyph = provider.glyph {
+                        Image(systemName: glyph).font(.system(size: 8, weight: .semibold))
+                    }
+                    Text(provider.rawValue)
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                }
+                .foregroundStyle(provider == .codex ? Color.accentColor.opacity(0.9)
+                                                    : .secondary.opacity(0.7))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background {
+                    Capsule().fill(provider == .codex ? Color.accentColor.opacity(0.14)
+                                                      : .white.opacity(0.06))
+                }
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .help(provider == .codex ? "a codex session — click for claude"
+                                     : "a claude session — click for codex")
+        }
+    }
+
+    /// Codex's models, from `model/list` — never a list bob keeps. "auto" is
+    /// codex's own config choice, and the only thing on offer until the list
+    /// lands (or if it never does).
+    private var codexModelDial: some View {
+        Menu {
+            ForEach(catalog.models) { row in
+                Button { codexModel = row.id } label: {
+                    if row.id == codexModel {
+                        Label(row.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(row.displayName)
+                    }
+                }
+            }
+            Button { codexModel = "" } label: {
+                if codexModel.isEmpty {
+                    Label("auto (codex default)", systemImage: "checkmark")
+                } else {
+                    Text("auto (codex default)")
+                }
+            }
+        } label: {
+            Text(codexModel.isEmpty ? "auto" : codexModel)
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary.opacity(0.75))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("model for this codex session")
     }
 
     private var askFirstToggle: some View {
@@ -750,7 +882,7 @@ struct SessionCard: View {
         } label: {
             HStack(spacing: 8) {
                 statusDot
-                Image(systemName: "terminal")
+                Image(systemName: session.provider.glyph ?? "terminal")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary.opacity(0.7))
                 VStack(alignment: .leading, spacing: 1) {

@@ -16,6 +16,49 @@ lands. Dates are merge dates.
   to match the terminal. Editable at `~/bob/state/companion-loadout.json`, every kept tool
   documented with its token price.
 
+## in review — codex sessions
+
+Bob hosts **Codex sessions** alongside Claude ones: same window, same tabs, same transcript, same
+ask-first permissions. All of it sits on one branch for review; nothing is on main yet.
+
+Codex ships a protocol built for GUI hosts — `codex app-server`, a persistent process speaking
+newline-delimited JSON-RPC — so most of bob retargeted rather than got rebuilt. Three things arrive
+free that Claude made bob work for: the context window is reported exactly, the subscription
+percentages are pushed on every turn (no polling, no keychain), and listing past conversations is
+one request instead of a transcript parser.
+
+- **the protocol, pinned** — [#40](https://github.com/pavvann/bob/pull/40), closes #36. The 291
+  generated schema files committed as a version fixture, a re-runnable protocol recorder, and six
+  behaviours settled by probe: an unanswered approval never expires, a second turn on one thread is
+  silently *merged* into the running one, child processes survive an interrupt, and the daemon
+  cannot outlive bob (so a local websocket is the mechanism for background work).
+- **the transport** — [#41](https://github.com/pavvann/bob/pull/41). One shared app-server, threads
+  as tabs, turns streaming into the existing transcript store through the existing coalescer.
+- **sessions you can open and use** — [#42](https://github.com/pavvann/bob/pull/42), closes #37. A
+  provider capsule in the new-session picker, a hexagon on the tab, the same stage made generic
+  rather than twinned, a per-session dial for model · effort · sandbox · approvals, and codex's
+  approvals routed into bob's own ask-first card with the buttons the wire actually offered.
+- **the work made visible** — [#43](https://github.com/pavvann/bob/pull/43). Commands stream their
+  output into the rail while they run and land with an exit code; a failure goes red and refuses to
+  fold away. Plus MCP calls, searches, file changes, and collapsible reasoning that stays absent
+  when a model emits none.
+- **the commands work** — [#46](https://github.com/pavvann/bob/pull/46). `/resume` was broken three
+  ways: on a codex tab the word travelled to the model as a message, it appeared in no palette at
+  all, and work tabs had no palette to begin with. Fixed, with a per-provider palette scoped to the
+  tab's own project, and a codex resume picker that is one request ordered by real recency.
+- **a first-class citizen** — [#47](https://github.com/pavvann/bob/pull/47). Codex sessions produce
+  digests and answer to `>name`; the subscription strip follows whichever provider the active tab
+  belongs to.
+- **questions** — [#49](https://github.com/pavvann/bob/pull/49), closes #38. Codex's questions reach
+  the chooser bob already had, answered on the request's own id.
+- **the statusline reads the easy source** — [#48](https://github.com/pavvann/bob/pull/48), closes
+  #39. Claude reports its context window and pushes both usage percentages on the wire; bob had been
+  maintaining a table of model window sizes and reading a keychain token to poll an HTTP endpoint for
+  numbers already in its own stdin buffer. Now both providers are symmetrical, and the keychain
+  prompt is gone. A 425,933-token thread that used to pin at `ctx 100%` reads 42.6%.
+
+Forty-one defects were found and fixed across thirteen independent review rounds getting here.
+
 ## 2026-08-27
 
 - **a resumed conversation shows the conversation** — [#32](https://github.com/pavvann/bob/pull/32), closes #30.

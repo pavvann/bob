@@ -38,6 +38,10 @@ enum PermissionDecision {
     /// ask (`permission_suggestions`, probe 1.6) — the "always allow" button.
     case allowAdopting([PermissionSuggestion])
     case deny(message: String)
+    /// One of the answers the request itself offered, carrying the whole reply
+    /// to send back. Codex's approvals work this way — the decision set differs
+    /// per request kind — and a claude ask never produces one.
+    case choice(PermissionChoice)
 }
 
 /// Ask-first sessions forward can_use_tool requests here; the CLI blocks the
@@ -50,10 +54,13 @@ protocol PermissionBroker {
     /// the answer any more, and a card offering to approve a dead session's
     /// Write is worse than no card.
     func abandon(sessionId: UUID)
+    /// One ask specifically: answered elsewhere, or its turn died under it.
+    func withdraw(sessionId: UUID, requestId: String)
 }
 
 extension PermissionBroker {
     func abandon(sessionId: UUID) {}
+    func withdraw(sessionId: UUID, requestId: String) {}
 }
 
 /// The no-op broker `.auto` sessions carry. --permission-mode auto never asks,
@@ -208,9 +215,21 @@ final class ClaudeSession: ObservableObject, Identifiable {
     /// one's window is the one you're looking at. Tagged with the conversation it
     /// was measured in, so a reading can't outlive the thread it describes.
     private var latestUsage: (conversation: UUID, tokens: TokenUsage)?
-    /// The denominator `contextUsedPct` divides by — the reported model's window,
-    /// or the dial alias's before the CLI has spoken.
-    private var contextWindow = ContextWindow.fallback
+    /// The window the CLI last reported, tagged with the model it was reported
+    /// for. The tag is what stops a 1M model's number being reused as a 200k
+    /// model's denominator after a switch — `ContextWindow.denominator` compares
+    /// it rather than trusting it.
+    private var reportedWindow: (model: String?, window: Int)?
+    /// The resolved model id off `system/init` — `claude-sonnet-5[1m]`, dated
+    /// suffix and all. Kept verbatim rather than reduced to a tier word, because
+    /// it is the key `modelUsage` is filed under and the name the fallback guess
+    /// is derived from.
+    private var resolvedModel: String?
+    /// The denominator: reported if it belongs to this model, else the guess the
+    /// model's name affords.
+    private var contextWindow: Int {
+        ContextWindow.denominator(model: resolvedModel, reported: reportedWindow)
+    }
 
     /// `claudePath`/`stderrSink` are injected (SessionManager passes
     /// ClaudeBridge's statics) so the core stays testable standalone.
@@ -222,7 +241,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
         self.taskNoticeLinger = taskNoticeLinger
         self.sessionOnDisk = config.resumed
         self.modelShortName = ContextWindow.shortName(for: config.model)
-        self.contextWindow = ContextWindow.size(for: config.model)
+        // the dial's alias is all bob knows until the CLI's init line names the
+        // resolved id — enough to guess a denominator with, and it is what makes
+        // an opus session's first reported-nothing turn read against 1M
+        self.resolvedModel = config.model
         if config.permissions == .askFirst { self.broker = UIPermissionBroker.shared }
     }
 
@@ -463,16 +485,9 @@ final class ClaudeSession: ObservableObject, Identifiable {
     }
 
     /// The semantic beat: turn boundaries and health flips, nothing per-token.
-    /// AttentionCenter listens here instead of objectWillChange, so a
-    /// streaming turn wakes it a handful of times, not once per delta. Emitted
-    /// after the mutation they describe — a consumer always reads post-change.
-    enum SessionNote: Sendable {
-        case turnBegan
-        case activityChanged   // a notice landed / readiness moved — status may have changed
-        case turnEnded
-        case sessionFailed
-    }
-
+    /// `SessionNote` itself lives in SessionKind.swift — codex sessions speak the
+    /// same four words, and the ear that listens must not know which of the two
+    /// it is hearing.
     var notes: AsyncStream<SessionNote> {
         AsyncStream(bufferingPolicy: .bufferingNewest(16)) { continuation in
             let key = UUID()
@@ -527,7 +542,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
                 }
             }
         }
-        let pump = StreamPump(session: self)
+        let pump = StreamPump<StreamEvent>.claude(session: self)
         let name = config.name
         let sink = stderrSink
         let reader = Task.detached(priority: .userInitiated) {
@@ -775,7 +790,7 @@ final class ClaudeSession: ObservableObject, Identifiable {
             adopt(reportedSessionId: reported)
             // it also names the model the CLI actually resolved, dated id and
             // all, which is the only way to know it when the dial said "default"
-            if ContextWindow.shortName(for: model) != nil { adoptModel(model) }
+            adoptModel(model)
             becomeReadyIfSpawning()
         case .status:
             spontaneousIfIdle()
@@ -866,12 +881,12 @@ final class ClaudeSession: ObservableObject, Identifiable {
                 becomeReadyIfSpawning()
             }
             // interrupt acks need no handling — the aborted result does it
-        case .rateLimit(let type, let resetsAt, let overage):
+        case .rateLimit(let info):
             // the subscription is one account's, not this session's, so the
-            // numbers go to the one meter the whole window reads. The wire knows
-            // the reset instant before the endpoint does; the percentages still
-            // come from the endpoint, on a coalesced refresh.
-            UsageMeter.shared.nudge(type: type, resetsAt: resetsAt, isUsingOverage: overage)
+            // numbers go to the one meter the whole window reads. The event
+            // carries both percentages outright, so this hands over the whole
+            // thing rather than the two fields bob used to keep.
+            UsageMeter.shared.apply(info)
         case .ignored:
             break
         }
@@ -895,11 +910,19 @@ final class ClaudeSession: ObservableObject, Identifiable {
     }
 
     /// One doorway for "this session is running that model": the caption's word
-    /// and the context meter's denominator can never disagree.
+    /// and the id the reported window is looked up by can never disagree.
+    ///
+    /// The raw id is taken whenever the CLI names one — `modelUsage` is keyed by
+    /// it, and an unrecognised tier still reports its window — while the tier word
+    /// is only replaced when there is one, since a stale-but-true word beats none.
+    /// A line that names no model at all changes nothing: silence is not a new
+    /// model, and treating it as one would throw away a good denominator.
     private func adoptModel(_ model: String?) {
-        let short = ContextWindow.shortName(for: model)
-        if short != modelShortName { modelShortName = short }
-        contextWindow = ContextWindow.size(for: model)
+        guard let model, !model.isEmpty else { return }
+        resolvedModel = model
+        if let short = ContextWindow.shortName(for: model), short != modelShortName {
+            modelShortName = short
+        }
     }
 
     private func becomeReadyIfSpawning() {
@@ -930,6 +953,12 @@ final class ClaudeSession: ObservableObject, Identifiable {
 
     private func finishTurn(_ r: TurnResult) {
         lastResult = r
+        // the same event that ends the turn names the window that turn ran in, so
+        // the denominator is never older than the numerator. Tagged with the
+        // model, because that is what makes it safe to keep across turns.
+        if let window = r.contextWindow(for: resolvedModel) {
+            reportedWindow = (resolvedModel, window)
+        }
         publishContextUse()
         let interrupted = state == .interrupting || r.terminalReason == "aborted_streaming"
         if let entry = currentBob {
@@ -999,10 +1028,6 @@ final class ClaudeSession: ObservableObject, Identifiable {
               latest.conversation == config.sessionId,
               contextWindow > 0
         else { return }
-        // A session holding more than its assumed window IS a long-context
-        // session — the API would have refused the prompt otherwise. Promote
-        // the denominator; never demote.
-        if latest.tokens.contextInUse > contextWindow { contextWindow = 1_000_000 }
         let pct = min(100, Double(latest.tokens.contextInUse) / Double(contextWindow) * 100)
         if contextUsedPct != pct { contextUsedPct = pct }
     }
@@ -1232,6 +1257,10 @@ final class ClaudeSession: ObservableObject, Identifiable {
             payload = allowPayload(ask, adopting: suggestions)
         case .deny(let message):
             payload = ["behavior": "deny", "message": message]
+        case .choice:
+            // unreachable: a claude ask carries no choices, so no card can
+            // offer one. Refuse rather than invent a behavior for it.
+            payload = ["behavior": "deny", "message": UIPermissionBroker.refusal]
         }
         writeLine([
             "type": "control_response",

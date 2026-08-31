@@ -30,9 +30,9 @@ extension PermissionPolicy: Codable {
 
 // MARK: - the registry
 
-/// Owns every live ClaudeSession: bob-the-companion at index 0, work sessions
-/// (one per project) after him. Work sessions survive a relaunch as *cold*
-/// tabs — config on disk, no process until they're used.
+/// Owns every live session: bob-the-companion at index 0, work sessions (one
+/// per project, claude or codex) after him. Work sessions survive a relaunch as
+/// *cold* tabs — config on disk, nothing running until they're used.
 @MainActor
 final class SessionManager: ObservableObject {
     static let shared = SessionManager()
@@ -46,6 +46,17 @@ final class SessionManager: ObservableObject {
     }
 
     @Published private(set) var sessions: [ClaudeSession] = []
+    /// Codex tabs. A separate list rather than a widened `sessions`, because
+    /// `sessions` is what the bridge mirrors, and that means *claude* — while
+    /// the band, the stage and the state file read `workTabs`, which is both
+    /// kinds in the order they arrived. AttentionCenter used to read `sessions`
+    /// too; it now subscribes to both (#38), because a codex tab going red is
+    /// the same news as a claude one.
+    @Published private(set) var codexSessions: [CodexSession] = []
+    /// Tab order across providers, by session id. The registry can't derive it:
+    /// two lists have no shared index, and a claude tab opened after a codex one
+    /// must not jump in front of it.
+    @Published private(set) var tabOrder: [UUID] = []
     @Published var activeID: UUID? = nil
 
     /// bob himself — session #0. ClaudeBridge mirrors `sessions.first`, so index
@@ -53,8 +64,41 @@ final class SessionManager: ObservableObject {
     /// behind him, whatever order they arrive in.
     var companion: ClaudeSession? { sessions.first }
     var active: ClaudeSession? { sessions.first(where: { $0.id == activeID }) ?? companion }
-    /// Everything but bob — the tabs, and exactly what the state file holds.
+    /// Every claude but bob.
     var workSessions: [ClaudeSession] { sessions.filter { $0.id != companionID } }
+
+    /// Every tab, either provider, in the order they were opened — the band,
+    /// ⌘1…⌘9, `>name` dispatch and the state file all read this one list.
+    /// Anything missing from `tabOrder` (a spawn path that forgot to register)
+    /// lands at the end rather than disappearing off the band.
+    var workTabs: [SessionRef] {
+        var refs: [SessionRef] = []
+        for id in tabOrder {
+            if let session = sessions.first(where: { $0.id == id && $0.id != companionID }) {
+                refs.append(.claude(session))
+            } else if let session = codexSessions.first(where: { $0.id == id }) {
+                refs.append(.codex(session))
+            }
+        }
+        let known = Set(refs.map(\.id))
+        refs += workSessions.filter { !known.contains($0.id) }.map(SessionRef.claude)
+        refs += codexSessions.filter { !known.contains($0.id) }.map(SessionRef.codex)
+        return refs
+    }
+
+    /// Whichever session is on stage, bob's own thread included.
+    var activeRef: SessionRef? {
+        guard let id = activeID else { return nil }
+        if let session = sessions.first(where: { $0.id == id }) { return .claude(session) }
+        if let session = codexSessions.first(where: { $0.id == id }) { return .codex(session) }
+        return nil
+    }
+
+    /// The active tab when it isn't bob — what the work stage renders.
+    var activeWorkTab: SessionRef? {
+        guard let ref = activeRef, ref.id != companionID else { return nil }
+        return ref
+    }
 
     /// Which session is the companion. Identity, not position, so a launch race
     /// (restore before spawn) can't make a work session masquerade as bob.
@@ -90,8 +134,12 @@ final class SessionManager: ObservableObject {
         }
         restoreWorkSessions()
         // the manager's ear opens with the registry — status transitions in
-        // any work session become digests in bob's own thread (D9)
+        // any work session, either provider, become digests in bob's own
+        // thread (D9, #38)
         AttentionCenter.shared.start()
+        // and the statusline's codex source, which is a subscription rather
+        // than a poller: it costs one idle task until app-server exists
+        CodexMeter.shared.start()
     }
 
     /// Last launch's work sessions come back as cold tabs: config only, no
@@ -107,10 +155,20 @@ final class SessionManager: ObservableObject {
         guard let data = try? Data(contentsOf: stateFile) else { return }
 
         let split = Self.prune(Self.decodeRecords(data), exists: Self.isDirectory)
-        for record in split.kept where !hasWorkSession(cwd: record.cwd) {
-            let session = makeSession(record.config)
-            sessions.append(session)
-            hydrate(session)
+        for record in split.kept where !hasWorkTab(cwd: record.cwd, provider: record.provider) {
+            switch record.provider {
+            case .claude:
+                let session = makeSession(record.config)
+                sessions.append(session)
+                tabOrder.append(session.id)
+                hydrate(session)
+            case .codex:
+                // cold, exactly like a claude tab: the thread is named in the
+                // record and `open()` resumes it on the first send or click.
+                let session = makeCodexSession(record.codexConfig)
+                codexSessions.append(session)
+                tabOrder.append(session.id)
+            }
         }
         for record in split.gone {
             note("dropped restored session '\(record.name)' — \(record.cwd) is gone")
@@ -162,10 +220,44 @@ final class SessionManager: ObservableObject {
             companionID = session.id
         } else {
             sessions.append(session)
+            tabOrder.append(session.id)
             save()
         }
         if activeID == nil { activeID = session.id }
         session.spawn()
+        return session
+    }
+
+    /// A codex session in a project directory — the same gesture as
+    /// `spawnWorkSession`, one process further away: every codex tab shares one
+    /// `codex app-server`, so this opens a thread rather than a process.
+    /// Idempotent per cwd within the provider (a claude tab and a codex tab in
+    /// one project are two different things, and both are allowed).
+    @discardableResult
+    func openCodexSession(cwd: URL, name: String? = nil, model: String? = nil,
+                          effort: String? = nil,
+                          approvalPolicy: CodexApprovalPolicy = .onRequest,
+                          sandbox: CodexSandboxPolicy? = nil,
+                          resumeThreadId: String? = nil) -> CodexSession {
+        let dir = cwd.standardizedFileURL
+        if let existing = codexSessions.first(where: { $0.config.cwd.standardizedFileURL == dir }) {
+            if case .unspawned = existing.state { existing.open() }
+            return existing
+        }
+        let session = makeCodexSession(CodexSessionConfig(
+            cwd: dir,
+            name: name ?? Self.defaultName(for: dir),
+            approvalPolicy: approvalPolicy,
+            sandbox: sandbox,
+            model: model,
+            effort: effort,
+            resumeThreadId: resumeThreadId
+        ))
+        codexSessions.append(session)
+        tabOrder.append(session.id)
+        if activeID == nil { activeID = session.id }
+        save()
+        session.open()
         return session
     }
 
@@ -233,7 +325,7 @@ final class SessionManager: ObservableObject {
     /// clamping to the last tab: a shortcut that lands somewhere you didn't
     /// ask for is worse than one that quietly declines.
     func jumpToWorkSession(_ index: Int) {
-        let tabs = workSessions
+        let tabs = workTabs
         guard index >= 0, index < tabs.count else { return }
         SurfaceRouter.shared.close()
         activate(tabs[index].id)
@@ -243,18 +335,28 @@ final class SessionManager: ObservableObject {
     /// still cold. A `.failed` tab stays failed; retrying is `session.spawn()`,
     /// an explicit second click, not a side effect of looking at it.
     func activate(_ id: UUID) {
-        guard let session = sessions.first(where: { $0.id == id }) else { return }
-        activeID = id
-        if case .unspawned = session.state { session.spawn() }
+        if let session = sessions.first(where: { $0.id == id }) {
+            activeID = id
+            if case .unspawned = session.state { session.spawn() }
+        } else if let session = codexSessions.first(where: { $0.id == id }) {
+            activeID = id
+            if case .unspawned = session.state { session.open() }
+        }
     }
 
     /// Route a prompt at a session, spawning first if the tab is cold. Calling
     /// `session.send` on an unspawned session would client-queue the text with
     /// no process to ever flush it — that queue drains on a process's first init.
     func send(_ text: String, to id: UUID) {
-        guard let session = sessions.first(where: { $0.id == id }) else { return }
-        if case .unspawned = session.state { session.spawn() }
-        session.send(text)
+        if let session = sessions.first(where: { $0.id == id }) {
+            if case .unspawned = session.state { session.spawn() }
+            session.send(text)
+        } else if let session = codexSessions.first(where: { $0.id == id }) {
+            // a codex send before the thread exists is safe: it queues and
+            // drains the moment `open()` reaches `.idle`
+            if case .unspawned = session.state { session.open() }
+            session.send(text)
+        }
     }
 
     // MARK: - bob's hand (D9 — the owner commands, via prefix)
@@ -265,9 +367,15 @@ final class SessionManager: ObservableObject {
     /// on a busy session (probe 1.7): it runs as the next turn, terminal-style,
     /// never interrupting. Spawn-if-cold same as send(_:to:).
     func inject(_ text: String, into id: UUID) {
-        guard let session = sessions.first(where: { $0.id == id }) else { return }
-        if case .unspawned = session.state { session.spawn() }
-        session.send("[via bob] \(text)", source: .injected)
+        if let session = sessions.first(where: { $0.id == id }) {
+            if case .unspawned = session.state { session.spawn() }
+            session.send("[via bob] \(text)", source: .injected)
+        } else if let session = codexSessions.first(where: { $0.id == id }) {
+            // mid-turn this becomes a `turn/steer` rather than a queued turn —
+            // still delivered without interrupting, which is what D9 promises
+            if case .unspawned = session.state { session.open() }
+            session.send("[via bob] \(text)", source: .injected)
+        }
     }
 
     /// The explicit stop verb — `>name! text` — and the ONLY path that ever
@@ -278,8 +386,38 @@ final class SessionManager: ObservableObject {
     /// (still_queued) — and it is never delivered to a session that died
     /// instead of stopping.
     func stopAndTell(_ text: String, to id: UUID) {
+        if let codex = codexSessions.first(where: { $0.id == id }) {
+            stopAndTellCodex(text, to: codex)
+            return
+        }
         guard let session = sessions.first(where: { $0.id == id }) else { return }
         if case .unspawned = session.state { session.spawn() }
+        guard session.isStreaming else {
+            session.send("[via bob] \(text)", source: .injected)
+            return
+        }
+        session.interrupt()
+        Task { @MainActor [weak session] in
+            for _ in 0..<600 {                       // bounded: 30s, watchdog scale
+                guard let session else { return }
+                switch session.state {
+                case .idle:
+                    session.send("[via bob] \(text)", source: .injected)
+                    return
+                case .failed, .unspawned:
+                    return                           // it died — don't pile on
+                default:
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+            }
+        }
+    }
+
+    /// Same shape for a codex tab, one lever shorter: there is no per-session
+    /// process to stop, so the stop is `turn/interrupt` and the wait is for the
+    /// turn to land back on idle.
+    private func stopAndTellCodex(_ text: String, to session: CodexSession) {
+        if case .unspawned = session.state { session.open() }
         guard session.isStreaming else {
             session.send("[via bob] \(text)", source: .injected)
             return
@@ -305,11 +443,37 @@ final class SessionManager: ObservableObject {
     /// of the state file. Quitting is the opposite — `shutdown()` leaves the
     /// file alone so every tab comes back.
     func close(_ id: UUID) {
-        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
-        sessions[index].close()
-        sessions.remove(at: index)
-        if companionID == id { companionID = nil }
-        if activeID == id { activeID = sessions.first?.id }
+        if let index = sessions.firstIndex(where: { $0.id == id }) {
+            sessions[index].close()
+            sessions.remove(at: index)
+            if companionID == id { companionID = nil }
+        } else if let index = codexSessions.firstIndex(where: { $0.id == id }) {
+            let session = codexSessions.remove(at: index)
+            // the thread survives on disk — that's what makes it resumable —
+            // but nothing of it may be left *startable*, and if something was
+            // already running the owner hears about it rather than wondering
+            let name = session.config.name
+            Task { [weak self] in
+                switch await session.close() {
+                case .clean:
+                    break
+                case .leftCommandRunning:
+                    self?.report("closed \(name), but a command it had already started is still"
+                               + " running — codex reaps it when bob quits")
+                case .turnDidNotConfirm:
+                    // forensics, not news: nothing is known to be running, and
+                    // the thread was abandoned rather than left routable. Saying
+                    // this out loud every time app-server is slow to answer an
+                    // interrupt would be noise wearing an alarm's clothes.
+                    self?.note("closed \(name) — codex didn't confirm the turn stopped inside"
+                             + " the leash; thread abandoned rather than detached")
+                }
+            }
+        } else {
+            return
+        }
+        tabOrder.removeAll { $0 == id }
+        if activeID == id { activeID = sessions.first?.id ?? codexSessions.first?.id }
         save()
     }
 
@@ -318,14 +482,36 @@ final class SessionManager: ObservableObject {
     /// Deliberately does NOT touch the state file: the tabs are meant to be
     /// there tomorrow.
     func shutdown() async {
+        await shutdownCodex()
         guard !sessions.isEmpty else { return }
         for session in sessions { session.close() }
         try? await Task.sleep(nanoseconds: 2_000_000_000)
         for session in sessions where session.isRunning { session.terminateNow() }
         sessions.removeAll()
+        tabOrder.removeAll()
         activeID = nil
         companionID = nil
         restoredFromDisk = false
+    }
+
+    /// The codex half of the goodbye, and the one place `CodexServer.shutdown()`
+    /// is called from. Each session stands its own turn down first (concurrently
+    /// — a quit may not cost one interrupt's leash per tab) and refuses whatever
+    /// it was holding for an answer; only then does stdin close, so app-server
+    /// has nothing pending and exits in milliseconds rather than taking the ~9s
+    /// a clean close with work in flight is entitled to.
+    ///
+    /// Called unconditionally: the model dial can start app-server without any
+    /// session existing, and an orphaned one would outlive bob.
+    private func shutdownCodex() async {
+        let codex = codexSessions
+        codexSessions.removeAll()
+        if !codex.isEmpty {
+            await withTaskGroup(of: Void.self) { group in
+                for session in codex { group.addTask { await session.close() } }
+            }
+        }
+        await CodexServer.shared.shutdown()
     }
 
     // MARK: - status derivation (D9)
@@ -373,6 +559,39 @@ final class SessionManager: ObservableObject {
 
     func status(of session: ClaudeSession) -> SessionStatus { Self.status(of: session) }
 
+    /// The codex reading of the same five words. Two differences from claude's,
+    /// both because the protocol says it plainly instead of leaving it to be
+    /// inferred: `activeFlags` names a park (`waitingOnApproval`) whether or not
+    /// bob could draw a card for it, and the last turn's own reported status
+    /// stands in for parsing a closing message. The trailing-notice branch is
+    /// deliberately absent — a resumed thread's history lands under a notice,
+    /// and claude's equivalent would read that as a session that just dropped.
+    static func status(of session: CodexSession) -> SessionStatus {
+        if case .failed = session.state { return .error }
+        if UIPermissionBroker.shared.count(for: session.id) > 0 { return .awaitingInput }
+        if !session.activeFlags.isEmpty { return .awaitingInput }
+        // a question codex is *blocking* on. `blockedOn` excludes the
+        // non-blocking kind by construction, which is what keeps a question
+        // codex isn't waiting for from reading as a stopped thread.
+        if session.blockedOn != nil { return .awaitingInput }
+        switch session.state {
+        case .turnActive, .interrupting, .spawning: return .working
+        default: break
+        }
+        if session.lastTurn?.status == .failed { return .needsAttention }
+        if endsInQuestion(session.transcript.entries.last(where: { $0.role == .bob && !$0.hidden })?.text) {
+            return .awaitingInput
+        }
+        return .done
+    }
+
+    static func status(of ref: SessionRef) -> SessionStatus {
+        switch ref {
+        case .claude(let session): return status(of: session)
+        case .codex(let session): return status(of: session)
+        }
+    }
+
     /// "should i force-push?" → awaiting. Trailing emphasis or brackets don't
     /// hide the mark: `**…?**` and `(…?)` still count.
     static func endsInQuestion(_ text: String?) -> Bool {
@@ -393,13 +612,37 @@ final class SessionManager: ObservableObject {
     /// rather than `--session-id` (the CLI hard-errors on an id it already owns:
     /// "Session ID … is already in use", rc=1, probed on 2.1.228). That is what
     /// makes a restored tab the *same* conversation, history and all, and keeps
-    /// its transcript under ~/.claude/projects named the same forever.
+    /// its transcript under ~/.claude/projects named the same forever. On a
+    /// codex tab `id` names nothing on codex's side — `codex.threadId` is what
+    /// resumes the conversation — so there it's just a stable bob-side handle.
     struct SessionRecord: Codable, Equatable {
         var id: UUID
         var cwd: String                     // absolute path, plain string so the file reads
         var name: String
-        var model: String?                  // absent = CLI default
-        var permissions: PermissionPolicy?  // absent = .auto
+        var model: String?                  // absent = CLI default (claude) / codex config
+        var permissions: PermissionPolicy?  // absent = .auto — claude only
+        /// Absent = claude, so a file written before codex existed still reads,
+        /// and a file of nothing but claude tabs still reads the way it did.
+        var kind: SessionProvider?
+        /// The codex-only half. Nested rather than five more optional columns:
+        /// the two providers configure nothing in common except cwd, name and
+        /// model.
+        var codex: CodexRecord?
+
+        struct CodexRecord: Codable, Equatable {
+            /// What `thread/resume` needs next launch — the whole reason a
+            /// restored codex tab is the same conversation.
+            var threadId: String?
+            var effort: String?
+            /// Only `readOnly` is ever written: absent means the GUI default,
+            /// writes scoped to the session's own cwd, which is computed from
+            /// cwd rather than stored so a moved project can't leave a stale
+            /// writable root behind.
+            var sandbox: String?
+            var approval: String?
+        }
+
+        var provider: SessionProvider { kind ?? .claude }
 
         var config: SessionConfig {
             SessionConfig(
@@ -411,6 +654,19 @@ final class SessionManager: ObservableObject {
                 name: name,
                 voiced: false,
                 resumed: true
+            )
+        }
+
+        var codexConfig: CodexSessionConfig {
+            CodexSessionConfig(
+                sessionId: id,
+                cwd: URL(fileURLWithPath: cwd),
+                name: name,
+                approvalPolicy: CodexApprovalPolicy(rawValue: codex?.approval ?? "") ?? .onRequest,
+                sandbox: codex?.sandbox == "readOnly" ? .readOnly : nil,
+                model: model,
+                effort: codex?.effort,
+                resumeThreadId: codex?.threadId
             )
         }
     }
@@ -460,10 +716,18 @@ final class SessionManager: ObservableObject {
     func persist() { save() }
 
     private func save() {
-        guard let data = Self.encodeRecords(workSessions.map(record(for:))) else { return }
+        // in workTabs order, so the band comes back the way it was left
+        guard let data = Self.encodeRecords(workTabs.map(record(for:))) else { return }
         try? FileManager.default.createDirectory(
             at: stateFile.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: stateFile, options: .atomic)
+    }
+
+    private func record(for ref: SessionRef) -> SessionRecord {
+        switch ref {
+        case .claude(let session): return record(for: session)
+        case .codex(let session): return record(for: session)
+        }
     }
 
     private func record(for session: ClaudeSession) -> SessionRecord {
@@ -473,6 +737,23 @@ final class SessionManager: ObservableObject {
             name: session.config.name,
             model: session.config.model,
             permissions: session.config.permissions
+        )
+    }
+
+    private func record(for session: CodexSession) -> SessionRecord {
+        SessionRecord(
+            id: session.config.sessionId,
+            cwd: session.config.cwd.path,
+            name: session.config.name,
+            model: session.config.model,
+            permissions: nil,
+            kind: .codex,
+            codex: SessionRecord.CodexRecord(
+                threadId: session.threadId ?? session.config.resumeThreadId,
+                effort: session.config.effort,
+                sandbox: session.config.sandbox == .readOnly ? "readOnly" : nil,
+                approval: session.config.approvalPolicy.rawValue
+            )
         )
     }
 
@@ -491,9 +772,30 @@ final class SessionManager: ObservableObject {
         return session
     }
 
-    private func hasWorkSession(cwd: String) -> Bool {
+    private func makeCodexSession(_ config: CodexSessionConfig) -> CodexSession {
+        let session = CodexSession(config: config, server: .shared)
+        // the dial and the thread id both live in the state file, so every way
+        // either can change writes it — including the ones nobody thought of
+        session.onConfigChanged = { [weak self] in self?.save() }
+        return session
+    }
+
+    private func hasWorkTab(cwd: String, provider: SessionProvider) -> Bool {
         let dir = URL(fileURLWithPath: cwd).standardizedFileURL
-        return workSessions.contains { $0.config.cwd.standardizedFileURL == dir }
+        switch provider {
+        case .claude:
+            return workSessions.contains { $0.config.cwd.standardizedFileURL == dir }
+        case .codex:
+            return codexSessions.contains { $0.config.cwd.standardizedFileURL == dir }
+        }
+    }
+
+    /// Something happened to a session that the owner would otherwise have no
+    /// way to know: it goes in bob's own thread, which is where bob tells him
+    /// things, and in the log either way.
+    private func report(_ line: String) {
+        note(line)
+        companion?.transcript.append(TranscriptEntry(role: .notice, text: line))
     }
 
     /// Registry forensics land in the same log a curious owner already checks:

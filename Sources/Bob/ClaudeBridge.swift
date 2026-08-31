@@ -557,10 +557,10 @@ final class ClaudeBridge: ObservableObject {
     /// writes instead of clobbering each other, and rotated one generation back
     /// past a megabyte so it can't grow forever. Falls back to /dev/null rather
     /// than ever letting the noise back into the reply.
-    nonisolated static func stderrSink(root: URL) -> FileHandle {
+    nonisolated static func stderrSink(root: URL, name: String = "bridge-stderr.log") -> FileHandle {
         let url = root
             .appendingPathComponent("state", isDirectory: true)
-            .appendingPathComponent("bridge-stderr.log")
+            .appendingPathComponent(name)
         let fm = FileManager.default
         try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let attrs = try? fm.attributesOfItem(atPath: url.path),
