@@ -8,6 +8,8 @@
     <string>bob</string>
     <key>CFBundleIdentifier</key>
     <string>app.bob.mac</string>
+    <key>CFBundleIconFile</key>
+    <string>Bob</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
