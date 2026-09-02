@@ -9,9 +9,12 @@
     <key>CFBundleIdentifier</key>
     <string>app.bob.mac</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>0</string>
+    <!-- Stamped at build time by `make app` from ./VERSION and the commit
+         count. 0.0.0/0 is the placeholder: a bundle reading it was assembled
+         without the stamp, which is worth noticing rather than trusting. -->
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.0.0</string>
     <key>CFBundleExecutable</key>
     <string>Bob</string>
     <key>CFBundlePackageType</key>

@@ -6,7 +6,13 @@ and the number that mattered. written for the person using bob, not for the diff
 Convention: every change arrives on a branch, through a PR, reviewed independently before it
 lands. Dates are merge dates.
 
-## in review
+Versions: the marketing version lives in `./VERSION` and is stamped into the bundle by
+`make app`, alongside a build number that is simply the commit count — monotonic without a
+counter to maintain, reproducible from any checkout. A released section below is named for the
+version it shipped as; `in review` is whatever has not merged yet. `Bob → About Bob` reads the
+same string bob hands codex as its client version.
+
+## in review — 0.3.0
 
 - **the companion stops carrying a coding terminal** — [#33](https://github.com/pavvann/bob/pull/33), closes #31.
   bob's own chat spawned with the full terminal loadout: ~94 global skills, 9 MCP servers, 89
@@ -16,10 +22,23 @@ lands. Dates are merge dates.
   to match the terminal. Editable at `~/bob/state/companion-loadout.json`, every kept tool
   documented with its token price.
 
-## in review — codex sessions
+- **an app icon, and `make install`** — [#59](https://github.com/pavvann/bob/pull/59). Bob has a
+  face, and a one-line way into /Applications. The source art had no alpha, so its corners were
+  opaque black and would have rendered as a hard square; the silhouette is derived from the art
+  itself and placed on Apple's icon grid so bob sits at the same optical size as its neighbours.
+- **PATH from an interactive login shell** — [#60](https://github.com/pavvann/bob/pull/60). Bob
+  reported "codex binary not found" for a binary that ran fine in a terminal, and the codex/claude
+  switcher quietly disappeared from the new-session picker with it. `zsh -lc` is a login shell that
+  is *not interactive*, so it skips `.zshrc` — which is where npm's global prefix, pyenv, cargo and
+  nvm actually add themselves. A GUI-launched bob was computing a PATH the owner's terminal has
+  never had. claude was spared only because homebrew happens to sit on the non-interactive path.
+
+## 0.2.0 — 2026-08-31
+
+The release that made bob two-agent, gave it a real terminal, and got it an icon.
 
 Bob hosts **Codex sessions** alongside Claude ones: same window, same tabs, same transcript, same
-ask-first permissions. All of it sits on one branch for review; nothing is on main yet.
+ask-first permissions.
 
 Codex ships a protocol built for GUI hosts — `codex app-server`, a persistent process speaking
 newline-delimited JSON-RPC — so most of bob retargeted rather than got rebuilt. Three things arrive
@@ -58,6 +77,27 @@ one request instead of a transcript parser.
   prompt is gone. A 425,933-token thread that used to pin at `ctx 100%` reads 42.6%.
 
 Forty-one defects were found and fixed across thirteen independent review rounds getting here.
+
+- **codex sessions in a terminal get a card and a panel** —
+  [#53](https://github.com/pavvann/bob/pull/53), closes #52. A codex session running in a terminal
+  was invisible to bob while a claude one got a live panel. Two filters decide what earns a card:
+  `originator`, codex's analog of claude's `sdk-cli` stamp, and `source`, which has to be the
+  literal string `cli` — a subagent thread carries the same originator with an *object* there, and
+  33 of 45 tui rollouts on this machine are subagents, so filtering on originator alone puts three
+  noise cards in the band for every real one. Rollouts are also filed by the day a session
+  *started*, so one open for a week sits in last week's directory: the scan crosses date dirs.
+- **a real terminal** — [#55](https://github.com/pavvann/bob/pull/55), closes #54 and #7. A pty with
+  a login shell in a floating panel, one per working directory, opened from a button beside the
+  input box. `vi`, `ngrok`, a dev server — anything you would type in a terminal. Closing the panel
+  *hides* it: the process, the pty and the scrollback survive, so a dev server does not die because
+  you shut the window. Only the shell exiting closes one for real. Burst output measured at ~105k
+  lines/sec cost 2.8s of cpu and settled clean, and with no terminal open idle sits on the
+  performance baseline to the tenth.
+- **the protocol fixture retired** — [#57](https://github.com/pavvann/bob/pull/57). The 291 generated
+  schema files #40 pinned were reference material, and the reference had been read: nothing in the
+  build, the bundle or the runtime ever loaded them. What they caught lives in the decoder and the
+  probe findings now, and the files stay recoverable from git history, so only 3.7MB of noise left
+  every clone, worktree and file tree.
 
 ## 2026-08-27
 
