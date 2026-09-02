@@ -618,28 +618,64 @@ final class ClaudeBridge: ObservableObject {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        proc.arguments = ["-lc", "echo -n $PATH"]
+        // `-i` as well as `-l`. A login shell that is not interactive sources
+        // .zprofile and .zlogin but SKIPS .zshrc — and .zshrc is where PATH
+        // additions actually live: npm's global prefix, pyenv, cargo, nvm.
+        // Without `-i` a GUI-launched bob computes a PATH the owner's terminal
+        // has never had, so a tool installed by npm is simply invisible and
+        // `codexPath` reports "not found" for a binary that runs fine in a
+        // terminal two inches away.
+        //
+        // The sentinel is because an interactive rc file is allowed to print:
+        // banners, motd, update notices. Reading stdout raw folds that chatter
+        // into the first PATH entry. `\036` (record separator) cannot occur in
+        // a path, so everything after the last one is PATH and nothing else.
+        proc.arguments = ["-ilc", #"printf '\036%s' "$PATH""#]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = FileHandle.nullDevice
 
-        let done = DispatchSemaphore(value: 0)
-        proc.terminationHandler = { _ in done.signal() }
+        // Drain concurrently rather than after exit. A chatty rc file can fill
+        // the 64KB pipe buffer, and a child blocked on write never exits — which
+        // as a read-after-wait would have been a guaranteed timeout instead of a
+        // PATH. EOF here means the child closed stdout, which is also the signal
+        // that it is done talking.
+        let lock = NSLock()
+        var collected = Data()
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            lock.lock(); collected = data; lock.unlock()
+            drained.signal()
+        }
+
         do {
             try proc.run()
         } catch {
             return fallback
         }
-        guard done.wait(timeout: .now() + 2) == .success else {
-            proc.terminationHandler = nil
+        // An interactive rc is heavier than a bare login one — measured 0.05s
+        // without `-i` against 0.6-0.8s with it on this machine — so the ceiling
+        // has room for a slow rc while still bounding a hang. It stays a ceiling
+        // rather than a wait: this resolves lazily and can land on the main actor.
+        guard drained.wait(timeout: .now() + 4) == .success else {
             proc.terminate()
             return fallback
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard proc.terminationStatus == 0,
-              let resolved = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !resolved.isEmpty
+        proc.waitUntilExit()
+
+        lock.lock(); let data = collected; lock.unlock()
+        // Exit status is deliberately not checked. The sentinel already proves
+        // the printf ran; an rc file whose last act happens to fail should not
+        // cost the owner their PATH.
+        guard let text = String(data: data, encoding: .utf8),
+              let tail = text.components(separatedBy: "\u{1e}").last
         else { return fallback }
-        return resolved
+        let resolved = tail
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: ":")
+            .filter { !$0.isEmpty }
+            .joined(separator: ":")
+        return resolved.isEmpty ? fallback : resolved
     }()
 }
