@@ -269,25 +269,29 @@ struct ContentView: View {
     /// version tripped the type checker once each tile carried a third
     /// argument — five generic `HoverTile`s in one builder is about the limit.
     private var ambientStrip: some View {
-        HStack(alignment: .top, spacing: ambientCollapsed ? 8 : 12) {
-            if ambientCollapsed { Spacer(minLength: 0) }
-            ambientTiles
-            if ambientCollapsed { Spacer(minLength: 0) }
+        Group {
+            if ambientCollapsed {
+                // one shared panel with a pointer, not five tiles that each
+                // reveal their own — see AmbientBar
+                AmbientBar()
+            } else {
+                HStack(alignment: .top, spacing: 12) { ambientTiles }
+            }
         }
         .frame(height: ambientCollapsed ? 30 : 110, alignment: .top)
         .animation(.spring(response: 0.34, dampingFraction: 0.84), value: ambientCollapsed)
         .zIndex(2)
     }
 
-    /// Reveal side mirrors each icon's place in the row, so a panel always opens
-    /// away from the nearest window edge and stays paired with its own icon.
+    /// bob's own stage, where the tiles are the point and are laid out in full.
+    /// The collapsed case is AmbientBar's job.
     @ViewBuilder
     private var ambientTiles: some View {
-        HoverTile(title: "work", iconified: ambientCollapsed, reveal: .leading) { WorkTileContent(expanded: $0) }
-        HoverTile(title: "music", iconified: ambientCollapsed, reveal: .leading) { MusicTileContent(expanded: $0) }
-        HoverTile(title: "todos", iconified: ambientCollapsed, reveal: .center) { TodoTileContent(expanded: $0) }
-        HoverTile(title: "calendar", iconified: ambientCollapsed, reveal: .trailing) { CalendarTileContent(expanded: $0) }
-        HoverTile(title: "weather", iconified: ambientCollapsed, reveal: .trailing) { WeatherTileContent(expanded: $0) }
+        HoverTile(title: "work") { WorkTileContent(expanded: $0) }
+        HoverTile(title: "music") { MusicTileContent(expanded: $0) }
+        HoverTile(title: "todos") { TodoTileContent(expanded: $0) }
+        HoverTile(title: "calendar") { CalendarTileContent(expanded: $0) }
+        HoverTile(title: "weather") { WeatherTileContent(expanded: $0) }
     }
 
     /// A session or a surface is on stage, so the ambient tiles step aside. Bob's
@@ -1133,5 +1137,175 @@ private struct MemoryTileContent: View {
             }
         }
         return result.reversed()
+    }
+}
+
+// MARK: - the collapsed ambient bar
+
+/// The panel and its pointer as ONE path. A triangle parked on top of a card
+/// shows a seam where two materials meet — same fill, drawn twice, composited
+/// twice — so the beak is part of the card's own outline instead. `caretX` is
+/// `animatableData`, which is what lets the pointer slide between icons rather
+/// than cut.
+private struct PanelWithCaret: Shape {
+    var caretX: CGFloat
+    var caretWidth: CGFloat = 20
+    var caretHeight: CGFloat = 8
+    var cornerRadius: CGFloat = 22
+
+    var animatableData: CGFloat {
+        get { caretX }
+        set { caretX = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let body = CGRect(x: rect.minX, y: rect.minY + caretHeight,
+                          width: rect.width, height: max(0, rect.height - caretHeight))
+        var path = Path(roundedRect: body, cornerRadius: cornerRadius, style: .continuous)
+        // keep the beak clear of the rounded corners, or it grows out of a curve
+        let limit = cornerRadius + caretWidth / 2
+        let x = min(max(caretX, body.minX + limit), body.maxX - limit)
+        // half a point of overlap into the body: an exact meeting leaves a
+        // hairline where the two subpaths touch
+        let base = body.minY + 0.5
+        var beak = Path()
+        beak.move(to: CGPoint(x: x - caretWidth / 2, y: base))
+        beak.addQuadCurve(to: CGPoint(x: x, y: rect.minY),
+                          control: CGPoint(x: x - caretWidth / 5, y: rect.minY + caretHeight * 0.3))
+        beak.addQuadCurve(to: CGPoint(x: x + caretWidth / 2, y: base),
+                          control: CGPoint(x: x + caretWidth / 5, y: rect.minY + caretHeight * 0.3))
+        beak.closeSubpath()
+        path.addPath(beak)
+        return path
+    }
+}
+
+/// The ambient row while a session is on stage: five icons that never move, and
+/// one panel that opens in the same place every time with a pointer aimed back
+/// at whichever icon you are on.
+///
+/// Panels that opened on their icon's own side put the card somewhere different
+/// for every icon, which read as unattached. A fixed panel plus a moving pointer
+/// is the same information with nothing travelling but the pointer — and because
+/// the pointer belongs to the card's outline, the icon and the panel read as one
+/// linked thing rather than two stacked ones.
+///
+/// Hover is one region across the whole row rather than one per icon, so sliding
+/// between icons never crosses a dead gap and the panel never flickers out and
+/// back on the way.
+private struct AmbientBar: View {
+    /// The icon under the pointer right now.
+    @State private var active: Int?
+    /// The last icon shown, so the panel survives the pointer leaving the row
+    /// for the panel itself.
+    @State private var sticky = 0
+    /// Pointer is on the panel — that is what makes the panel reachable.
+    @State private var held = false
+
+    private static let icon: CGFloat = 30
+    private static let gap: CGFloat = 8
+    private static let step: CGFloat = icon + gap
+    private static let panelWidth: CGFloat = 300
+    private static let caretHeight: CGFloat = 8
+
+    private static let items: [(title: String, symbol: String)] = [
+        ("work", "briefcase"),
+        ("music", "music.note"),
+        ("todos", "checklist"),
+        ("calendar", "calendar"),
+        ("weather", "cloud.sun"),
+    ]
+
+    private var shown: Int? { active ?? (held ? sticky : nil) }
+
+    /// Icon `i`'s centre, measured from the row's own leading edge. Every icon is
+    /// the same size, so this is arithmetic — no GeometryReader per icon.
+    private static func center(_ i: Int) -> CGFloat {
+        CGFloat(i) * step + icon / 2
+    }
+
+    /// The row is centred inside the panel's width, so the beak lands on the
+    /// icon by construction.
+    private static func caretX(_ i: Int) -> CGFloat {
+        let rowWidth = CGFloat(items.count) * icon + CGFloat(items.count - 1) * gap
+        return (panelWidth - rowWidth) / 2 + center(i)
+    }
+
+    var body: some View {
+        HStack(spacing: Self.gap) {
+            ForEach(Self.items.indices, id: \.self) { i in
+                Image(systemName: Self.items[i].symbol)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary.opacity(shown == i ? 0.9 : 0.5))
+                    .frame(width: Self.icon, height: Self.icon)
+                    .background {
+                        Circle().fill(.ultraThinMaterial)
+                            .overlay { if shown == i { Circle().fill(Color.accentColor.opacity(0.08)) } }
+                    }
+                    .overlay { Circle().stroke(.white.opacity(shown == i ? 0.16 : 0.06), lineWidth: 0.5) }
+                    .help(Self.items[i].title)
+            }
+        }
+        .onContinuousHover(coordinateSpace: .local) { phase in
+            switch phase {
+            case .active(let point):
+                let i = min(max(Int(point.x / Self.step), 0), Self.items.count - 1)
+                // This fires on every mouse move. A state write per move is
+                // exactly the pointer-excited invalidation the transcript work
+                // went to remove, so nothing is written unless the icon changes.
+                guard active != i else { return }
+                sticky = i
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) { active = i }
+            case .ended:
+                guard active != nil else { return }
+                withAnimation(.easeOut(duration: 0.16)) { active = nil }
+            }
+        }
+        .overlay(alignment: .top) { panel }
+        .zIndex(20)
+    }
+
+    @ViewBuilder
+    private var panel: some View {
+        if let i = shown {
+            let shape = PanelWithCaret(caretX: Self.caretX(i), caretHeight: Self.caretHeight)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(Self.items[i].title)
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary.opacity(0.55))
+                    .textCase(.uppercase)
+                    .tracking(0.8)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .padding(.bottom, 8)
+                tileContent(i)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 14)
+            }
+            // clears the beak, which lives in the top `caretHeight` of the shape
+            .padding(.top, Self.caretHeight)
+            .frame(width: Self.panelWidth)
+            // hugs its content: a tile with one line in it shouldn't hang 220pt
+            // of empty glass over the transcript
+            .fixedSize(horizontal: false, vertical: true)
+            .background { shape.fill(.ultraThinMaterial) }
+            .overlay { shape.stroke(.white.opacity(0.06), lineWidth: 0.5) }
+            .shadow(color: .black.opacity(0.34), radius: 18, x: 0, y: 8)
+            .offset(y: Self.icon - Self.caretHeight + 6)
+            .onHover { held = $0 }
+            .transition(.opacity)
+        }
+    }
+
+    @ViewBuilder
+    private func tileContent(_ i: Int) -> some View {
+        switch i {
+        case 0:  WorkTileContent(expanded: true)
+        case 1:  MusicTileContent(expanded: true)
+        case 2:  TodoTileContent(expanded: true)
+        case 3:  CalendarTileContent(expanded: true)
+        default: WeatherTileContent(expanded: true)
+        }
     }
 }
