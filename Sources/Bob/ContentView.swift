@@ -1194,13 +1194,14 @@ private struct PanelWithCaret: Shape {
 /// between icons never crosses a dead gap and the panel never flickers out and
 /// back on the way.
 private struct AmbientBar: View {
-    /// The icon under the pointer right now.
+    /// The icon under the pointer right now, if the pointer is on one.
     @State private var active: Int?
-    /// The last icon shown, so the panel survives the pointer leaving the row
-    /// for the panel itself.
+    /// The last icon that was under it. This is what the panel keeps showing
+    /// while the pointer is between icons or down on the panel itself.
     @State private var sticky = 0
-    /// Pointer is on the panel — that is what makes the panel reachable.
-    @State private var held = false
+    /// Pointer is somewhere in the bar — including the revealed panel, which is
+    /// an overlay of the row and so shares its hover region.
+    @State private var inBar = false
 
     private static let icon: CGFloat = 30
     private static let gap: CGFloat = 8
@@ -1216,7 +1217,11 @@ private struct AmbientBar: View {
         ("weather", "cloud.sun"),
     ]
 
-    private var shown: Int? { active ?? (held ? sticky : nil) }
+    /// Falling back to `sticky` whenever the pointer is anywhere in the bar is
+    /// what makes the row traversable: the 8pt gaps between icons and the space
+    /// under them are not on any icon, and clearing on the way would close the
+    /// panel every time you moved between two of them.
+    private var shown: Int? { active ?? (inBar ? sticky : nil) }
 
     /// Icon `i`'s centre, measured from the row's own leading edge. Every icon is
     /// the same size, so this is arithmetic — no GeometryReader per icon.
@@ -1243,25 +1248,30 @@ private struct AmbientBar: View {
                             .overlay { if shown == i { Circle().fill(Color.accentColor.opacity(0.08)) } }
                     }
                     .overlay { Circle().stroke(.white.opacity(shown == i ? 0.16 : 0.06), lineWidth: 0.5) }
+                    .contentShape(Circle())
+                    // Per-icon, not one continuous-hover region across the row:
+                    // each icon carries a `.help` tooltip, and those install
+                    // tracking areas of their own that swallow a parent's
+                    // mouse-moved updates once the pointer is inside a child.
+                    // Two writes per icon change either way.
+                    .onHover { isHover in
+                        if isHover {
+                            sticky = i
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+                                active = i
+                            }
+                        } else if active == i {
+                            active = nil
+                        }
+                    }
                     .help(Self.items[i].title)
             }
         }
-        .onContinuousHover(coordinateSpace: .local) { phase in
-            switch phase {
-            case .active(let point):
-                let i = min(max(Int(point.x / Self.step), 0), Self.items.count - 1)
-                // This fires on every mouse move. A state write per move is
-                // exactly the pointer-excited invalidation the transcript work
-                // went to remove, so nothing is written unless the icon changes.
-                guard active != i else { return }
-                sticky = i
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) { active = i }
-            case .ended:
-                guard active != nil else { return }
-                withAnimation(.easeOut(duration: 0.16)) { active = nil }
-            }
-        }
         .overlay(alignment: .top) { panel }
+        .onHover { isHover in
+            guard inBar != isHover else { return }
+            withAnimation(.easeOut(duration: 0.16)) { inBar = isHover }
+        }
         .zIndex(20)
     }
 
@@ -1292,8 +1302,10 @@ private struct AmbientBar: View {
             .background { shape.fill(.ultraThinMaterial) }
             .overlay { shape.stroke(.white.opacity(0.06), lineWidth: 0.5) }
             .shadow(color: .black.opacity(0.34), radius: 18, x: 0, y: 8)
-            .offset(y: Self.icon - Self.caretHeight + 6)
-            .onHover { held = $0 }
+            // beak tip meets the row's bottom edge exactly — a gap here is a
+            // dead strip the pointer has to cross to reach the panel, and a
+            // touching beak is what makes the two read as one thing
+            .offset(y: Self.icon)
             .transition(.opacity)
         }
     }
