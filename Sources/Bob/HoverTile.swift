@@ -14,6 +14,30 @@ struct HoverTile<Content: View>: View {
     let content: (Bool) -> Content
     /// Collapsed to an icon (a session is on stage), or laid out in full (bob is).
     var iconified: Bool = false
+    /// Which way the revealed tile hangs off its icon.
+    var reveal: Reveal = .leading
+
+    /// The row is centred, so a tile that always opened rightward would drift
+    /// further from the icon that owns it the further right that icon sits — and
+    /// the eye pairs a panel with whichever icon it is nearest. Opening on the
+    /// icon's own side keeps the two read as one thing, and keeps a 300pt panel
+    /// off the window edges without any clamping.
+    enum Reveal { case leading, center, trailing }
+
+    /// Spelled out rather than memberwise: with two defaulted arguments sitting
+    /// after `content` in declaration order, a trailing closure can no longer
+    /// reach it, and the call sites read worse for it.
+    init(
+        title: String,
+        iconified: Bool = false,
+        reveal: Reveal = .leading,
+        @ViewBuilder content: @escaping (Bool) -> Content
+    ) {
+        self.title = title
+        self.iconified = iconified
+        self.reveal = reveal
+        self.content = content
+    }
 
     @State private var hover = false
 
@@ -71,7 +95,7 @@ struct HoverTile<Content: View>: View {
             // The revealed tile hangs off the icon rather than living in the row,
             // so nothing below it moves — and it stays in the hover region, so
             // travelling from icon to tile doesn't dismiss it.
-            .overlay(alignment: .topLeading) {
+            .overlay(alignment: revealAlignment) {
                 if hover {
                     Tile(title: title) { content(true) }
                         // hugs its content: a tile with one line in it shouldn't
@@ -79,8 +103,12 @@ struct HoverTile<Content: View>: View {
                         .frame(width: 300)
                         .fixedSize(horizontal: false, vertical: true)
                         .shadow(color: .black.opacity(0.34), radius: 18, x: 0, y: 8)
-                        .offset(x: -6, y: 34)
-                        .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
+                        .offset(x: revealOffset, y: 34)
+                        // grows out of the corner it is anchored to, so the
+                        // motion reads as coming from the icon rather than
+                        // arriving from somewhere else
+                        .transition(.opacity.combined(
+                            with: .scale(scale: 0.97, anchor: revealAnchor)))
                 }
             }
             .zIndex(hover ? 20 : 0)
@@ -90,5 +118,31 @@ struct HoverTile<Content: View>: View {
                 }
             }
             .help(title)
+    }
+
+    private var revealAlignment: Alignment {
+        switch reveal {
+        case .leading:  return .topLeading
+        case .center:   return .top
+        case .trailing: return .topTrailing
+        }
+    }
+
+    /// A few points of overhang past the icon, outward on the side it opens to,
+    /// so the panel's edge does not sit exactly on the 30pt circle's.
+    private var revealOffset: CGFloat {
+        switch reveal {
+        case .leading:  return -6
+        case .center:   return 0
+        case .trailing: return 6
+        }
+    }
+
+    private var revealAnchor: UnitPoint {
+        switch reveal {
+        case .leading:  return .topLeading
+        case .center:   return .top
+        case .trailing: return .topTrailing
+        }
     }
 }

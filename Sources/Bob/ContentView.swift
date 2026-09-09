@@ -25,26 +25,17 @@ struct ContentView: View {
             AmbientBackground(palette: music.palette, active: music.isPlaying)
 
             HStack(spacing: 14) {
-                VStack(spacing: 18) {
+                VStack(spacing: ambientCollapsed ? 10 : 18) {
                     // ambient context — glanceable strip across the top.
                     // hover any tile to grow it (dock-style) into the richer
                     // expanded variant. HStack alignment top so smaller tiles
                     // sit at the top while the hovered one expands downward.
                     // Full tiles on bob's own stage; on a session page they
                     // collapse to icons and give the transcript the height back.
-                    // Leading-aligned when collapsed so the row reads as a small
-                    // strip of controls rather than five lonely dots spread wide.
-                    HStack(alignment: .top, spacing: ambientCollapsed ? 8 : 12) {
-                        HoverTile(title: "work", iconified: ambientCollapsed) { exp in WorkTileContent(expanded: exp) }
-                        HoverTile(title: "music", iconified: ambientCollapsed) { exp in MusicTileContent(expanded: exp) }
-                        HoverTile(title: "todos", iconified: ambientCollapsed) { exp in TodoTileContent(expanded: exp) }
-                        HoverTile(title: "calendar", iconified: ambientCollapsed) { exp in CalendarTileContent(expanded: exp) }
-                        HoverTile(title: "weather", iconified: ambientCollapsed) { exp in WeatherTileContent(expanded: exp) }
-                        if ambientCollapsed { Spacer(minLength: 0) }
-                    }
-                    .frame(height: ambientCollapsed ? 30 : 110, alignment: .top)
-                    .animation(.spring(response: 0.34, dampingFraction: 0.84), value: ambientCollapsed)
-                    .zIndex(2)
+                    // Centred when collapsed: the icons read as a top bar with
+                    // the usage strip at its right, rather than a second thing
+                    // competing with the file tree for the left edge.
+                    ambientStrip
 
                     // bob — the conductor, centered in everything the tiles and
                     // the minion band leave behind. The greedy frame is what
@@ -79,7 +70,7 @@ struct ContentView: View {
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
-            .padding(20)
+            .padding(14)
             // keyed on ids, not whole records: these springs exist for cards
             // arriving and leaving, and a status flip re-animating the layout
             // is pure invalidation noise
@@ -202,20 +193,32 @@ struct ContentView: View {
     /// declared minimum plus both gutter ghosts and the four flexible spacers
     /// at their floor. Matches what ViewThatFits used to conclude, without
     /// paying for a second full layout of the transcript to conclude it.
-    private static let gutteredMinWidth: CGFloat = 560 + FileTree.width + SessionRail.width + 4 * 10
+    /// How wide the conversation is allowed to get. Past this the line grows
+    /// long enough that the eye loses its place returning to the left margin,
+    /// so the extra width goes to the gutters instead.
+    private static let stageMaxWidth: CGFloat = 800
+    /// The breakpoint is the guttered row's own declared minimum — two inner
+    /// spacers now, not four — so it stays identical to the width at which the
+    /// row actually stops fitting.
+    private static let gutteredMinWidth: CGFloat = 560 + FileTree.width + SessionRail.width + 2 * 12
 
     /// The stage, optionally flanked: a ghost holding the left gutter so the
     /// conversation stays centred, and the rail on the right when a work session
     /// is on stage. `minWidth` is what keeps the width branch above honest.
     @ViewBuilder
     private func stageRow(withGutters: Bool) -> some View {
-        // Four equal flexible spacers: the tree and the rail float in the
-        // middle of their own gutters rather than hugging either the
-        // conversation or the window edge, and the stage stays centred because
-        // both gutters are the same width.
+        // Two flexible spacers, both on the inside. The tree and the rail sit
+        // against the window's own edges, where the eye already looks for a
+        // sidebar, and everything left over goes to the conversation.
+        //
+        // The spacers stay *equal* on purpose: that is what keeps the stage
+        // centred whether or not a tree and a rail are there, and the ghosts
+        // below are the other half of it. A stage that slid sideways every time
+        // you changed tabs would be worse than no rail at all. Four spacers did
+        // the same job but spent the leftover width on margins instead of on
+        // the text.
         HStack(alignment: .top, spacing: 0) {
             if withGutters {
-                Spacer(minLength: 10)
                 if let staged = activeSession, staged.id != sessionManager.companionID {
                     FileTree(root: staged.cwd)
                         .frame(maxHeight: .infinity)
@@ -223,7 +226,7 @@ struct ContentView: View {
                 } else {
                     Color.clear.frame(width: FileTree.width, height: 1)
                 }
-                Spacer(minLength: 10)
+                Spacer(minLength: 12)
             }
             CenterStage(
                 bridge: bridge, voiceIn: voiceIn, voiceOut: voiceOut, home: home,
@@ -239,10 +242,10 @@ struct ContentView: View {
                     return true
                 }
             )
-            .frame(minWidth: withGutters ? 560 : nil, maxWidth: 640)
+            .frame(minWidth: withGutters ? 560 : nil, maxWidth: Self.stageMaxWidth)
             .frame(maxHeight: .infinity)
             if withGutters {
-                Spacer(minLength: 10)
+                Spacer(minLength: 12)
                 // the gutter follows the provider: claude's cards are the
                 // question chooser and this conversation's agents; codex reports
                 // its work as typed items instead, so its rail is those plus the
@@ -258,9 +261,33 @@ struct ContentView: View {
                 case nil:
                     Color.clear.frame(width: SessionRail.width, height: 1)
                 }
-                Spacer(minLength: 10)
             }
         }
+    }
+
+    /// The ambient icons across the top. Its own property because the inline
+    /// version tripped the type checker once each tile carried a third
+    /// argument — five generic `HoverTile`s in one builder is about the limit.
+    private var ambientStrip: some View {
+        HStack(alignment: .top, spacing: ambientCollapsed ? 8 : 12) {
+            if ambientCollapsed { Spacer(minLength: 0) }
+            ambientTiles
+            if ambientCollapsed { Spacer(minLength: 0) }
+        }
+        .frame(height: ambientCollapsed ? 30 : 110, alignment: .top)
+        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: ambientCollapsed)
+        .zIndex(2)
+    }
+
+    /// Reveal side mirrors each icon's place in the row, so a panel always opens
+    /// away from the nearest window edge and stays paired with its own icon.
+    @ViewBuilder
+    private var ambientTiles: some View {
+        HoverTile(title: "work", iconified: ambientCollapsed, reveal: .leading) { WorkTileContent(expanded: $0) }
+        HoverTile(title: "music", iconified: ambientCollapsed, reveal: .leading) { MusicTileContent(expanded: $0) }
+        HoverTile(title: "todos", iconified: ambientCollapsed, reveal: .center) { TodoTileContent(expanded: $0) }
+        HoverTile(title: "calendar", iconified: ambientCollapsed, reveal: .trailing) { CalendarTileContent(expanded: $0) }
+        HoverTile(title: "weather", iconified: ambientCollapsed, reveal: .trailing) { WeatherTileContent(expanded: $0) }
     }
 
     /// A session or a surface is on stage, so the ambient tiles step aside. Bob's
@@ -311,7 +338,10 @@ struct ContentView: View {
             RateLimitStrip(provider: sessionManager.activeRef?.provider ?? .claude)
             memoryToggle
         }
-        .padding(.top, 12)
+        // 16 rather than the row's own 14: the usage strip is a couple of points
+        // shorter than the icon strip, and this lands their centres on one line
+        // so the two read as a single top bar instead of two near-misses.
+        .padding(.top, 16)
         .padding(.trailing, 14)
     }
 
