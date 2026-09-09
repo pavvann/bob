@@ -12,7 +12,7 @@ counter to maintain, reproducible from any checkout. A released section below is
 version it shipped as; `in review` is whatever has not merged yet. `Bob → About Bob` reads the
 same string bob hands codex as its client version.
 
-## in review — 0.3.0
+## in review
 
 - **the companion stops carrying a coding terminal** — [#33](https://github.com/pavvann/bob/pull/33), closes #31.
   bob's own chat spawned with the full terminal loadout: ~94 global skills, 9 MCP servers, 89
@@ -21,6 +21,11 @@ same string bob hands codex as its client version.
   **32.0k tokens, 16%**. Work sessions keep the full loadout, byte for byte — they are supposed
   to match the terminal. Editable at `~/bob/state/companion-loadout.json`, every kept tool
   documented with its token price.
+
+
+## 0.3.0 — 2026-09-09
+
+Bob gets a face, a version, and stops lying to itself about where its tools are.
 
 - **an app icon, and `make install`** — [#59](https://github.com/pavvann/bob/pull/59). Bob has a
   face, and a one-line way into /Applications. The source art had no alpha, so its corners were
@@ -32,10 +37,16 @@ same string bob hands codex as its client version.
   is *not interactive*, so it skips `.zshrc` — which is where npm's global prefix, pyenv, cargo and
   nvm actually add themselves. A GUI-launched bob was computing a PATH the owner's terminal has
   never had. claude was spared only because homebrew happens to sit on the non-interactive path.
+- **the app has versions** — [#61](https://github.com/pavvann/bob/pull/61). `./VERSION` plus the
+  commit count, stamped into the bundle at build time rather than committed into it, so the file on
+  disk can never disagree with the tree it came from. This was already load-bearing and already
+  wrong: bob introduces itself to codex with `CFBundleShortVersionString` in the initialize
+  handshake, so every codex session until now said `0.1.0` — a number untouched since the first
+  commit.
 
 ## 0.2.0 — 2026-08-31
 
-The release that made bob two-agent, gave it a real terminal, and got it an icon.
+The release that made bob two-agent and gave it a real terminal.
 
 Bob hosts **Codex sessions** alongside Claude ones: same window, same tabs, same transcript, same
 ask-first permissions.
