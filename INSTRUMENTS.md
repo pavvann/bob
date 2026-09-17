@@ -1,353 +1,209 @@
 # bob — instruments
 
-How bob grows new capability without me editing Swift.
+How bob grows new capability without rebuilding the app.
 
-Status: **design, not built.** Supersedes `EXTENSIONS.md` (PR #62), which got
-three central things wrong. This document says what changed and why.
+Status: **design, not built.** Third version. The first two were argued from
+first principles and were wrong in ways that research settled immediately, so
+this one leads with how the working systems actually do it.
 
-## Why this is not called "extensions"
+## What the working systems do
 
-"Extension ecosystem" is the wrong frame for a program with one user. The
-success measure is not how many exist. It is whether small personal
-capabilities become part of daily work without making bob incoherent.
+| | runtime | who fetches | who draws | wire | isolation |
+|---|---|---|---|---|---|
+| **Raycast** | Node child process, one worker thread per extension | the extension | **the host** — React → JSON render tree → JSON Patch → native AppKit | JSON-RPC over stdio | v8 isolate + memory cap |
+| **VS Code** | Node extension host process | the extension | the host (tree views, panels); webviews are the exception | IPC | separate process |
+| **Shopify** | your own server | the app | **the host** — Polaris web components at declared targets | App Bridge | iframe |
+| **MCP** | any language, own process | the server | n/a — the consumer is a model | JSON-RPC over stdio or HTTP | process boundary |
 
-That reframing is not cosmetic — it changes what to optimise for:
+Three things are common to all of them, and the first two are the opposite of
+what this document said in its first two versions:
 
-| VS Code optimises for | bob should optimise for |
-|---|---|
-| long-term API compatibility | automatic migration of all twelve local instruments |
-| a large third-party population | future-you understanding what exists |
-| publishing and discovery | no ceremony at all — the folder existing is the install |
-| stability across versions | cheap experimentation and cheap deletion |
+1. **The extension gets a real runtime and does its own I/O.** Node, or your own
+   server. It holds its own credentials and makes its own network calls. Nobody
+   makes the host fetch on the extension's behalf.
+2. **The extension does not draw pixels.** It declares UI in the host's own
+   components and the host renders natively. This is why every Raycast extension
+   looks like Raycast and every Shopify extension looks like Shopify.
+3. **A fixed message vocabulary over JSON-RPC.** Raycast is explicit: extensions
+   may send only registered messages, and *"arbitrary calling into Raycast code
+   isn't possible."*
 
-The unit is an **instrument**: one coherent answer, decision, or verb.
+Also worth noting: **Raycast deliberately does not sandbox.** No file I/O or
+network restrictions. Its security model is open source, human review, and a kill
+list. For bob — one user, who wrote or asked for every instrument — the
+equivalent is that you can read the folder.
 
-- "Are my deploys healthy?"
-- "How much budget is left?"
-- "What shape did this turn take?"
-- "Resume the session that owns this file."
+The earlier fear that drove the wrong design was CORS. It only applies to
+webviews. VS Code's docs say exactly this: a webview must proxy through the
+extension host. An extension with a Node runtime has no CORS problem at all,
+because it is not a browser.
 
-## The gap, stated correctly
+## The shape for bob
 
-bob has **no** extensibility of the application. Everything it does and
-everything it draws is compiled in.
+**An instrument is a process.** Any language. It fetches its own data, holds its
+own credentials, does the real work.
 
-`~/bob/skills/` is not a counter-example, and the earlier doc was wrong to claim
-it. A skill is **instructions for the model** — trigger phrases and a recipe
-loaded into context. `play-music.md` is prose telling the model to call a
-script. Bob.app never reads either file: it does not parse them, render them, or
-behave differently because they exist. The model's behaviour changes; the
-application's does not.
+**The wire is JSON-RPC over stdio — which bob already speaks, twice.**
+`CodexServer.swift`, `CodexProtocol.swift` and `StreamPump.swift` are ~1,400
+lines of exactly this: process lifecycle, request/response routing,
+notifications, crash handling, stdin teardown. It survived 41 defects across 13
+review rounds against a real server. A third client on the same plumbing is a
+much smaller job than a new runtime.
 
-So the starting point is zero, not half.
+**Bob draws.** The instrument sends a description of what it wants shown; bob
+renders it in SwiftUI. That is what makes an instrument look like bob rather than
+like a small website parked in a window.
 
-What skills do prove is the harder half, and it is why this is worth attempting
-at all: **the authorship loop already works.** `watch-pr.md` carries its own
-origin note — *"drafted 2026-08-13 after the same shape got queued 3x in three
-days."* bob wrote it because a pattern repeated, and it was kept. That loop,
-aimed at capability instead of behaviour, is the entire proposal.
+**A webview is the escape hatch, not the default.** Genuinely visual work — the
+isometric codebase diagram, a chart nobody's primitive covers — gets arbitrary
+HTML. That path pays the CORS tax and proxies through bob, exactly as VS Code
+does. Rare by design.
 
-## What an instrument declares
+## The second face: bob as an MCP server
 
-```yaml
----
-name: work-map
-question: What shape did this turn take?
+An instrument already holds real data. The sessions running inside bob already
+want that data. Right now they cannot reach it, and a Claude session running
+inside bob does not know it is inside bob.
 
-consumes:
-  - events: [file.changed, command.finished, turn.completed]
-owns:
-  state: layout          # private; no other instrument may read it
-actions:
-  - file.open
-  - session.focus
-projections:
-  - kind: stage
-    invoked: true
-  - kind: glance
-    slot: top-right
-    reveal: { on: [command.failed] }
----
+So an instrument has two faces on one connection:
 
-Prose for two readers: future-me, and bob when I ask it to change this.
+- **UI face** — a render tree and user events. Consumer: the owner.
+- **MCP face** — tools and resources. Consumer: the model in a session. Optional.
+
+And bob aggregates. **One `bob` MCP server, with the instruments inside it.**
+
+This is the ecosystem's converged pattern, not a guess: an April 2026 survey of
+**17** MCP gateways (MetaMCP, agentgateway, mcp-proxy, IBM ContextForge, Kong,
+Cloudflare Portals) found they agree on flat aggregation, tool namespacing and a
+single endpoint.
+
+Why it matters here: **bob registers with each CLI once, ever.** Adding, pinning
+or removing an instrument after that never touches a file the CLIs own — which
+is what makes the lifecycle below possible at all.
+
+### The transport question, and why it answers itself
+
+Stdio transport means the *client spawns the server*. Bob cannot be spawned by a
+CLI that bob itself launched. So bob serves **streamable HTTP on localhost**, and
+the ordering problem disappears: bob is already running, bob spawns the session,
+the session connects outward.
+
+Verified on this machine, 2026-09-17:
+
+```
+claude mcp add --transport http bob http://127.0.0.1:PORT -H "Authorization: Bearer …"
+codex  mcp add bob --url http://127.0.0.1:PORT --bearer-token-env-var BOB_MCP_TOKEN
 ```
 
-Five things, and the order matters: what it consumes, what it owns, what it can
-do, where it appears, and why it exists.
+Both CLIs take a streamable-HTTP MCP server, and both take a bearer token. The
+codex config already holds one HTTP MCP server, so this path is live rather than
+theoretical.
 
-**A projection is not the unit.** "Deploy status" is not five extensions — it is
-one instrument contributing an ambient dot, a detail panel, a command, a
-notification, and a fact. Making the surface the package boundary was the first
-doc's central mistake.
+Bob has no HTTP server today. `Network.framework`'s `NWListener` ships with macOS
+and needs no dependency, which matters for an app with one SPM dependency it
+thought hard about.
 
-## Moments — the part that decides whether any of this works
+### What bob itself should expose
 
-> A successful instrument does not merely run. It has a reliable moment in which
-> it becomes relevant.
+The instruments are not the whole prize. Bob knows things no MCP server knows:
+what is in the other tab, what the last turn in the codex session did, what the
+wiki says about a project, what is on the stage.
 
-The usual failure of extensibility is not a bad SDK. It is that extensibility
-creates **supply without recurring demand**. A thing can exist and nothing ever
-brings it back into the work. Panels and dashboards are the most vulnerable of
-all, because opening one is another decision.
+A session that can ask bob about bob is a bigger idea than the extension system,
+and it arrives on the same plumbing.
 
-So standardising the *moments* matters more than standardising the pixels — and
-bob is unusually well supplied with them already. Its agents emit a real event
-vocabulary today, rendered linearly and never synthesised: user and agent
-messages, command execution with live output and exit code, MCP tool calls with
-status, web searches, file changes, turn completion, failures. `SessionWatcher`,
-`DirWatcher`, `AttentionCenter` and the minion lifecycle add more.
+## The trap: this is issue #31 again
 
-**An address is not a moment.** "Lives in the notch" is an address. "Production
-went from healthy to failed" is a moment. Permanent visibility is legitimate
-only with **differential salience** — quiet when normal, changing character when
-attention is warranted. A number that updates continuously becomes wallpaper
-inside a week.
+Twelve instruments, four tools each, is **48 tool definitions in every session's
+context on every turn**.
 
-One honest exception: some ambient things are valued as atmosphere or identity —
-a clock, a fitness ring, today's total. That is a real reason and this is
-personal software, so delight counts. It is just not what a first instrument
-should be asked to prove.
+That fight already happened here. #31: the companion carried ~94 skills, 9 MCP
+servers and 89 tools — **53.6k tokens, 27% of the window, before a word was
+typed.** An aggregator that exposes everything recreates it exactly, except
+self-inflicted.
 
-## The grammar line
+The protocol anticipates this. Servers declare `tools: { listChanged: true }`,
+clients subscribe through `subscriptions/listen`, and the server emits
+`notifications/tools/list_changed` when the set changes — so bob can show a
+session only what is relevant and change its mind without a restart. The MCP docs
+explicitly recommend **progressive tool discovery** for clients federating many
+servers.
 
-The sharp question is: **is bob willing to own the interaction grammar?**
+The same survey found **per-client tool visibility is an open design space** —
+none of the 17 gateways does it well as of Q1 2026. Bob is unusually placed to,
+because it is the only one that knows which project a session is sitting in. That
+is an edge and a warning in one sentence.
 
-If every instrument invents its own navigation, loading state, error handling
-and visual language, bob stops being an application and becomes a window manager
-for tiny websites — and a graveyard of attractive toys is then an expected
-property, not a failure that better standards could prevent.
+## What survives from the earlier versions
 
-But "the host renders everything" fails the other way. Every genuinely new kind
-of visual would need Swift — sparkline, dependency graph, map — which is the
-exact ceiling this exists to escape, moved from "adding a panel" to "adding a
-chart type."
+Three ideas came out of the argument with codex and are unaffected by the
+research:
 
-The line that resolves it:
+**An instrument is a question, not a place.** "Deploy status" is not five
+extensions; it is one capability contributing an ambient indicator, a panel, a
+command, a notification and a fact. Projections are presentation, and
+presentation must not define the package boundary.
 
-> **bob owns 100% of the outer grammar and 20–40% of the pixels.**
+**A successful instrument needs a moment.** Extensibility creates supply without
+recurring demand; a thing exists and nothing brings it back. An *address* ("lives
+in the corner") is not a *moment* ("revenue crossed the target"). bob is
+unusually well supplied with moments already — file changes, command exits, turn
+completion, failures, `SessionWatcher`, `DirWatcher`, `AttentionCenter`.
 
-- **Host-owned, always:** how effects happen, how focus moves, how failure is
-  shown, how navigation works, how an instrument is configured, how it reports
-  it is broken.
-- **Instrument-owned, freely:** what the picture is.
+**Time schedules the review; judgment performs the eviction.** Creation is free,
+so permanence has to cost something. A new instrument is on probation; after N
+active days bob asks. Ignore the question and it loses its scarce placement — the
+corner, the stage — while the folder survives untouched. Expiry removes
+privilege, not work. Clicks are the wrong signal because they would punish
+exactly the quiet ambient instruments that succeed.
 
-Native primitives exist so that "three facts and a button" does not require a
-web application — value, status, sparkline-less list, action controls.
-**Deliberately no chart primitives.** A sparkline is trivial SVG inside a web
-projection; a chart taxonomy is exactly the trap.
+### One open disagreement, flagged rather than resolved
 
-Arbitrary web rendering is therefore **normal for genuinely visual work**, not a
-rare escape hatch. The isometric codebase diagram that started this conversation
-is a legitimate instrument, not an exception to be tolerated.
+Codex's framework prefers instruments that earn attention through events, and
+says plainly that *"a number that updates continuously will probably become
+wallpaper."*
 
-## Data in: the host fetches, the projection renders
+The thing that started this was a permanently visible business metric. That is
+the case codex calls weak. It conceded the exception — some ambient objects are
+valued as motivation or identity, and *"this is personal software; delight
+counts"* — but the framework still leans against it.
 
-**A projection has no network access.** Not a limitation — a boundary.
+**This is the owner's call, not the framework's**, and it is recorded here
+unresolved: is bob's extension surface for things that alert you, or things you
+look at?
 
-1. CORS: a remote API will not serve a local webview origin anyway.
-2. Credentials stay out of `~/bob`. An API key in `view.html` is a plaintext
-   secret in a folder everything can read.
-3. It makes the capability section enforceable rather than aspirational: a
-   projection that cannot reach the network can only render what bob handed it,
-   and cannot quietly exfiltrate anything.
-4. One refresh policy, host-owned — which is what the performance gates depend
-   on.
+## What v1 is
 
-The host runs declared sources off the main actor, only while the projection is
-visible, and pushes results in. The projection may ask for a refresh; it may not
-go and get one.
-
-## Effects out: declared actions
-
-The symmetric rule, and the place mini-app incoherence actually begins — not in
-rendering, but in a broad JavaScript bridge added for convenience.
-
-> bob owns every **effect** that crosses the projection boundary. Interaction
-> *inside* a projection is free and unpoliced.
-
-Pan, zoom, hover, select, filter, expand, drill down — the instrument's
-business, and no two instruments need the same selection model. A dependency
-graph and a table should not be forced to agree on what a blue outline means.
-
-"Open this file", "resume that session", "redeploy" — declared named actions,
-executed by the host.
-
-The coherence worth defending is how effects, focus, failure and navigation
-behave. Not whether every selected object looks the same.
-
-## Permissions
-
-bob already has an ask-first approval card that the user reads and trusts. The
-risk in reusing it is habituation: if a weather instrument asks permission to
-refresh, the user learns to approve without reading, and that degrades the card
-for the agent sessions where it genuinely matters.
-
-| request | behaviour |
-|---|---|
-| declared read / refresh | no approval |
-| declared navigation, from an explicit click | immediate |
-| declared bounded reversible effect, from an explicit click | immediate |
-| destructive or high-impact effect | approve per invocation |
-| effect initiated by a timer or event rather than the user | approve per invocation, always |
-| **undeclared effect** | **rejected — no card offered** |
-
-That last row matters most. An undeclared action must not raise an approval
-card, because that turns the card into a runtime privilege-escalation
-mechanism — a malformed or compromised projection could keep asking for new
-powers until something says yes. Changing capability means changing the manifest
-and re-reviewing the instrument. An undeclared action is an error, not a request.
-
-**Risk is classified by the host executor, not the manifest.** A manifest
-claiming `risk: harmless` is worth nothing. `file.open` has bounded, known
-semantics. An action backed by an arbitrary shell template does not, and
-defaults to per-invocation approval with the resolved command shown.
-
-> A named host action and a named shell recipe are not the same security object.
-
-Pin-time trust is sufficient only for real host verbs. Shell recipes keep asking.
-
-## State
-
-- **Private by default.** An instrument's own directory is namespaced and no
-  other instrument may read it.
-- **User-authored files stay shared.** Notes, wiki, and everything under `~/bob`
-  a human wrote remain readable.
-- **Publishing is deferred.** Cross-instrument data must eventually be a declared
-  `publishes`, never a private path someone learned the shape of — but do not
-  build it until a second consumer actually exists.
-
-This corrects the first doc's proudest and worst claim. "Every instrument reads
-the same `~/bob`" is shared *access*, not composition. One instrument writes
-`state/deploys.json`, three others learn its undocumented shape, and that is
-global mutable state with filesystem latency. It feels wonderfully composable
-for six months and is mysteriously coupled afterwards.
-
-When publishing does arrive: named **scalar** facts — boolean, number, string,
-enum, timestamp — one writer each, many readers. No arbitrary JSON documents,
-and no registry: bob builds the catalogue by scanning manifests.
-
-## Lifecycle: creation is free, permanence is earned
-
-Near-zero authoring cost makes the permanent collection **worse**, not better,
-unless something forces curation. AI removes implementation cost. It does not
-remove attention cost, choice cost, visual clutter, or the cost of remembering
-why a thing exists.
-
-So: a generated instrument starts as **scratch**. Immediately usable, no
-ceremony. Permanence requires evidence.
-
-> **Time schedules the review. Human judgment performs the eviction.**
-
-After N active days bob asks: keep it here · revise it · remove it from this
-surface · archive it. Ignore the review and it loses its **scarce placement** —
-the notch, the stage — while its folder survives untouched.
-
-**Expiration removes privilege, not work.**
-
-Usage counts are shown as evidence for that judgment, never as an automatic
-score: days rendered, state changes observed, detail opens, actions taken,
-errors. A green deploy dot may have zero interactions in a year and be worth
-keeping. Clicks would punish exactly the ambient instruments that succeed.
-
-Pinned is not immortal either. A periodic re-acknowledgement of scarce placement
-is the anti-graveyard mechanism — not a clever engagement formula.
-
-## Performance budget
-
-bob went from 26% idle CPU to 0.2% and has held it through a month of features.
-This is the classic way to give that back.
-
-1. Zero instruments installed must not move any existing bench window.
-2. Installed-but-hidden must cost nothing measurable: no timer, no webview, no
-   watcher beyond the one directory scan.
-3. A new bench case — several instruments visible and refreshing — against the
-   same idle / stream / idle-with-transcript windows.
-
-If a webview per visible projection exceeds the budget, the answer is fewer
-visible projections, not a looser budget.
-
-## What v1 deliberately cannot do
-
-- No cross-instrument reads, and no `publishes` until a second consumer exists.
-- No direct instrument-to-instrument messaging.
-- No background work: hidden means stopped.
-- No undeclared actions, ever — not even with approval.
-- No compatibility promise. The format will change and bob will migrate the
-  folders.
-- No publishing, discovery, or install flow.
-
-## The first instrument: a live work map
-
-There is a trap in picking the first one. Everything that best fits the criteria
-above — real moment, differential salience — is something bob **already does
-natively and better**: the usage strip, the `AttentionCenter` digest, the file
-tree. Rebuilding those as instruments proves a mechanism by making the product
-worse. Meanwhile everything genuinely absent — deploy status, revenue, channel
-analytics — needs credentials and has no existing moment in bob, which is the
-profile that becomes wallpaper.
-
-The way out is a third category: **a derived lens over bob's own event stream.**
-Those events are rendered linearly today and never synthesised into an
-interpretation.
-
-> **What is the agent touching, and where is this turn concentrated in the
-> codebase?**
-
-Plausibly the isometric diagram that started this conversation, fed by live
-session events. Nodes illuminate as files are edited. Commands animate where
-they ran. Failures stay marked. Turn completion freezes the footprint. Pan,
-zoom, hover and filter are internal; clicking a file is `file.open`; clicking a
-session marker is `session.focus`.
-
-It is not a weaker rewrite of existing UI, and not an external dashboard:
-
-- the **file tree** answers *what files exist?*
-- the **activity rail** answers *what happened, in order?*
-- the **work map** answers *what shape did this work take?*
-
-And it exercises nearly every seam at once — an existing bob moment, arbitrary
-custom rendering, high-frequency internal interaction, structured event
-delivery, host navigation actions, private layout state, an invoked stage
-projection — with no credentials and no third-party service.
-
-Its ambient projection is **not** in v1. First prove the stage view earns
-repeated use. If a stable summary emerges that deserves peripheral attention,
-that summary can contribute to a glance later.
+- One instrument, chosen because it is wanted for itself.
+- One projection kind.
+- Process + JSON-RPC, on the existing plumbing.
+- Host-rendered UI. The webview escape hatch exists but is not the first thing
+  built.
+- No MCP face until the UI face works.
+- No cross-instrument reads. No background work when hidden. No compatibility
+  promise — bob migrates the folders when the format changes.
 
 ## Open questions
 
-1. **How are events delivered to a projection?** A push per event is simple and
-   chatty; a coalesced snapshot is cheaper and loses ordering. The transcript
-   work says coalesce, but a work map may care about sequence.
-2. **How many native primitives, exactly?** "Value, status, list, action" is the
-   sketch. The real number should come from the second and third instrument, not
-   from this document.
-3. **What is N in "after N active days, review"?** Seven is a guess.
-4. **Where do instruments live** — `~/bob/instruments/`?
+1. **What is the first instrument?** Still the most important unanswered
+   question, and the one that stops this being architecture for its own sake.
+2. **How many host UI primitives, and which?** Raycast's answer is roughly list,
+   detail, form, action panel. bob's should come from the second and third
+   instrument, not from this document.
+3. **Does the MCP face come before or after the UI face?** It may be the more
+   valuable half, which is an argument for going first and an argument for going
+   second.
+4. **Alerting or looking at?** See the flagged disagreement above.
 
-## Risks
+## Verified on this machine, 2026-09-17
 
-- **The API gets designed against imagined instruments.** Mitigation is the
-  sequencing: one instrument, built for its own sake, before any second slot.
-- **The perf win gets spent.** Mitigation is the gates, with a control run on
-  the branch's own base.
-- **The escape hatch becomes the default** and bob erodes into a webview host
-  one projection at a time. Mitigation is the grammar line: bob keeps 100% of
-  the outer grammar regardless of who draws the picture.
-- **It never gets used.** The real failure mode. If the only instruments that
-  exist are the ones written to test the system, that is the answer, and deleting
-  it beats feeding it.
+Recorded with dates because the last set of protocol facts in this repo went five
+releases stale without anyone noticing.
 
-## Where this came from
-
-Three rounds of argument with codex, which disagreed with the first doc on the
-unit, on shared state, and on rendering, and was right on all three. It also
-supplied two things neither doc had: that a successful extension needs a
-*moment* rather than a surface, and that time should schedule a review while
-judgment performs the eviction.
-
-It conceded in return that a host-renders-everything position simply relocates
-the ceiling, which is what produced the 100%/20–40% split; that a published-fact
-registry is premature before a second consumer; and that interaction internal to
-a projection must stay unpoliced or the diagram that prompted all of this becomes
-impossible.
+- `claude mcp add --transport http … -H …` — HTTP transport with headers
+- `codex mcp add … --url … --bearer-token-env-var …` — streamable HTTP with bearer auth
+- codex config already contains an HTTP MCP server, so the shape is proven here
+- `codex-cli 0.154.0`, and bob's codex behavioural findings were measured against
+  0.149.0 — see `tools/codex-probe/FINDINGS.md`
+- MCP protocol version `2026-07-28`; sampling and logging deprecated
+- bob imports no HTTP server today; `NWListener` would add none
