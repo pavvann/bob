@@ -7,20 +7,34 @@ argument for a shape, and the list of things v1 deliberately will not do.
 
 ## The gap
 
-bob already has extensions. They just can't draw anything.
+bob has no extensions. Everything the app does and everything it draws is
+compiled in.
 
-```
-~/bob/skills/play-music.md
-~/bob/skills/watch-pr.md
-```
+It is worth being exact about this, because `~/bob/skills/` looks like a
+counter-example and is not one. A skill is **instructions for the model** —
+trigger phrases and a recipe that gets loaded into context when something
+matches. `play-music.md` is prose that tells the model to call a script;
+`watch-pr.md` is prose that tells it to spawn a minion. Bob.app never reads
+either file. It does not parse them, render them, or change behaviour because
+they exist. The model's behaviour changes; the application's does not.
 
-Those are real: you wrote them, they are plain files in a folder you own, and
-adding one needs no rebuild. They change what bob **does**.
+So the starting point is zero, not half.
 
-There is no equivalent for what bob **shows**. Every visible thing in bob is
-compiled in. `AppSurface` is a two-case enum — `notes`, `canvas` — and adding a
-third means editing the enum, a switch, a symbol table and a router, then
-rebuilding and reinstalling.
+What skills *do* prove is worth keeping, because it is the harder half of what
+follows:
+
+- **The format works.** A folder of plain markdown you own, no rebuild, edited by
+  hand when it is wrong. You use it.
+- **The authorship loop already works.** `watch-pr.md` carries its own origin
+  note — "drafted 2026-08-13 after the same shape got queued 3x in three days".
+  bob wrote it because a pattern repeated, and you kept it. That loop, pointed at
+  surfaces instead of behaviour, is the whole proposal below.
+
+The gap, then, is not that bob's extensions cannot draw. It is that bob can grow
+its own **behaviour** from a folder you own, and has no way at all to grow its
+own **surface**. Every visible thing is compiled in: `AppSurface` is a two-case
+enum — `notes`, `canvas` — and adding a third means editing the enum, a switch,
+a symbol table and a router, then rebuilding and reinstalling.
 
 The evidence that this is a real ceiling and not a theoretical one:
 
@@ -34,8 +48,10 @@ The evidence that this is a real ceiling and not a theoretical one:
 
 ## The one-line version
 
-`~/bob/skills/` changes bob's behaviour. `~/bob/extensions/` should change bob's
-surface. Same idea, same folder, same plain files.
+`~/bob/skills/` grows what the model does. `~/bob/extensions/` should grow what
+the app shows. Different mechanism entirely — one is context, the other is code
+the app loads — but the same folder, the same plain files, and the same way of
+coming into existence.
 
 ## Non-goals
 
@@ -102,9 +118,11 @@ why the sequencing below builds `panel` first and gets `widget` nearly free.
   view.html         ← what it draws
 ```
 
-No manifest format to learn beyond YAML frontmatter, which `~/bob/skills/`
-already uses. No build step. No install command — the folder existing *is* the
-installation.
+No manifest format to learn beyond YAML frontmatter. No build step. No install
+command — the folder existing *is* the installation. The shape deliberately
+rhymes with `~/bob/skills/` so there is one thing to learn about how bob is
+extended, even though the two are read by different readers: a skill by the
+model, an extension by the app.
 
 ### 3. `extension.md`
 
