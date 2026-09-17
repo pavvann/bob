@@ -507,9 +507,19 @@ private struct MeterPercent: View {
 
     private var rounded: Int { Int(pct.rounded()) }
 
-    /// Tempered, not alarming: these sit in a quiet caption, so they're the
+    static func tint(_ pct: Double) -> Color { MeterTint.used(pct) }
+}
+
+/// The ramp, in exactly one place, so a colour means the same thing in the
+/// global strip, in a session's caption and on a panel.
+///
+/// It is keyed on **used**, whatever the caller happens to be displaying: the
+/// panel counts room *left*, so it passes `100 - left` and red still means
+/// "nearly out" on both framings rather than inverting by accident.
+enum MeterTint {
+    /// Tempered, not alarming: these sit in quiet captions, so they're the
     /// palette's greens and reds at the same weight as the text around them.
-    static func tint(_ pct: Double) -> Color {
+    static func used(_ pct: Double) -> Color {
         if pct >= 80 { return .red.opacity(0.85) }
         if pct >= 50 { return .orange.opacity(0.85) }
         return .green.opacity(0.85)
