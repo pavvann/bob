@@ -98,6 +98,12 @@ enum TranscriptParser {
         var final: FeedFinal?
         /// Newest real event time seen in these lines — the liveness clock.
         var lastEventAt: Date?
+        /// What the model had in front of it on the last request, and the window
+        /// to read it against. Both providers state the first; only codex states
+        /// the second, so a nil window means "ask the model's name" rather than
+        /// "no meter". See `SessionFeedModel.applyContext`.
+        var contextTokens: Int?
+        var contextWindow: Int?
     }
 
     static func parse(lines: [String], flavor: Flavor) -> Update {
@@ -131,6 +137,16 @@ enum TranscriptParser {
             guard (obj["isMeta"] as? Bool) != true,
                   let message = obj["message"] as? [String: Any] else { return }
             if let m = message["model"] as? String { u.model = m }
+            // Both halves of the cache count: a cached token occupies the window
+            // exactly as much as a fresh one. Output stays out — it is what the
+            // model wrote, not what it read. Same rule as `TokenUsage` on the
+            // stream-json side, so a panel and a tab can't disagree.
+            if let usage = message["usage"] as? [String: Any] {
+                let held = (usage["input_tokens"] as? Int ?? 0)
+                    + (usage["cache_read_input_tokens"] as? Int ?? 0)
+                    + (usage["cache_creation_input_tokens"] as? Int ?? 0)
+                if held > 0 { u.contextTokens = held }
+            }
             for block in (message["content"] as? [[String: Any]]) ?? [] {
                 switch block["type"] as? String {
                 case "text":
@@ -173,7 +189,27 @@ enum TranscriptParser {
                 }
             }
         case "system":
-            if (obj["subtype"] as? String) == "init", let m = obj["model"] as? String { u.model = m }
+            switch obj["subtype"] as? String {
+            case "init":
+                if let m = obj["model"] as? String { u.model = m }
+            case "compact_boundary":
+                // The transcript spells this camelCase where the wire spells it
+                // snake_case (`preTokens` here, `pre_tokens` on stream-json) —
+                // same numbers, two dialects of the same CLI.
+                //
+                // It matters more here than anywhere else: a compaction is the
+                // one context change that emits no assistant message, so without
+                // this line the panel's meter would keep reading the pre-compact
+                // number for the rest of the session.
+                guard let meta = obj["compactMetadata"] as? [String: Any] else { break }
+                if let post = meta["postTokens"] as? Int, post > 0 { u.contextTokens = post }
+                let auto = (meta["trigger"] as? String) == "auto"
+                u.events.append(FeedEvent(kind: .output,
+                                          symbol: "arrow.down.right.and.arrow.up.left",
+                                          text: auto ? "auto-compacted" : "compacted"))
+            default:
+                break
+            }
         case "result" where flavor == .minionStream:
             var final = FeedFinal(isError: (obj["is_error"] as? Bool) ?? false)
             final.resultText = clean(obj["result"] as? String, limit: 700, firstLineOnly: false)
@@ -272,6 +308,24 @@ enum TranscriptParser {
                let b = git["branch"] as? String, !b.isEmpty { u.gitBranch = b }
             if let m = CodexProbe.model(from: payload) { u.model = m }
         case "event_msg":
+            // `token_count` rides the same channel as the feed items, and it is
+            // the better of the two sources: codex states the window it actually
+            // used (`model_context_window`) instead of leaving it to be guessed
+            // from the model's name.
+            if (payload["type"] as? String) == "token_count" {
+                guard let info = payload["info"] as? [String: Any] else { return }
+                if let window = info["model_context_window"] as? Int, window > 0 {
+                    u.contextWindow = window
+                }
+                // codex's `input_tokens` is the WHOLE prompt and `cached_input_tokens`
+                // is the share of it that was cached — so unlike claude's counts the
+                // cached half must not be added again (CodexTokenUsage.contextInUse).
+                if let last = info["last_token_usage"] as? [String: Any],
+                   let held = last["input_tokens"] as? Int, held > 0 {
+                    u.contextTokens = held
+                }
+                return
+            }
             guard (payload["type"] as? String) == "item_completed",
                   let item = payload["item"] as? [String: Any] else { return }
             appendCodexItem(item, into: &u)

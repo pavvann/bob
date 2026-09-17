@@ -226,6 +226,7 @@ struct SessionPanelView: View {
                     if let cwd = model.cwd { chip("folder", tidyPath(cwd)) }
                     if let branch = model.gitBranch { chip("arrow.triangle.branch", branch) }
                     if let m = model.model { chip("cpu", shortModel(m)) }
+                    if let left = model.contextLeftPct { contextChip(left) }
                     Spacer(minLength: 0)
                 }
             }
@@ -304,6 +305,27 @@ struct SessionPanelView: View {
         guard let last = model.lastActivity else { return "" }
         let gap = now.timeIntervalSince(last)
         return gap < 4 ? "streaming" : "\(Self.duration(gap)) ago"
+    }
+
+    /// "82% left" — the only chip in the row that is about *now* rather than
+    /// about which session this is, so it is the only one that carries colour.
+    /// The word stays: a bare percentage next to a model name reads as a
+    /// confidence score, and there is already a different percentage in the
+    /// window (the subscription strip) for it to be confused with.
+    private func contextChip(_ left: Double) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "gauge.with.dots.needle.bottom.50percent")
+                .font(.system(size: 8, weight: .medium))
+            Text("\(Int(left.rounded()))% left")
+                .font(.system(size: 9, weight: .regular, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .foregroundStyle(MeterTint.used(100 - left))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background { Capsule().fill(.white.opacity(0.06)) }
+        .help("context left in this session's window")
     }
 
     private func chip(_ icon: String, _ text: String) -> some View {

@@ -28,6 +28,17 @@ final class SessionFeedModel: ObservableObject {
     /// A live session with no process behind it yet — the panel offers to wake
     /// it instead of sitting there looking broken.
     @Published private(set) var isCold = false
+    /// How much of the window is still free, as a percentage — a countdown, not
+    /// a fill. nil until the session has taken a turn, because a panel opened on
+    /// a transcript bob has only read the tail of has nothing to report yet and
+    /// "100% left" would be a lie rather than an absence.
+    @Published private(set) var contextLeftPct: Double?
+
+    /// The last reading and the window it was read against, held so a transcript
+    /// line that moves only one of them (claude states tokens but never a window;
+    /// a compaction states tokens and nothing else) doesn't drop the other.
+    private var contextTokens: Int?
+    private var contextWindow: Int?
 
     let source: PanelSource
 
@@ -258,6 +269,7 @@ final class SessionFeedModel: ObservableObject {
         if cwd == nil, let c = out.update.cwd { cwd = c }
         if let b = out.update.gitBranch, b != gitBranch { gitBranch = b }
         if let m = out.update.model, m != model { model = m }
+        applyContext(out.update)
         switch flavor {
         case .cliTranscript, .codexRollout:
             // claude: mtime moves when an idle transcript's metadata is
@@ -270,6 +282,32 @@ final class SessionFeedModel: ObservableObject {
         case .minionStream:
             if let mt = out.mtime, mt != lastActivity { lastActivity = mt }
         }
+    }
+
+    /// The panel's context countdown.
+    ///
+    /// Framed as room left rather than room used, which is the opposite of the
+    /// caption under the input bar — deliberately. A number counting *down*
+    /// toward an event you can act on reads as a warning; one counting up toward
+    /// a ceiling reads as a statistic, and it also looks like the quota strip in
+    /// the top right, which is a completely different number.
+    ///
+    /// It is "left", not "left until auto-compact", because bob cannot see that
+    /// threshold: `--autocompact` takes `auto` or any window from 100k to 1M, is
+    /// set per session in the terminal bob is only watching, and is stated
+    /// nowhere in the transcript. Naming an event bob can't time would be a
+    /// guess wearing a precise label.
+    private func applyContext(_ update: TranscriptParser.Update) {
+        if let w = update.contextWindow, w > 0 { contextWindow = w }
+        if let t = update.contextTokens, t > 0 { contextTokens = t }
+        guard let tokens = contextTokens else { return }
+        // claude's transcript never states a window, so the model's name is the
+        // only denominator on that side — the same last-resort guess the session
+        // meter uses, not a second opinion.
+        let window = contextWindow ?? ContextWindow.size(for: model)
+        guard window > 0 else { return }
+        let left = max(0, min(100, 100 - Double(tokens) / Double(window) * 100))
+        if contextLeftPct != left { contextLeftPct = left }
     }
 
     // MARK: off-main file work
