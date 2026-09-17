@@ -376,9 +376,21 @@ final class SlashCommandService: ObservableObject {
 
     /// Interactive-REPL housekeeping — session, account and terminal-UI
     /// commands that are meaningless (or misleading) inside a `-p` chat.
+    ///
+    /// `compact` is deliberately NOT here. It was, on the assumption that it was
+    /// REPL housekeeping, and that was wrong: compaction is an operation on the
+    /// conversation, and a conversation in bob fills its window exactly as fast
+    /// as one in a terminal. Verified against the CLI rather than assumed — sent
+    /// as a stream-json message it comes back `result/success` with the
+    /// command's own answer, not as text handed to the model, which is the
+    /// failure #46 fixed for `/resume`.
+    ///
+    /// The same one-line probe settles any other entry here that turns out to be
+    /// wanted: send it to `claude -p --input-format stream-json` and look at
+    /// whether the reply is the command's or the model's.
     nonisolated private static let terminalOnly: Set<String> = [
         "add-dir", "agents", "autocompact", "bashes", "bug", "clear", "color",
-        "compact", "config", "context", "cost", "doctor", "effort", "exit",
+        "config", "context", "cost", "doctor", "effort", "exit",
         "export", "extra-usage", "fast", "goal", "heapdump", "help", "hooks",
         "ide", "import", "init", "insights", "install-github-app", "list-agents",
         "login", "logout", "mcp", "memory", "model", "output-style",

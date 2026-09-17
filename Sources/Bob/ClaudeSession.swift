@@ -794,6 +794,8 @@ final class ClaudeSession: ObservableObject, Identifiable {
             becomeReadyIfSpawning()
         case .status:
             spontaneousIfIdle()
+        case .compacted(let pre, let post, let trigger):
+            noteCompaction(pre: pre, post: post, trigger: trigger)
         case .streamEvent:
             // text/thinking deltas never reach here — the pump coalesces them
             // into applyPump; what's left is block/message chatter worth an
@@ -1030,6 +1032,56 @@ final class ClaudeSession: ObservableObject, Identifiable {
         else { return }
         let pct = min(100, Double(latest.tokens.contextInUse) / Double(contextWindow) * 100)
         if contextUsedPct != pct { contextUsedPct = pct }
+    }
+
+    /// The meter's one blind spot, closed. Every other number it shows is a
+    /// by-product of a turn — an assistant message reports what the model read,
+    /// and finishTurn publishes it. A compaction has no assistant message: it
+    /// throws context away and ends. So the caption kept reading the number from
+    /// *before* the compaction, which is the one moment a person is watching it,
+    /// and stayed wrong until the next real turn moved it by accident.
+    ///
+    /// The boundary states both sides itself, so bob takes the number instead of
+    /// waiting for one. Draining is excluded for the same reason `.assistant` is:
+    /// a superseded process's events describe a thread already off screen.
+    private func noteCompaction(pre: Int, post: Int, trigger: String?) {
+        guard state != .draining else { return }
+        if post > 0 {
+            // a compaction's survivors are what the next turn reads as input —
+            // the cache halves are spent, which is why this is not a partial
+            // update of the old reading but a replacement of it
+            latestUsage = (config.sessionId, TokenUsage(inputTokens: post))
+            publishContextUse()
+        }
+        appendNotice(Self.compactionLine(pre: pre, post: post,
+                                         auto: trigger == "auto", window: contextWindow))
+    }
+
+    /// `compacted · 21% → 4% (42k → 7.2k tokens)`. The percentages first because
+    /// they are what the caption above speaks in; the raw counts after, because
+    /// they are the boundary's own numbers and the percentage is a division by a
+    /// window bob may be guessing at.
+    static func compactionLine(pre: Int, post: Int, auto: Bool, window: Int) -> String {
+        let head = auto ? "auto-compacted" : "compacted"
+        guard pre > 0, post > 0 else { return head }
+        let counts = "\(shortTokens(pre)) → \(shortTokens(post)) tokens"
+        guard window > 0 else { return "\(head) · \(counts)" }
+        return "\(head) · \(percent(pre, of: window)) → \(percent(post, of: window)) (\(counts))"
+    }
+
+    private static func percent(_ tokens: Int, of window: Int) -> String {
+        "\(Int((min(1, Double(tokens) / Double(window)) * 100).rounded()))%"
+    }
+
+    /// 42087 → "42k", 7217 → "7.2k", 840 → "840". One decimal below ten
+    /// thousand, where the difference between 7.2k and 7.9k is still worth
+    /// seeing, and none above it, where it isn't. The megabyte rung is not
+    /// decoration: a 1M-window model fills past 999k and "1000k" reads as a bug.
+    private static func shortTokens(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        guard n >= 1000 else { return "\(n)" }
+        let k = Double(n) / 1000
+        return k < 10 ? String(format: "%.1fk", k) : "\(Int(k.rounded()))k"
     }
 
     /// Client-side queue drains the moment a fresh process reports in (D4):

@@ -71,6 +71,12 @@ enum StreamEvent: Equatable, Sendable {
     case initialized(sessionId: String, model: String?)
     /// `system/status` — the CLI began working a turn ("requesting").
     case status(String?)
+    /// `system/compact_boundary` — the conversation was just compacted, by
+    /// `/compact` or by the CLI hitting the ceiling on its own. The metadata is
+    /// the ONLY place the post-compaction context size is stated: a compaction
+    /// runs no assistant message, so `usage` never moves and the meter would go
+    /// on reading the pre-compaction number until the next real turn.
+    case compacted(preTokens: Int, postTokens: Int, trigger: String?)
     /// partial-message events (only with `--include-partial-messages`).
     case streamEvent(Partial)
     /// `assistant` — emitted once per completed content block. `usage` is the
@@ -235,6 +241,16 @@ enum StreamJSON {
             )
         case "status":
             return .status(obj["status"] as? String)
+        case "compact_boundary":
+            // `trigger` is "manual" for /compact and "auto" for the CLI's own
+            // ceiling; the two read differently in the thread, so it survives
+            // the decode rather than being flattened away here.
+            let meta = obj["compact_metadata"] as? [String: Any]
+            return .compacted(
+                preTokens: (meta?["pre_tokens"] as? Int) ?? 0,
+                postTokens: (meta?["post_tokens"] as? Int) ?? 0,
+                trigger: meta?["trigger"] as? String
+            )
         case "task_started":
             return .taskStarted(
                 id: (obj["task_id"] as? String) ?? "",
