@@ -148,8 +148,11 @@ struct SessionAgent: Identifiable, Equatable {
 /// The whole point of this type is that it is the *same* card: codex asks "which
 /// one" for the same reason claude does, so it gets claude's chooser rather than
 /// a second overlay. Only the two ends differ — how the questions arrive, and
-/// how the answer is shaped — and both come off the pinned fixture at
-/// `protocol/codex/0.149.0/json-schema/`, not off a summary:
+/// how the answer is shaped — and both were read off the generated schema for
+/// codex-cli 0.149.0 rather than off a summary. That fixture is no longer in the
+/// tree; regenerate it with `codex app-server generate-json-schema --out DIR`
+/// against whatever version is installed, and diff before trusting the shapes
+/// below on a newer CLI:
 ///
 ///  - **`ToolRequestUserInputParams.json`** — `questions: [{id, header,
 ///    question, options: [{label, description}] | null, isOther, isSecret}]`
