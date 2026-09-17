@@ -5,8 +5,15 @@ against the real `~/.codex` home. Every claim below came out of a capture made b
 the two scripts beside this file; probe threads were named `bob protocol probe`
 and deleted afterwards.
 
-The schema is pinned in `protocol/codex/0.149.0/`. This file covers the
-behaviours the schema cannot express.
+This file covers the behaviours the generated schema cannot express. The schema
+itself is no longer kept in the tree — regenerate it with
+`codex app-server generate-json-schema --out DIR` when you need it.
+
+> **These findings are dated.** Every claim below was measured against
+> **0.149.0**. Nothing here has been re-checked since, and bob's codex layer
+> asserts several of them in comments. Re-run the scripts below and diff this
+> table before trusting it on a newer CLI — a behaviour that changed would fail
+> silently, which is the worst way for this particular set of facts to be wrong.
 
 ## the tools
 
